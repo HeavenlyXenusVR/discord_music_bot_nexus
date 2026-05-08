@@ -1,3 +1,4 @@
+import copy
 import json
 import asyncio
 import discord
@@ -5,6 +6,7 @@ import aiohttp
 import os
 import time
 import logging
+import warnings
 import random
 import datetime
 import sys
@@ -14,6 +16,9 @@ import wavelink
 from discord.ext import commands, tasks
 from discord import app_commands
 import re
+
+warnings.filterwarnings("ignore", message=".*already exists.*", category=Warning, module=r"aiomysql\..*")
+warnings.filterwarnings("ignore", message="Can't create database .*; database exists", category=Warning, module=r"aiomysql\..*")
 
 # --- DAVE PROTOCOL MONKEYPATCH (FIXES LAVALINK 4.2.2 E2EE ENCRYPTION) ---
 original_request = aiohttp.ClientSession.request
@@ -45,28 +50,42 @@ def _resolve_channel_id_for_guild(guild_id: int):
 
 def _inject_lavalink_channel_id(method, url, kwargs):
     if str(method).upper() != 'PATCH':
-        return
+        return kwargs
+    
     try:
         payload = kwargs.get("json")
-        if not isinstance(payload, dict) or "voice" not in payload: return
+        if not isinstance(payload, dict) or "voice" not in payload: 
+            return kwargs
+            
         voice_data = payload["voice"]
-        if not isinstance(voice_data, dict) or "endpoint" not in voice_data or "channelId" in voice_data: return
+        if not isinstance(voice_data, dict) or "endpoint" not in voice_data or "channelId" in voice_data: 
+            return kwargs
+            
         url_str = str(url)
         match = re.search(r'/players/(\d+)', url_str)
-        if not match: return
+        if not match: 
+            return kwargs
+            
         guild_id = int(match.group(1))
         resolved_channel_id = _resolve_channel_id_for_guild(guild_id)
+        
         if resolved_channel_id:
-            payload["voice"]["channelId"] = resolved_channel_id
+            new_kwargs = copy.copy(kwargs)
+            new_payload = copy.deepcopy(payload)
+            new_payload["voice"]["channelId"] = resolved_channel_id
+            new_kwargs["json"] = new_payload
+            return new_kwargs
     except Exception:
         pass
+        
+    return kwargs
 
 def patched_request(self, method, url, *args, **kwargs):
-    _inject_lavalink_channel_id(method, url, kwargs)
+    kwargs = _inject_lavalink_channel_id(method, url, kwargs)
     return original_request(self, method, url, *args, **kwargs)
 
 async def patched__request(self, method, url, *args, **kwargs):
-    _inject_lavalink_channel_id(method, url, kwargs)
+    kwargs = _inject_lavalink_channel_id(method, url, kwargs)
     return await original__request(self, method, url, *args, **kwargs)
 
 aiohttp.ClientSession.request = patched_request
@@ -116,13 +135,15 @@ async def ensure_database_exists():
     )
     try:
         async with conn.cursor() as cur:
-            await cur.execute(f"CREATE DATABASE IF NOT EXISTS `{db_name}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
+            await cur.execute("SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = %s", (db_name,))
+            if not await cur.fetchone():
+                await cur.execute(f"CREATE DATABASE `{db_name}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
     finally:
         conn.close()
 
 class DBPoolManager:
     _pool = None
-    _lock = asyncio.Lock()  # Eagerly initialised – no race on first __aenter__
+    _lock = asyncio.Lock()
 
     async def __aenter__(self):
         async with DBPoolManager._lock:
@@ -155,8 +176,15 @@ class HTTPSessionManager:
         return HTTPSessionManager._session
     async def __aexit__(self, exc_type, exc_val, exc_tb): pass
 
-# --- LOGGING SETUP ---
-file_handler = logging.FileHandler(filename="discord_bot.log", encoding="utf-8", mode="a")
+# --- LOGGING SETUP (Per-bot logs) ---
+import os
+from logging.handlers import RotatingFileHandler
+
+BOT_ENV_PREFIX = "NEXUS"
+log_dir = "logs"
+os.makedirs(log_dir, exist_ok=True)
+log_filename = os.path.join(log_dir, f"{BOT_ENV_PREFIX.lower()}.log")
+file_handler = RotatingFileHandler(filename=log_filename, encoding="utf-8", mode="a", maxBytes=10*1024*1024, backupCount=5)
 discord.utils.setup_logging(handler=file_handler, level=logging.INFO)
 logger = logging.getLogger("discord")
 
@@ -491,6 +519,7 @@ guild_states = {}
 auto_heal_initialized = False
 recovering_guilds = set()
 process_queue_locks = {}
+voice_connect_locks = {}
 last_position_persist = {}
 playlist_db_initialized = False
 playlist_db_lock = asyncio.Lock()
@@ -500,6 +529,40 @@ recovery_exhausted_until = {}
 idle_voice_since = {}
 auto_restore_snooze_until = {}
 startup_task_registry = {}
+MAX_RUNTIME_GUILD_CACHE_ENTRIES = max(64, int(os.getenv(f"{BOT_ENV_PREFIX}_RUNTIME_GUILD_CACHE_MAX", os.getenv("RUNTIME_GUILD_CACHE_MAX", "512"))))
+
+def _runtime_key(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return value
+
+def prune_runtime_state_cache():
+    try:
+        active_guild_ids = {_runtime_key(g.id) for g in bot.guilds}
+    except Exception:
+        active_guild_ids = set()
+    protected = {_runtime_key(key) for key in playback_tracking.keys()} | {_runtime_key(key) for key in guild_states.keys()} | {_runtime_key(key) for key in recovering_guilds} | {_runtime_key(key) for key in recovery_retry_tasks.keys()}
+
+    def prune_mapping(mapping):
+        for key in list(mapping.keys()):
+            normalized = _runtime_key(key)
+            if active_guild_ids and normalized not in active_guild_ids and normalized not in protected:
+                mapping.pop(key, None)
+        while len(mapping) > MAX_RUNTIME_GUILD_CACHE_ENTRIES:
+            removable = None
+            for key in list(mapping.keys()):
+                normalized = _runtime_key(key)
+                if normalized not in protected:
+                    removable = key
+                    break
+            if removable is None:
+                break
+            mapping.pop(removable, None)
+
+    for mapping in (process_queue_locks, voice_connect_locks, last_position_persist, recovery_retry_counts, recovery_exhausted_until, idle_voice_since, auto_restore_snooze_until, vote_skip_sessions, metrics_last_errors):
+        prune_mapping(mapping)
+
 
 
 def schedule_named_task(name, coro):
@@ -548,9 +611,14 @@ vote_skip_sessions = {}
 metrics_last_errors = {}
 METRICS_HEARTBEAT_INTERVAL = max(5, int(os.getenv(f"{BOT_ENV_PREFIX}_METRICS_HEARTBEAT_INTERVAL", os.getenv("METRICS_HEARTBEAT_INTERVAL", "15"))))
 VOICE_REJOIN_DELAY_SECONDS = max(1, int(os.getenv(f"{BOT_ENV_PREFIX}_VOICE_REJOIN_DELAY_SECONDS", os.getenv("VOICE_REJOIN_DELAY_SECONDS", "5"))))
+VOICE_CONNECT_TIMEOUT_SECONDS = max(10.0, float(os.getenv(f"{BOT_ENV_PREFIX}_VOICE_CONNECT_TIMEOUT_SECONDS", os.getenv("VOICE_CONNECT_TIMEOUT_SECONDS", "30"))))
+VOICE_CONNECT_TIMEOUT_BACKOFF_SECONDS = max(120.0, float(os.getenv(f"{BOT_ENV_PREFIX}_VOICE_CONNECT_TIMEOUT_BACKOFF_SECONDS", os.getenv("VOICE_CONNECT_TIMEOUT_BACKOFF_SECONDS", "30"))))
 
 lavalink_connect_task = None
 lavalink_connect_lock = asyncio.Lock()
+lavalink_recovery_bootstrapped = False
+BOT_RECOVERY_ORDER = ["GWS", "HARMONIC", "MAESTRO", "MELODIC", "NEXUS", "RHYTHM", "SYMPHONY", "TUNESTREAM", "ALUCARD", "SAPPHIRE"]
+BOT_RECOVERY_STAGGER_SECONDS = max(0.0, float(os.getenv(f"{BOT_ENV_PREFIX}_RECOVERY_STARTUP_STAGGER_SECONDS", os.getenv("RECOVERY_STARTUP_STAGGER_SECONDS", str((BOT_RECOVERY_ORDER.index(BOT_ENV_PREFIX) if BOT_ENV_PREFIX in BOT_RECOVERY_ORDER else 0) * 8)))))
 
 def _get_pool_nodes():
     nodes = getattr(wavelink.Pool, "nodes", None)
@@ -580,7 +648,11 @@ async def _connect_lavalink_forever():
                 logger.warning(f"Waiting for Lavalink to boot or authenticate... Retrying in 5s ({exc})")
                 await asyncio.sleep(5)
             else:
-                break
+                for _ in range(40):
+                    if _has_connected_lavalink_node():
+                        return
+                    await asyncio.sleep(0.5)
+                logger.warning("Lavalink connection attempt did not become ready within 20s; retrying.")
 
 def ensure_lavalink_connection_task():
     global lavalink_connect_task
@@ -673,9 +745,9 @@ async def build_autodj_query(cur, guild_id):
     for title in recent_titles:
         cleaned = re.sub(r"\s*\([^)]*\)|\s*\[[^\]]*\]", "", title).strip()
         if cleaned:
-            return f"ytsearch:{cleaned} audio"
+            return f"ytmsearch:{cleaned} audio"
     fallback_terms = ["lofi hip hop", "synthwave mix", "chill electronic", "gaming music", "jazz hop"]
-    return f"ytsearch:{random.choice(fallback_terms)}"
+    return f"ytmsearch:{random.choice(fallback_terms)}"
 
 async def maybe_enqueue_autodj(cur, guild, channel_id):
     if not await get_autodj_enabled(guild.id):
@@ -811,7 +883,8 @@ async def save_state(guild_id):
     if not state: return
     try:
         with open(f"state_{guild_id}.json", "w") as f: json.dump(state, f)
-    except: pass
+    except Exception:
+        pass
 
 async def load_states():
     states = {}
@@ -820,7 +893,8 @@ async def load_states():
             try:
                 gid = file.replace("state_", "").replace(".json", "")
                 with open(file) as f: states[gid] = json.load(f)
-            except: pass
+            except Exception:
+                pass
     return states
 
 async def delete_state(guild_id):
@@ -860,6 +934,13 @@ def get_process_queue_lock(guild_id):
     if lock is None:
         lock = asyncio.Lock()
         process_queue_locks[guild_id] = lock
+    return lock
+
+def get_voice_connect_lock(guild_id):
+    lock = voice_connect_locks.get(guild_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        voice_connect_locks[guild_id] = lock
     return lock
 
 def invalidate_position_persist(guild_id):
@@ -1065,6 +1146,8 @@ async def collect_and_persist_metrics(guild=None):
 async def restore_persistent_voice_states():
     """Rejoin desired voice channels after bot restart / Discord voice reconnect edges."""
     try:
+        if BOT_RECOVERY_STAGGER_SECONDS:
+            await asyncio.sleep(BOT_RECOVERY_STAGGER_SECONDS)
         async with DBPoolManager() as pool:
             async with pool.acquire() as conn:
                 async with conn.cursor(aiomysql.DictCursor) as cur:
@@ -1090,11 +1173,24 @@ async def restore_persistent_voice_states():
                 if guild.voice_client and getattr(guild.voice_client, "is_connected", lambda: False)():
                     await persist_voice_state(guild.id, getattr(guild.voice_client.channel, "id", channel_id), desired_connected=True, connected=True)
                     continue
+                state = await derive_recovery_state_from_db(guild.id)
+                stay_in_vc = False
+                try:
+                    async with DBPoolManager() as pool:
+                        async with pool.acquire() as conn:
+                            async with conn.cursor() as cur:
+                                await cur.execute("SELECT stay_in_vc FROM nexus_guild_settings WHERE guild_id = %s", (guild.id,))
+                                stay_row = await cur.fetchone()
+                                stay_in_vc = bool(stay_row[0]) if stay_row else False
+                except Exception:
+                    logger.debug("[nexus] Failed checking 24/7 state for persistent voice restore.", exc_info=True)
+                if not state and not stay_in_vc:
+                    await persist_voice_state(guild.id, channel_id, desired_connected=False, connected=False, last_error="no_recoverable_playback")
+                    continue
                 await asyncio.sleep(VOICE_REJOIN_DELAY_SECONDS)
-                vc = await ensure_voice_connection(guild, channel_id)
+                vc = await ensure_voice_connection(guild, channel_id, respect_recovery_backoff=True)
                 if vc:
-                    await persist_voice_state(guild.id, channel_id, desired_connected=True, connected=True)
-                    state = await derive_recovery_state_from_db(guild.id)
+                    await persist_voice_state(guild.id, channel_id, desired_connected=bool(stay_in_vc or state), connected=True)
                     if state:
                         schedule_recovery_retry(guild.id, channel_id, start_position=state.get("position", 0), reason="persistent_voice_restore")
                 else:
@@ -1259,6 +1355,10 @@ def schedule_recovery_retry(guild_id, channel_id, *, start_position=0, reason="r
     async def _retry():
         try:
             await asyncio.sleep(delay)
+            if recovery_backoff_remaining(guild_id) > 0:
+                recovery_retry_counts.pop(guild_id, None)
+                return
+
             guild = bot.get_guild(guild_id)
             if not guild:
                 recovery_retry_counts.pop(guild_id, None)
@@ -1271,7 +1371,7 @@ def schedule_recovery_retry(guild_id, channel_id, *, start_position=0, reason="r
 
             recovery_retry_tasks.pop(guild_id, None)
             logger.warning(f"[{guild_id}] Recovery retry {attempts}/{MAX_RECOVERY_RETRIES} armed ({reason}).")
-            await process_queue(guild, channel_id, start_position=start_position)
+            await process_queue(guild, channel_id, start_position=start_position, allow_recovery_restore=True)
         except asyncio.CancelledError:
             raise
         finally:
@@ -1285,6 +1385,13 @@ def schedule_recovery_retry(guild_id, channel_id, *, start_position=0, reason="r
 
 async def requeue_failed_track(cur, guild_id, channel_id, url, title, requester_id, *, position=0, reason="recovery"):
     await insert_queue_front(cur, "nexus_queue", guild_id, "nexus", url, title, requester_id)
+    # FIX 6: Re-add the failed track to the backup so it survives a crash.
+    # After FIX 1 the backup loses the track the moment it is popped to play;
+    # if playback then fails we must restore backup parity.
+    await cur.execute(
+        "INSERT INTO nexus_queue_backup (guild_id, bot_name, video_url, title, requester_id) VALUES (%s, 'nexus', %s, %s, %s)",
+        (guild_id, url, title, requester_id),
+    )
     await cur.execute(
         "UPDATE nexus_playback_state SET is_playing = FALSE, is_paused = FALSE, position_seconds = %s WHERE guild_id = %s AND bot_name = 'nexus'",
         (position, guild_id),
@@ -1425,50 +1532,63 @@ async def ensure_self_deaf(guild, voice_client):
     except Exception as e:
         logger.warning(f"[{guild.id}] Failed to self-deafen voice connection: {e}")
 
-async def ensure_voice_connection(guild, channel_id):
+async def ensure_voice_connection(guild, channel_id, *, respect_recovery_backoff=False):
     channel = guild.get_channel(channel_id)
     if not channel: return None
-    if not await ensure_lavalink_ready():
-        logger.warning(f"[{guild.id}] Lavalink not ready yet; deferring voice connection.")
-        return None
-    voice_client = guild.voice_client
-    pending_voice_channels[guild.id] = channel_id
-    try:
-        if voice_client and (
-            not _voice_client_connected(voice_client)
-            or (
-                recovery_retry_counts.get(guild.id)
-                and getattr(voice_client, "channel", None)
-                and voice_client.channel.id == channel_id
-                and not _player_is_active(voice_client)
-            )
-        ):
-            try:
-                await voice_client.disconnect()
-            except Exception:
-                pass
-            voice_client = None
+    lock = get_voice_connect_lock(guild.id)
+    async with lock:
+        if respect_recovery_backoff and recovery_backoff_remaining(guild.id) > 0:
+            return None
+        if not await ensure_lavalink_ready():
+            logger.warning(f"[{guild.id}] Lavalink not ready yet; deferring voice connection.")
+            return None
+        voice_client = guild.voice_client
+        pending_voice_channels[guild.id] = channel_id
+        try:
+            if voice_client and (
+                not _voice_client_connected(voice_client)
+                or (
+                    recovery_retry_counts.get(guild.id)
+                    and getattr(voice_client, "channel", None)
+                    and voice_client.channel.id == channel_id
+                    and not _player_is_active(voice_client)
+                )
+            ):
+                try:
+                    await voice_client.disconnect()
+                except Exception:
+                    pass
+                voice_client = None
 
-        if not voice_client:
-            voice_client = await channel.connect(cls=wavelink.Player, timeout=60.0)
-        elif voice_client.channel.id != channel_id:
-            await voice_client.move_to(channel)
-        await ensure_self_deaf(guild, voice_client)
-        if getattr(voice_client, "channel", None):
-            pending_voice_channels[guild.id] = voice_client.channel.id
+            if not voice_client:
+                if respect_recovery_backoff and BOT_RECOVERY_STAGGER_SECONDS:
+                    await asyncio.sleep(min(BOT_RECOVERY_STAGGER_SECONDS, 45.0))
+                voice_client = await channel.connect(cls=wavelink.Player, timeout=VOICE_CONNECT_TIMEOUT_SECONDS, self_deaf=True)
+            elif voice_client.channel.id != channel_id:
+                await voice_client.move_to(channel)
+            await ensure_self_deaf(guild, voice_client)
+            if getattr(voice_client, "channel", None):
+                pending_voice_channels[guild.id] = voice_client.channel.id
 
-        if isinstance(channel, discord.StageChannel):
-            if guild.me.voice and guild.me.voice.suppress:
-                try: await guild.me.edit(suppress=False)
-                except Exception: pass
+            if isinstance(channel, discord.StageChannel):
+                if guild.me.voice and guild.me.voice.suppress:
+                    try: await guild.me.edit(suppress=False)
+                    except Exception: pass
 
-        await persist_voice_state(guild.id, channel_id, desired_connected=True, connected=True)
-        clear_recovery_backoff(guild.id)
+            await persist_voice_state(guild.id, channel_id, desired_connected=True, connected=True)
+            clear_recovery_backoff(guild.id)
 
-        return voice_client
-    except Exception as e:
-        logger.error(f"[{guild.id}] Voice connect error: {e}")
-        return None
+            return voice_client
+        except Exception as e:
+            logger.error(f"[{guild.id}] Voice connect error: {e}")
+            message = str(e).lower()
+            if isinstance(e, asyncio.TimeoutError) or "exceeded the timeout" in message or "timed out" in message:
+                arm_recovery_backoff(guild.id, seconds=VOICE_CONNECT_TIMEOUT_BACKOFF_SECONDS, reason="voice_connect_timeout")
+                try:
+                    await mark_voice_disconnected(guild.id, channel_id, desired_connected=True, reason="voice_connect_timeout")
+                except Exception:
+                    logger.debug(f"[{guild.id}] Failed to persist voice timeout state.", exc_info=True)
+            return None
 
 async def is_dj(interaction: discord.Interaction, silent=False):
     if interaction.user.guild_permissions.administrator: return True
@@ -1530,7 +1650,7 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
             coro = process_queue(payload.player.guild, _te_channel_id)
             schedule_named_task(f"track_end_process_queue:{payload.player.guild.id}", coro)
 
-async def _process_queue_inner(guild, channel_id, start_position=0):
+async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_recovery_restore=False):
     recovering_guilds.discard(guild.id)
     async with DBPoolManager() as pool:
         async with pool.acquire() as conn:
@@ -1542,7 +1662,7 @@ async def _process_queue_inner(guild, channel_id, start_position=0):
                 await cur.execute("SELECT id, video_url, title, requester_id FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus' ORDER BY id ASC LIMIT 1", (guild.id,))
                 next_song = await cur.fetchone()
 
-                if not next_song:
+                if not next_song and allow_recovery_restore:
                     restored_active = await restore_active_playback_entry(cur, guild.id)
                     restored_backup = 0 if restored_active else await restore_queue_from_backup(cur, guild.id)
                     if restored_active or restored_backup:
@@ -1551,30 +1671,36 @@ async def _process_queue_inner(guild, channel_id, start_position=0):
                         next_song = await cur.fetchone()
 
                 if not next_song:
-                    await cur.execute("UPDATE nexus_playback_state SET is_playing = FALSE, is_paused = FALSE WHERE guild_id = %s AND bot_name = 'nexus'", (guild.id,))
+                    await cur.execute(
+                        "UPDATE nexus_playback_state SET channel_id = NULL, video_url = NULL, title = NULL, position_seconds = 0, is_playing = FALSE, is_paused = FALSE WHERE guild_id = %s AND bot_name = 'nexus'",
+                        (guild.id,),
+                    )
                     playback_tracking.pop(guild.id, None)
+                    guild_states.pop(guild.id, None)
                     invalidate_position_persist(guild.id)
                     clear_recovery_retry(guild.id)
+                    clear_idle_restore_state(guild.id)
+                    await delete_state(guild.id)
                     await bot.change_presence(status=discord.Status.online)
-                    await cur.execute("SELECT COUNT(*) FROM nexus_queue_backup WHERE guild_id = %s AND bot_name = 'nexus'", (guild.id,))
-                    backup_row = await cur.fetchone()
-                    backup_count = backup_row[0] if backup_row else 0
-                    recovery_channel_id = getattr(getattr(guild.voice_client, "channel", None), "id", None) or channel_id
-
-                    if backup_count > 0 and recovery_channel_id:
-                        await remember_recovery_state(guild.id, recovery_channel_id, 0)
-                    else:
-                        guild_states.pop(guild.id, None)
-                        await delete_state(guild.id)
+                    if not allow_recovery_restore:
+                        await cur.execute("DELETE FROM nexus_queue_backup WHERE guild_id = %s AND bot_name = 'nexus'", (guild.id,))
                     if await maybe_enqueue_autodj(cur, guild, channel_id):
                         return
 
                     if _should_auto_disconnect(guild, stay_in_vc) and guild.voice_client:
+                        await mark_voice_disconnected(guild.id, getattr(getattr(guild.voice_client, "channel", None), "id", channel_id), desired_connected=False, reason="queue_complete")
                         await guild.voice_client.disconnect()
+                    elif guild.voice_client and getattr(guild.voice_client, "channel", None):
+                        await persist_voice_state(guild.id, guild.voice_client.channel.id, desired_connected=bool(stay_in_vc), connected=True)
                     return
 
                 song_id, url, title, requester_id = next_song
                 await cur.execute("DELETE FROM nexus_queue WHERE id = %s AND guild_id = %s AND bot_name = 'nexus'", (song_id, guild.id))
+                # FIX 1: Keep backup in sync — remove the track we are about to play
+                await cur.execute(
+                    "DELETE FROM nexus_queue_backup WHERE video_url = %s AND title = %s AND guild_id = %s AND bot_name = 'nexus' LIMIT 1",
+                    (url, title, guild.id),
+                )
 
                 try:
                     track, resolved_source = await resolve_queue_track(url, title)
@@ -1599,7 +1725,7 @@ async def _process_queue_inner(guild, channel_id, start_position=0):
                     await requeue_failed_track(cur, guild.id, channel_id, url, title, requester_id, position=start_position, reason="search_failure")
                     return
 
-                voice_client = await ensure_voice_connection(guild, channel_id)
+                voice_client = await ensure_voice_connection(guild, channel_id, respect_recovery_backoff=allow_recovery_restore)
                 if not voice_client:
                     logger.warning(f"[{guild.id}] Voice connection unavailable. Requeueing '{title}' for recovery.")
                     await requeue_failed_track(cur, guild.id, channel_id, url, title, requester_id, position=start_position, reason="voice_connect")
@@ -1673,7 +1799,7 @@ async def _process_queue_inner(guild, channel_id, start_position=0):
                     embed.add_field(name="Requested by", value=requester_name, inline=True)
                 await send_or_update_status_message(guild, embed)
 
-async def process_queue(guild, channel_id, start_position=0):
+async def process_queue(guild, channel_id, start_position=0, *, allow_recovery_restore=False):
     lock = get_process_queue_lock(guild.id)
     async with lock:
         vc = guild.voice_client
@@ -1683,7 +1809,7 @@ async def process_queue(guild, channel_id, start_position=0):
                 return
             if _player_is_paused(vc) and start_position <= 0:
                 return
-        return await _process_queue_inner(guild, channel_id, start_position=start_position)
+        return await _process_queue_inner(guild, channel_id, start_position=start_position, allow_recovery_restore=allow_recovery_restore)
 
 async def stop_playback(guild):
     playback_tracking.pop(guild.id, None)
@@ -1696,7 +1822,7 @@ async def stop_playback(guild):
     async with DBPoolManager() as pool:
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
-                await cur.execute("UPDATE nexus_playback_state SET is_playing = FALSE, is_paused = FALSE WHERE guild_id = %s AND bot_name = 'nexus'", (guild.id,))
+                await cur.execute("UPDATE nexus_playback_state SET channel_id = NULL, video_url = NULL, title = NULL, position_seconds = 0, is_playing = FALSE, is_paused = FALSE WHERE guild_id = %s AND bot_name = 'nexus'", (guild.id,))
                 await cur.execute("DELETE FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus'", (guild.id,))
                 await cur.execute("DELETE FROM nexus_queue_backup WHERE guild_id = %s AND bot_name = 'nexus'", (guild.id,))
                 await cur.execute("UPDATE nexus_voice_state SET desired_connected = FALSE, connected_channel_id = NULL, disconnected_at = CURRENT_TIMESTAMP WHERE guild_id = %s AND bot_name = 'nexus'", (guild.id,))
@@ -1704,18 +1830,17 @@ async def stop_playback(guild):
     if guild.voice_client: await guild.voice_client.disconnect()
     await bot.change_presence(status=discord.Status.online, activity=discord.Activity(type=discord.ActivityType.watching, name="the Swarm | Idle"))
 
-async def restore_guild_state(guild_id, state):
+async def restore_guild_state(guild_id, state, *, override_backoff=False):
     target_guild_id = int(guild_id)
     guild = bot.get_guild(target_guild_id)
     vc = guild.voice_client if guild else None
 
-    if recovery_backoff_remaining(target_guild_id) > 0 and not (vc and _player_is_active(vc)):
+    if target_guild_id in recovering_guilds:
+        logger.debug(f"[{target_guild_id}] Recovery already active; aborting overlapping heal task.")
         return
 
-    if target_guild_id in recovering_guilds:
-        if vc and _player_is_playing(vc):
-            return
-        recovering_guilds.discard(target_guild_id)
+    if not override_backoff and recovery_backoff_remaining(target_guild_id) > 0 and not (vc and _player_is_active(vc)):
+        return
 
     if target_guild_id in playback_tracking:
         if vc and _player_is_active(vc):
@@ -1728,12 +1853,24 @@ async def restore_guild_state(guild_id, state):
     try:
         if not guild:
             return
+
         vc_id = state.get("voice_channel_id")
-        if not vc_id:
-            return
-        channel = guild.get_channel(vc_id)
+        channel = None
+
+        if vc_id:
+            channel = guild.get_channel(vc_id)
+
+        # NEW: Fallback to home channel if no saved voice channel
         if not channel:
+            channel = await get_home_channel(guild)
+            if channel:
+                logger.info(f"[{target_guild_id}] No saved voice channel — falling back to home channel {channel.id}")
+
+        if not channel:
+            logger.warning(f"[{target_guild_id}] Could not resolve any voice channel for recovery.")
             return
+
+        vc_id = channel.id
 
         async with DBPoolManager() as pool:
             async with pool.acquire() as conn:
@@ -1751,12 +1888,12 @@ async def restore_guild_state(guild_id, state):
         resume_position = max(0, int(db_position if db_position is not None else state.get("position", 0)))
         await remember_recovery_state(target_guild_id, vc_id, resume_position)
 
-        vc = await ensure_voice_connection(guild, vc_id)
+        vc = await ensure_voice_connection(guild, vc_id, respect_recovery_backoff=not override_backoff)
         if not vc:
             schedule_recovery_retry(target_guild_id, vc_id, start_position=resume_position, reason="restore_voice")
             return
 
-        schedule_named_task(f"process_queue:{target_guild_id}", process_queue(guild, vc_id, start_position=resume_position))
+        schedule_named_task(f"process_queue:{target_guild_id}", process_queue(guild, vc_id, start_position=resume_position, allow_recovery_restore=True))
         handoff = True
     except Exception as e:
         logger.error(f"[RESTORE ERROR] {guild_id}: {e}")
@@ -1811,8 +1948,8 @@ async def derive_recovery_state_from_db(guild_id):
     backup_count = backup_row[0] if backup_row else 0
 
     channel_id = playback_channel_id or voice_channel_id or home_channel_id
-    has_playback_state = bool(playback_url or playback_title)
-    has_recoverable_state = bool(channel_id and (has_playback_state or queue_count > 0 or backup_count > 0))
+    has_playback_state = bool((playback_is_playing or playback_position > 0) and (playback_url or playback_title))
+    has_recoverable_state = bool(channel_id and (has_playback_state or queue_count > 0))
     if not has_recoverable_state:
         return None
 
@@ -1847,6 +1984,8 @@ async def bootstrap_recovery_states_from_db():
 
 async def bootstrap_recovery_after_ready():
     try:
+        if BOT_RECOVERY_STAGGER_SECONDS:
+            await asyncio.sleep(BOT_RECOVERY_STAGGER_SECONDS)
         states = await bootstrap_recovery_states_from_db()
         for gid, state in states.items():
             schedule_named_task(f"restore_guild_state:{gid}", restore_guild_state(gid, state))
@@ -1854,32 +1993,31 @@ async def bootstrap_recovery_after_ready():
         logger.error(f"Recovery bootstrap error: {e}")
 
 @tasks.loop(seconds=AUTO_HEAL_INTERVAL)
-
 async def auto_heal_loop():
     global auto_heal_initialized
 
     if not auto_heal_initialized:
-        states = await load_states()
         db_states = await bootstrap_recovery_states_from_db()
         for gid, state in db_states.items():
-            states.setdefault(str(gid), state)
-        for gid, state in states.items():
             schedule_named_task(f"restore_guild_state:{gid}", restore_guild_state(gid, state))
         auto_heal_initialized = True
 
     for gid, state in list(guild_states.items()):
         try:
-            if recovery_backoff_remaining(int(gid)) > 0:
+            normalized_gid = int(gid)
+            if recovery_backoff_remaining(normalized_gid) > 0:
                 continue
-            guild = bot.get_guild(int(gid))
+            retry_task = recovery_retry_tasks.get(normalized_gid)
+            if normalized_gid in recovering_guilds or (retry_task and not retry_task.done()):
+                continue
+            guild = bot.get_guild(normalized_gid)
             if guild:
                 vc = guild.voice_client
                 if (not vc or not vc.is_connected()) or (vc and not _player_is_active(vc) and state.get("voice_channel_id")):
                     logger.info(f"[HEAL] Rejoining/restarting playback for {gid}")
                     if vc and not _player_is_active(vc):
-                        playback_tracking.pop(int(gid), None)
-                        recovering_guilds.discard(int(gid))
-                    schedule_named_task(f"restore_guild_state:{gid}", restore_guild_state(gid, state))
+                        playback_tracking.pop(normalized_gid, None)
+                    schedule_named_task(f"restore_guild_state:{gid}", restore_guild_state(normalized_gid, state))
         except Exception:
             pass
 
@@ -1890,7 +2028,13 @@ async def setup_hook():
 
 @bot.event
 async def on_wavelink_node_ready(payload: wavelink.NodeReadyEventPayload):
+    global lavalink_recovery_bootstrapped
     logger.info(f"🔥 Lavalink Bridge Officially Connected and Locked! (Node: {payload.node.identifier})")
+    if lavalink_recovery_bootstrapped:
+        return
+    lavalink_recovery_bootstrapped = True
+    if BOT_RECOVERY_STAGGER_SECONDS:
+        await asyncio.sleep(BOT_RECOVERY_STAGGER_SECONDS)
     logger.info("Checking for orphaned playback states to auto-resume...")
     try:
         async with DBPoolManager() as pool:
@@ -1904,17 +2048,21 @@ async def on_wavelink_node_ready(payload: wavelink.NodeReadyEventPayload):
                             vc = guild.voice_client
                             if vc and _player_is_playing(vc):
                                 continue
+                            # FIX 7: Skip guilds already being healed by another loop
+                            if guild.id in recovering_guilds:
+                                continue
                             if guild.id in playback_tracking and not (vc and _player_is_active(vc)):
                                 playback_tracking.pop(guild.id, None)
-                            recovering_guilds.discard(guild.id)
                             recovering_guilds.add(guild.id)
                             await restore_active_playback_entry(cur, guild.id)
-                            asyncio.create_task(process_queue(guild, orphan['channel_id'], start_position=orphan['position_seconds']))
+                            schedule_named_task(f"orphan_restore_process_queue:{guild.id}", process_queue(guild, orphan['channel_id'], start_position=orphan['position_seconds'], allow_recovery_restore=True))
     except Exception as e:
         logger.error(f"Auto-resume error: {e}")
 
 @bot.event
 async def on_wavelink_node_closed(node: wavelink.Node, disconnected):
+    global lavalink_recovery_bootstrapped
+    lavalink_recovery_bootstrapped = False
     logger.warning("⚠️ Lavalink Connection Lost! Native self-healing activated...")
     ensure_lavalink_connection_task()
     for guild_id, state in list(guild_states.items()):
@@ -1985,6 +2133,7 @@ async def on_voice_state_update(member, before, after):
 
 @tasks.loop(seconds=METRICS_HEARTBEAT_INTERVAL)
 async def metrics_heartbeat_loop():
+    prune_runtime_state_cache()
     for guild in list(bot.guilds):
         try:
             await reconcile_runtime_playback_state(guild)
@@ -2233,14 +2382,19 @@ async def clear(interaction: discord.Interaction):
         except Exception: pass
     playback_tracking.pop(interaction.guild.id, None)
     guild_states.pop(interaction.guild.id, None)
+    recovering_guilds.discard(interaction.guild.id)
     invalidate_position_persist(interaction.guild.id)
+    clear_recovery_retry(interaction.guild.id)
+    clear_idle_restore_state(interaction.guild.id)
     await delete_state(interaction.guild.id)
     await clear_active_playlist(interaction.guild.id)
     async with DBPoolManager() as pool:
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("DELETE FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus'", (interaction.guild.id,))
-                await cur.execute("UPDATE nexus_playback_state SET is_playing = FALSE, is_paused = FALSE, position_seconds = 0 WHERE guild_id = %s AND bot_name = 'nexus'", (interaction.guild.id,))
+                await cur.execute("DELETE FROM nexus_queue_backup WHERE guild_id = %s AND bot_name = 'nexus'", (interaction.guild.id,))
+                await cur.execute("UPDATE nexus_playback_state SET channel_id = NULL, video_url = NULL, title = NULL, position_seconds = 0, is_playing = FALSE, is_paused = FALSE WHERE guild_id = %s AND bot_name = 'nexus'", (interaction.guild.id,))
+                await cur.execute("UPDATE nexus_voice_state SET desired_connected = FALSE, connected_channel_id = NULL, disconnected_at = CURRENT_TIMESTAMP WHERE guild_id = %s AND bot_name = 'nexus'", (interaction.guild.id,))
     await bot.change_presence(status=discord.Status.online)
     await interaction.response.send_message(embed=discord.Embed(description="🗑️ Playback stopped and queue cleared.", color=discord.Color.red()), ephemeral=True)
 
@@ -2278,6 +2432,13 @@ async def leave(interaction: discord.Interaction):
         clear_idle_restore_state(interaction.guild.id)
         await delete_state(interaction.guild.id)
         await clear_active_playlist(interaction.guild.id)
+        async with DBPoolManager() as pool:
+            async with pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("DELETE FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus'", (interaction.guild.id,))
+                    await cur.execute("DELETE FROM nexus_queue_backup WHERE guild_id = %s AND bot_name = 'nexus'", (interaction.guild.id,))
+                    await cur.execute("UPDATE nexus_playback_state SET channel_id = NULL, video_url = NULL, title = NULL, position_seconds = 0, is_playing = FALSE, is_paused = FALSE WHERE guild_id = %s AND bot_name = 'nexus'", (interaction.guild.id,))
+                    await cur.execute("UPDATE nexus_voice_state SET desired_connected = FALSE, connected_channel_id = NULL, disconnected_at = CURRENT_TIMESTAMP WHERE guild_id = %s AND bot_name = 'nexus'", (interaction.guild.id,))
         await interaction.guild.voice_client.disconnect()
         await interaction.response.send_message(embed=discord.Embed(description="Left the channel.", color=discord.Color.orange()), ephemeral=True)
     else:
@@ -2331,10 +2492,15 @@ async def remove(interaction: discord.Interaction, index: int):
     async with DBPoolManager() as pool:
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
-                await cur.execute("SELECT id FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus' ORDER BY id ASC LIMIT 1 OFFSET %s", (interaction.guild.id, index-1))
+                # FIX 8: Fetch url+title so we can mirror the deletion in the backup
+                await cur.execute("SELECT id, video_url, title FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus' ORDER BY id ASC LIMIT 1 OFFSET %s", (interaction.guild.id, index-1))
                 row = await cur.fetchone()
                 if row:
                     await cur.execute("DELETE FROM nexus_queue WHERE id = %s AND guild_id = %s AND bot_name = 'nexus'", (row[0], interaction.guild.id))
+                    await cur.execute(
+                        "DELETE FROM nexus_queue_backup WHERE video_url = %s AND title = %s AND guild_id = %s AND bot_name = 'nexus' LIMIT 1",
+                        (row[1], row[2], interaction.guild.id),
+                    )
                     await interaction.response.send_message(embed=discord.Embed(description=f"Removed item #{index}", color=discord.Color.green()), ephemeral=True)
                 else: await interaction.response.send_message("Invalid index.", ephemeral=True)
 
@@ -2346,9 +2512,15 @@ async def skipto(interaction: discord.Interaction, index: int):
     async with DBPoolManager() as pool:
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
-                await cur.execute("SELECT id FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus' ORDER BY id ASC LIMIT %s", (interaction.guild.id, index-1))
+                # FIX 9: Fetch url+title so skipped tracks can be removed from backup too
+                await cur.execute("SELECT id, video_url, title FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus' ORDER BY id ASC LIMIT %s", (interaction.guild.id, index-1))
                 rows = await cur.fetchall()
-                for r in rows: await cur.execute("DELETE FROM nexus_queue WHERE id = %s AND guild_id = %s AND bot_name = 'nexus'", (r[0], interaction.guild.id))
+                for r in rows:
+                    await cur.execute("DELETE FROM nexus_queue WHERE id = %s AND guild_id = %s AND bot_name = 'nexus'", (r[0], interaction.guild.id))
+                    await cur.execute(
+                        "DELETE FROM nexus_queue_backup WHERE video_url = %s AND title = %s AND guild_id = %s AND bot_name = 'nexus' LIMIT 1",
+                        (r[1], r[2], interaction.guild.id),
+                    )
     if interaction.guild.voice_client: await interaction.guild.voice_client.stop()
     await interaction.response.send_message(embed=discord.Embed(description=f"Skipped to #{index}", color=discord.Color.green()), ephemeral=True)
 
@@ -2363,12 +2535,10 @@ async def move(interaction: discord.Interaction, frm: int, to: int):
                 if frm > len(q) or to > len(q) or frm < 1 or to < 1:
                     return await interaction.response.send_message("Invalid index", ephemeral=True)
                 item = q.pop(frm - 1)
-                # After popping a lower index, later positions shift left by one.
-                # Example: move #2 to #5 in a 5-item queue should insert after the
-                # new #4, not before it.
+                # FIX 5: Always use (to - 1) as the 0-indexed insertion point.
+                # The old `to - 2` branch when frm < to was off by one and
+                # placed the item one slot before the user's intended position.
                 insert_at = to - 1
-                if frm < to:
-                    insert_at = to - 2
                 q.insert(max(0, min(insert_at, len(q))), item)
                 await cur.execute("DELETE FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus'", (interaction.guild.id,))
                 for r in q:
@@ -2403,6 +2573,8 @@ async def clearmine(interaction: discord.Interaction):
                 removed = row[0] if row else 0
                 if removed:
                     await cur.execute("DELETE FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus' AND requester_id = %s", (interaction.guild.id, interaction.user.id))
+                    # FIX 10: Mirror deletion in the backup queue
+                    await cur.execute("DELETE FROM nexus_queue_backup WHERE guild_id = %s AND bot_name = 'nexus' AND requester_id = %s", (interaction.guild.id, interaction.user.id))
     await interaction.response.send_message(embed=discord.Embed(description=f"🧹 Removed **{removed}** of your queued track(s).", color=discord.Color.green()), ephemeral=True)
 
 @bot.tree.command(name="nexus_main_voteskip", description="Start or join a vote skip when no DJ is around to skip directly")
@@ -2587,7 +2759,7 @@ async def volume(interaction: discord.Interaction, vol: int):
                 await cur.execute("INSERT INTO nexus_guild_settings (guild_id, volume) VALUES (%s, %s) ON DUPLICATE KEY UPDATE volume = %s", (interaction.guild.id, vol, vol))
     if interaction.guild.voice_client:
         try: await interaction.guild.voice_client.set_volume(vol)
-        except: pass
+        except Exception: pass
     await interaction.response.send_message(embed=discord.Embed(description=f"🔊 Volume set to {vol}%", color=discord.Color.green()), ephemeral=True)
 
 @bot.tree.command(name="nexus_main_loop", description="Choose whether playback loops nothing, the current song, or the full queue.")
@@ -2622,7 +2794,7 @@ async def filter_cmd(interaction: discord.Interaction, mode: str):
         elif mode == 'vaporwave': wav_filters.timescale.set(speed=0.8, pitch=0.8)
         elif mode == 'bassboost': wav_filters.equalizer.set(bands=[(0, 0.3), (1, 0.2), (2, 0.1)])
         try: await interaction.guild.voice_client.set_filters(wav_filters)
-        except: pass
+        except Exception: pass
     await interaction.response.send_message(embed=discord.Embed(description=f"🎛️ Filter set to: **{mode}**.", color=discord.Color.blurple()), ephemeral=True)
 
 @bot.tree.command(name="nexus_main_fade", description="Enable or disable smooth fade transitions between tracks for softer playback changes.")
@@ -2659,7 +2831,7 @@ async def modify_audio(interaction: discord.Interaction, speed: float = 1.0, pit
         wav_filters = wavelink.Filters()
         wav_filters.timescale.set(speed=speed, pitch=pitch)
         try: await interaction.guild.voice_client.set_filters(wav_filters)
-        except: pass
+        except Exception: pass
     await interaction.response.send_message(embed=discord.Embed(title="🎛️ Audio Modifiers Set", description=f"**Speed:** {speed}x\n**Pitch:** {pitch}x\n*Active for the next {duration} track(s).* ", color=discord.Color.gold()), ephemeral=True)
 
 # --- SCRUBBING ---
@@ -2679,7 +2851,7 @@ async def forward(interaction: discord.Interaction, seconds: int):
     if not await is_dj(interaction): return
     if interaction.guild.id not in playback_tracking: return await interaction.response.send_message("Nothing playing.", ephemeral=True)
     data = playback_tracking[interaction.guild.id]
-    current = int((time.time() - data['start_time']) * data.get('speed', 1.0) + data['offset'])
+    current = current_track_position(interaction.guild.id)
     new_pos = current + seconds
     if interaction.guild.voice_client:
         await interaction.guild.voice_client.seek(new_pos * 1000)
@@ -2693,7 +2865,7 @@ async def rewind(interaction: discord.Interaction, seconds: int):
     if not await is_dj(interaction): return
     if interaction.guild.id not in playback_tracking: return await interaction.response.send_message("Nothing playing.", ephemeral=True)
     data = playback_tracking[interaction.guild.id]
-    current = int((time.time() - data['start_time']) * data.get('speed', 1.0) + data['offset'])
+    current = current_track_position(interaction.guild.id)
     new_pos = max(0, current - seconds)
     if interaction.guild.voice_client:
         await interaction.guild.voice_client.seek(new_pos * 1000)
@@ -2750,7 +2922,7 @@ async def panel(interaction: discord.Interaction):
             if not await is_dj(i): return
             if i.guild.id not in playback_tracking: return await i.response.send_message("Nothing playing.", ephemeral=True)
             data = playback_tracking[i.guild.id]
-            current = int((time.time() - data['start_time']) * data.get('speed', 1.0) + data['offset'])
+            current = current_track_position(i.guild.id)
             new_pos = max(0, current - 10)
             if i.guild.voice_client:
                 await i.guild.voice_client.seek(new_pos * 1000)
@@ -2763,7 +2935,7 @@ async def panel(interaction: discord.Interaction):
             if not await is_dj(i): return
             if i.guild.id not in playback_tracking: return await i.response.send_message("Nothing playing.", ephemeral=True)
             data = playback_tracking[i.guild.id]
-            current = int((time.time() - data['start_time']) * data.get('speed', 1.0) + data['offset'])
+            current = current_track_position(i.guild.id)
             new_pos = current + 10
             if i.guild.voice_client:
                 await i.guild.voice_client.seek(new_pos * 1000)
@@ -2805,7 +2977,7 @@ async def panel(interaction: discord.Interaction):
 async def nowplaying(interaction: discord.Interaction):
     if interaction.guild.id in playback_tracking:
         data = playback_tracking[interaction.guild.id]
-        cur_t = int((time.time() - data['start_time']) * data.get('speed', 1.0) + data['offset'])
+        cur_t = current_track_position(interaction.guild.id)
         dur = data.get('duration', 0)
         p_bar = make_progress_bar(cur_t, dur)
         embed = discord.Embed(title="🎵 Now Playing", description=f"**[{data.get('title', 'Playing')}]({data['url']})**\n\n`{p_bar}`", color=discord.Color.blue())
@@ -2845,7 +3017,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: discord.
         if not interaction.response.is_done(): await interaction.response.send_message(error_msg, ephemeral=True)
         else: await interaction.followup.send(error_msg, ephemeral=True)
         return
-    logger.error(f"Command {interaction.command.name} failed: {error}", exc_info=True)
+    logger.error(f"Command {getattr(interaction.command, 'name', 'unknown')} failed: {error}", exc_info=True)
     error_msg = f"An error occurred: `{error}`"
     if not interaction.response.is_done(): await interaction.response.send_message(error_msg, ephemeral=True)
     else: await interaction.followup.send(error_msg, ephemeral=True)
@@ -2906,12 +3078,20 @@ def unwrap_search_results(results):
     playlist_like = results if getattr(results, 'url', None) or getattr(results, 'uri', None) else None
     return entries, playlist_like
 
+def _is_explicit_lavalink_query(value):
+    text = str(value or "").strip().lower()
+    if text.startswith(("http://", "https://")):
+        return True
+    return bool(re.match(r"^[a-z0-9_]+search:", text))
+
 async def search_playables(query):
-    cleaned = str(query or '').strip()
+    cleaned = str(query or "").strip()
     if not cleaned:
         return [], None
+    if not _is_explicit_lavalink_query(cleaned):
+        cleaned = f"ytmsearch:{cleaned}"
     if not await ensure_lavalink_ready():
-        raise RuntimeError('Lavalink is still starting up. Try again in a few seconds.')
+        raise RuntimeError("Lavalink is still starting up. Try again in a few seconds.")
     results = await wavelink.Playable.search(cleaned)
     return unwrap_search_results(results)
 
@@ -2921,7 +3101,7 @@ def _is_direct_media_url(value):
 
 def _build_track_title_search(title):
     cleaned = re.sub(r"\s+", " ", str(title or "").strip())
-    return f"ytsearch:{cleaned}" if cleaned else None
+    return f"ytmsearch:{cleaned}" if cleaned else None
 
 async def _expand_media_url(url):
     candidate = str(url or "").strip()
@@ -2995,6 +3175,7 @@ async def playlist_sync_loop():
 
     opts = ytdl_format_options.copy()
     opts['extract_flat'] = True
+    opts['playlistend'] = None  # FIX 4: Remove yt-dlp's default ~150-track pagination cap
     ydl = yt_dlp.YoutubeDL(opts)
     loop = asyncio.get_running_loop()
 
@@ -3064,6 +3245,7 @@ async def aria_command_listener():
                         async with conn.cursor() as cur:
                             await cur.execute("DELETE FROM nexus_swarm_overrides WHERE guild_id = %s AND bot_name = %s", (guild_id, 'nexus'))
                 await request_supervisor_restart("aria_override")
+                continue  # Bot is restarting; skip remaining processing for this row
 
             guild = bot.get_guild(guild_id)
             vc = guild.voice_client if guild else None
@@ -3095,7 +3277,7 @@ async def aria_command_listener():
                                         elif f_mode == 'vaporwave': wav_filters.timescale.set(speed=0.8, pitch=0.8)
                                         elif f_mode == 'bassboost': wav_filters.equalizer.set(bands=[(0, 0.3), (1, 0.2), (2, 0.1)])
                                         try: await vc.set_filters(wav_filters)
-                                        except: pass
+                                        except Exception: pass
                     executed = True
 
                 if executed:
@@ -3194,6 +3376,21 @@ async def resilience_loop():
                         if not (long_idle or disconnected_from_target):
                             continue
 
+                        await cur.execute(
+                            "SELECT is_playing, is_paused, position_seconds, video_url, title FROM nexus_playback_state WHERE guild_id = %s AND bot_name = 'nexus' LIMIT 1",
+                            (guild.id,),
+                        )
+                        playback_row = await cur.fetchone()
+                        has_recovery_playback = bool(
+                            playback_row
+                            and (bool(playback_row[0]) or bool(playback_row[1]) or int(playback_row[2] or 0) > 0)
+                            and (playback_row[3] or playback_row[4])
+                        )
+                        if not has_recovery_playback:
+                            await cur.execute("DELETE FROM nexus_queue_backup WHERE guild_id = %s AND bot_name = 'nexus'", (guild.id,))
+                            clear_idle_restore_state(guild.id)
+                            continue
+
                         restored = await restore_queue_from_backup(cur, guild.id)
                         if restored <= 0 or not target_channel_id:
                             continue
@@ -3202,7 +3399,7 @@ async def resilience_loop():
                         clear_idle_restore_state(guild.id)
                         schedule_recovery_retry(guild.id, target_channel_id, start_position=0, reason="idle_restore")
                         logger.info(f"[{guild.id}] Restored {restored} backup tracks after idle/home recovery.")
-                        asyncio.create_task(process_queue(guild, target_channel_id))
+                        schedule_named_task(f"idle_restore_process_queue:{guild.id}", process_queue(guild, target_channel_id, allow_recovery_restore=True))
     except Exception as e:
         logger.error(f"Resilience Loop Error: {e}")
 
@@ -3222,16 +3419,28 @@ async def zombie_reaper_loop():
                                 backup_row = await cur.fetchone()
                                 backup_count = backup_row[0] if backup_row else 0
                                 if backup_count > 0:
+                                    await cur.execute(
+                                        "SELECT is_playing, is_paused, position_seconds, video_url, title FROM nexus_playback_state WHERE guild_id = %s AND bot_name = 'nexus' LIMIT 1",
+                                        (guild.id,),
+                                    )
+                                    playback_row = await cur.fetchone()
+                                    has_recovery_playback = bool(
+                                        playback_row
+                                        and (bool(playback_row[0]) or bool(playback_row[1]) or int(playback_row[2] or 0) > 0)
+                                        and (playback_row[3] or playback_row[4])
+                                    )
                                     recovery_channel_id = getattr(getattr(vc, "channel", None), "id", None) or guild_states.get(guild.id, {}).get("voice_channel_id")
-                                    if recovery_channel_id:
+                                    if has_recovery_playback and recovery_channel_id:
                                         await remember_recovery_state(guild.id, recovery_channel_id, 0)
                                         restored = await restore_queue_from_backup(cur, guild.id)
                                         if restored > 0:
                                             clear_idle_restore_state(guild.id)
                                             schedule_recovery_retry(guild.id, recovery_channel_id, start_position=0, reason="zombie_restore")
-                                            asyncio.create_task(process_queue(guild, recovery_channel_id))
+                                            schedule_named_task(f"zombie_restore_process_queue:{guild.id}", process_queue(guild, recovery_channel_id, allow_recovery_restore=True))
+                                    else:
+                                        await cur.execute("DELETE FROM nexus_queue_backup WHERE guild_id = %s AND bot_name = 'nexus'", (guild.id,))
                                     playback_tracking.pop(guild.id, None)
-                                    await cur.execute("UPDATE nexus_playback_state SET is_playing = FALSE, is_paused = FALSE WHERE guild_id = %s AND bot_name = 'nexus'", (guild.id,))
+                                    await cur.execute("UPDATE nexus_playback_state SET channel_id = NULL, video_url = NULL, title = NULL, position_seconds = 0, is_playing = FALSE, is_paused = FALSE WHERE guild_id = %s AND bot_name = 'nexus'", (guild.id,))
                                     continue
                                 await cur.execute("SELECT stay_in_vc FROM nexus_guild_settings WHERE guild_id = %s", (guild.id,))
                                 cfg = await cur.fetchone()
@@ -3240,8 +3449,9 @@ async def zombie_reaper_loop():
                                     await stop_playback(guild)
                                 else:
                                     playback_tracking.pop(guild.id, None)
-                                    await cur.execute("UPDATE nexus_playback_state SET is_playing = FALSE, is_paused = FALSE WHERE guild_id = %s AND bot_name = 'nexus'", (guild.id,))
-            except: pass
+                                    await cur.execute("UPDATE nexus_playback_state SET channel_id = NULL, video_url = NULL, title = NULL, position_seconds = 0, is_playing = FALSE, is_paused = FALSE WHERE guild_id = %s AND bot_name = 'nexus'", (guild.id,))
+            except Exception:
+                logger.exception("[nexus] Zombie reaper failed for guild %s.", guild.id)
 
 @tasks.loop(hours=24.0)
 async def database_janitor_loop():
@@ -3324,7 +3534,8 @@ async def direct_order_listener():
                                     try:
                                         await send_feedback(guild, discord.Embed(title="🎶 Direct Order Received", description=f"Aria successfully deposited **{added_count}** tracks into my matrix. Booting audio engine...", color=discord.Color.green()))
                                         await send_webhook_log(bot.user.name if bot.user else "Unknown Node", "📥 Matrix Loaded", f"Aria routed a payload of **{added_count}** tracks directly into `{guild.name}`.", discord.Color.blue())
-                                    except: pass
+                                    except Exception:
+                                        pass
                         except Exception as e:
                             logger.error(f"Direct Play Extractor Error: {e}")
 
@@ -3366,16 +3577,25 @@ async def direct_order_listener():
                     executed = True
 
                 elif cmd == 'RECOVER':
-                    state = await derive_recovery_state_from_db(guild.id)
-                    recover_channel_id = order.get('vc_id') or (state or {}).get('voice_channel_id')
-                    if recover_channel_id:
-                        recover_state = dict(state or {})
-                        recover_state['voice_channel_id'] = recover_channel_id
-                        recover_state['position'] = int((state or {}).get('position', 0) or 0)
-                        await restore_guild_state(guild.id, recover_state)
+                    force_recover = isinstance(data, str) and data.strip().lower() in {'force', 'override', 'admin'}
+                    remaining_backoff = recovery_backoff_remaining(guild.id)
+                    if remaining_backoff > 0 and not force_recover:
+                        logger.info("[%s] Dropped RECOVER order for guild %s because recovery is paused for another %ss.", BOT_ENV_PREFIX.lower(), guild.id, remaining_backoff)
                         executed = True
                     else:
-                        logger.warning("[nexus] Could not resolve RECOVER target for guild %s.", guild.id)
+                        state = await derive_recovery_state_from_db(guild.id)
+                        recover_channel_id = order.get('vc_id') or (state or {}).get('voice_channel_id')
+                        if recover_channel_id:
+                            recover_state = dict(state or {})
+                            recover_state['voice_channel_id'] = recover_channel_id
+                            recover_state['position'] = int((state or {}).get('position', 0) or 0)
+                            if force_recover:
+                                clear_recovery_backoff(guild.id)
+                                clear_auto_restore_snooze(guild.id)
+                            await restore_guild_state(guild.id, recover_state, override_backoff=force_recover)
+                            executed = True
+                        else:
+                            logger.warning("[%s] Could not resolve RECOVER target for guild %s.", BOT_ENV_PREFIX.lower(), guild.id)
 
                 elif cmd == 'LEAVE':
                     force_leave = isinstance(data, str) and data.strip().lower() in {'force', 'override', 'admin'}
@@ -3495,6 +3715,9 @@ class SwarmIntelligence(commands.Cog):
             for guild in self.bot.guilds:
                 if recovery_backoff_remaining(guild.id) > 0:
                     continue
+                # FIX 3: Never let the watchdog interfere with an in-progress recovery
+                if guild.id in recovering_guilds:
+                    continue
                 vc = guild.voice_client
                 if vc and not _player_is_active(vc):
                     if guild.id in playback_tracking:
@@ -3527,8 +3750,9 @@ class SwarmIntelligence(commands.Cog):
                                         track_info['start_time'] = now
                                         track_info['offset'] = current_pos
                                         await send_webhook_log(self.bot.user.name if self.bot.user else "Unknown Node", "⚙️ Watchdog Revival", f"Detected playback stall in `{guild.name}`. Recovering track safely at {current_pos}s.", discord.Color.orange())
-                                        asyncio.create_task(process_queue(guild, track_info.get('channel_id'), start_position=current_pos))
-        except: pass
+                                        schedule_named_task(f"watchdog_recovery_process_queue:{guild.id}", process_queue(guild, track_info.get('channel_id'), start_position=current_pos))
+        except Exception:
+            logger.exception("[nexus] Watchdog tick failed.")
 
     @status_updater.before_loop
     @heartbeat.before_loop
