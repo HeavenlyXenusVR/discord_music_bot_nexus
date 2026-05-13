@@ -603,6 +603,7 @@ bot = commands.Bot(command_prefix="/", intents=intents)
 bot.start_time = time.time()
 playback_tracking = {}
 guild_states = {}
+STATE_FILE_WRITE_CACHE = {}
 auto_heal_initialized = False
 recovering_guilds = set()
 process_queue_locks = {}
@@ -653,14 +654,22 @@ def _cache_get(cache, key, ttl_seconds):
     if time.time() - timestamp > ttl_seconds:
         cache.pop(key, None)
         return None
+    try:
+        cache.pop(key, None)
+        cache[key] = (value, timestamp)
+    except Exception:
+        pass
     return value
 
 def _cache_set(cache, key, value):
+    if key in cache:
+        cache.pop(key, None)
     cache[key] = (value, time.time())
-    if len(cache) > MAX_FEATURE_CACHE_ENTRIES:
-        oldest = sorted(cache.items(), key=lambda kv: kv[1][1])[: max(1, len(cache) - MAX_FEATURE_CACHE_ENTRIES)]
-        for old_key, _ in oldest:
-            cache.pop(old_key, None)
+    while len(cache) > MAX_FEATURE_CACHE_ENTRIES:
+        try:
+            cache.pop(next(iter(cache)), None)
+        except StopIteration:
+            break
     return value
 
 def _cache_drop_guild(cache, guild_id):
@@ -829,7 +838,14 @@ SWARM_BRIDGE_DB_ERROR_LOG_INTERVAL_SECONDS = max(
     30.0,
     float(os.getenv(f"{BOT_ENV_PREFIX}_SWARM_BRIDGE_DB_ERROR_LOG_INTERVAL_SECONDS", os.getenv("SWARM_BRIDGE_DB_ERROR_LOG_INTERVAL_SECONDS", "120"))),
 )
+SWARM_COMMAND_TABLES_RECHECK_SECONDS = max(
+    30.0,
+    float(os.getenv(f"{BOT_ENV_PREFIX}_SWARM_COMMAND_TABLES_RECHECK_SECONDS", os.getenv("SWARM_COMMAND_TABLES_RECHECK_SECONDS", "60"))),
+)
 _last_swarm_bridge_db_error_log_at = 0.0
+swarm_command_tables_ready = False
+swarm_command_tables_retry_after = 0.0
+swarm_command_tables_lock = asyncio.Lock()
 
 # Discord can rate-limit /users/@me when all swarm containers login at once
 # or when Docker restart:always creates a fast crash loop. These delays keep
@@ -1375,17 +1391,22 @@ async def save_state(guild_id):
     state = guild_states.get(guild_id) or guild_states.get(str(guild_id))
     if not state:
         return
+    cache_key = _runtime_key(guild_id)
     path = f"state_{guild_id}.json"
     tmp_path = f"{path}.tmp"
     try:
+        state_json = json.dumps(state, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        if STATE_FILE_WRITE_CACHE.get(cache_key) == state_json and os.path.exists(path):
+            return
         with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(state, f)
+            f.write(state_json)
             f.flush()
             try:
                 os.fsync(f.fileno())
             except Exception:
                 pass
         os.replace(tmp_path, path)
+        STATE_FILE_WRITE_CACHE[cache_key] = state_json
     except Exception:
         try:
             if os.path.exists(tmp_path):
@@ -1402,6 +1423,7 @@ async def load_states():
                 gid = int(gid_text)
                 with open(file, encoding="utf-8") as f:
                     states[gid] = json.load(f)
+                STATE_FILE_WRITE_CACHE[gid] = json.dumps(states[gid], ensure_ascii=False, separators=(",", ":"), sort_keys=True)
             except Exception:
                 pass
     return states
@@ -1409,6 +1431,7 @@ async def load_states():
 async def delete_state(guild_id):
     for key in (guild_id, str(guild_id)):
         guild_states.pop(key, None)
+    STATE_FILE_WRITE_CACHE.pop(_runtime_key(guild_id), None)
     try:
         os.remove(f"state_{guild_id}.json")
     except FileNotFoundError:
@@ -1707,13 +1730,23 @@ async def collect_and_persist_metrics(guild=None):
                         player_playing = bool(vc and _player_is_playing(vc))
                         player_paused = bool(vc and _player_is_paused(vc))
                         live_position = current_track_position(g.id) if (player_playing or player_paused or g.id in playback_tracking) else 0
-                        await cur.execute("SELECT COUNT(*) AS total FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus'", (g.id,))
-                        queue_row = await cur.fetchone() or {}
-                        await cur.execute("SELECT COUNT(*) AS total FROM nexus_queue_backup WHERE guild_id = %s AND bot_name = 'nexus'", (g.id,))
-                        backup_row = await cur.fetchone() or {}
-                        await cur.execute("SELECT is_playing, is_paused, position_seconds FROM nexus_playback_state WHERE guild_id = %s AND bot_name = 'nexus' LIMIT 1", (g.id,))
-                        playback_row = await cur.fetchone() or {}
-                        if not voice_connected and (playback_row.get("is_playing") or playback_row.get("is_paused")):
+                        await cur.execute(
+                            """
+                            SELECT
+                                (SELECT COUNT(*) FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus') AS queue_total,
+                                (SELECT COUNT(*) FROM nexus_queue_backup WHERE guild_id = %s AND bot_name = 'nexus') AS backup_total,
+                                ps.is_playing,
+                                ps.is_paused,
+                                ps.position_seconds
+                            FROM (SELECT %s AS guild_id) seed
+                            LEFT JOIN nexus_playback_state ps
+                              ON ps.guild_id = seed.guild_id AND ps.bot_name = 'nexus'
+                            LIMIT 1
+                            """,
+                            (g.id, g.id, g.id),
+                        )
+                        metrics_row = await cur.fetchone() or {}
+                        if not voice_connected and (metrics_row.get("is_playing") or metrics_row.get("is_paused")):
                             await cur.execute("UPDATE nexus_playback_state SET is_playing = FALSE, is_paused = FALSE WHERE guild_id = %s AND bot_name = 'nexus'", (g.id,))
                         elif voice_connected and (player_playing or player_paused or g.id in playback_tracking):
                             await cur.execute(
@@ -1735,10 +1768,10 @@ async def collect_and_persist_metrics(guild=None):
                                 voice_connected,
                                 player_playing,
                                 player_paused,
-                                int(queue_row.get("total") or 0),
-                                int(backup_row.get("total") or 0),
-                                bool(playback_row.get("is_playing")) if voice_connected else False,
-                                bool(playback_row.get("is_paused")) if voice_connected else False,
+                                int(metrics_row.get("queue_total") or 0),
+                                int(metrics_row.get("backup_total") or 0),
+                                bool(metrics_row.get("is_playing")) if voice_connected else False,
+                                bool(metrics_row.get("is_paused")) if voice_connected else False,
                                 int(live_position or playback_row.get("position_seconds") or 0),
                                 g.id in recovering_guilds or str(g.id) in guild_states,
                                 bool(lavalink_ready),
@@ -4027,42 +4060,54 @@ bot.add_listener(on_ready_aria_listener, 'on_ready')
 
 
 async def ensure_swarm_command_tables():
-    global _last_swarm_bridge_db_error_log_at
-    try:
-        async with DBPoolManager() as pool:
-            async with pool.acquire() as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute("CREATE TABLE IF NOT EXISTS nexus_swarm_overrides (guild_id BIGINT, bot_name VARCHAR(50), command VARCHAR(20), attempts INT NOT NULL DEFAULT 0, last_error TEXT NULL, PRIMARY KEY(guild_id, bot_name))")
-                    await cur.execute("CREATE TABLE IF NOT EXISTS nexus_swarm_direct_orders (id INT AUTO_INCREMENT PRIMARY KEY, bot_name VARCHAR(50), guild_id BIGINT, vc_id BIGINT NULL, text_channel_id BIGINT NULL, command VARCHAR(50), data TEXT NULL, attempts INT NOT NULL DEFAULT 0, last_error TEXT NULL)")
-                    for stmt in [
-                        "ALTER TABLE nexus_swarm_overrides ADD COLUMN bot_name VARCHAR(50) DEFAULT 'nexus'",
-                        "ALTER TABLE nexus_swarm_overrides ADD COLUMN command VARCHAR(20) NULL",
-                        "ALTER TABLE nexus_swarm_direct_orders ADD COLUMN vc_id BIGINT NULL",
-                        "ALTER TABLE nexus_swarm_direct_orders ADD COLUMN text_channel_id BIGINT NULL",
-                        "ALTER TABLE nexus_swarm_direct_orders ADD COLUMN command VARCHAR(50) NULL",
-                        "ALTER TABLE nexus_swarm_direct_orders ADD COLUMN data TEXT NULL",
-                        "ALTER TABLE nexus_swarm_overrides ADD COLUMN attempts INT NOT NULL DEFAULT 0",
-                        "ALTER TABLE nexus_swarm_overrides ADD COLUMN last_error TEXT NULL",
-                        "ALTER TABLE nexus_swarm_direct_orders ADD COLUMN attempts INT NOT NULL DEFAULT 0",
-                        "ALTER TABLE nexus_swarm_direct_orders ADD COLUMN last_error TEXT NULL",
-                        "ALTER TABLE nexus_swarm_direct_orders ADD COLUMN claimed_at TIMESTAMP NULL",
-                        "ALTER TABLE nexus_swarm_direct_orders ADD COLUMN claim_token VARCHAR(128) NULL",
-                        "ALTER TABLE nexus_swarm_direct_orders ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
-                        "ALTER TABLE nexus_swarm_direct_orders ADD INDEX nexus_direct_unclaimed_idx (bot_name, guild_id, claimed_at, id)",
-                        "ALTER TABLE nexus_swarm_direct_orders ADD INDEX nexus_direct_claim_token_idx (claim_token)",
-                        "ALTER TABLE nexus_swarm_direct_orders ADD INDEX nexus_direct_recent_idx (bot_name, guild_id, command, created_at)",
-                    ]:
-                        try:
-                            await cur.execute(stmt)
-                        except Exception:
-                            pass
+    global _last_swarm_bridge_db_error_log_at, swarm_command_tables_ready, swarm_command_tables_retry_after
+    if swarm_command_tables_ready:
         return True
-    except Exception as exc:
-        now = time.time()
-        if now - _last_swarm_bridge_db_error_log_at >= SWARM_BRIDGE_DB_ERROR_LOG_INTERVAL_SECONDS:
-            _last_swarm_bridge_db_error_log_at = now
-            logger.warning("Swarm command tables unavailable for nexus; bridge listeners will retry: %s", exc)
+    now = time.time()
+    if now < swarm_command_tables_retry_after:
         return False
+    async with swarm_command_tables_lock:
+        if swarm_command_tables_ready:
+            return True
+        if time.time() < swarm_command_tables_retry_after:
+            return False
+        try:
+            async with DBPoolManager() as pool:
+                async with pool.acquire() as conn:
+                    async with conn.cursor() as cur:
+                        await cur.execute("CREATE TABLE IF NOT EXISTS nexus_swarm_overrides (guild_id BIGINT, bot_name VARCHAR(50), command VARCHAR(20), attempts INT NOT NULL DEFAULT 0, last_error TEXT NULL, PRIMARY KEY(guild_id, bot_name))")
+                        await cur.execute("CREATE TABLE IF NOT EXISTS nexus_swarm_direct_orders (id INT AUTO_INCREMENT PRIMARY KEY, bot_name VARCHAR(50), guild_id BIGINT, vc_id BIGINT NULL, text_channel_id BIGINT NULL, command VARCHAR(50), data TEXT NULL, attempts INT NOT NULL DEFAULT 0, last_error TEXT NULL)")
+                        for stmt in [
+                            "ALTER TABLE nexus_swarm_overrides ADD COLUMN bot_name VARCHAR(50) DEFAULT 'nexus'",
+                            "ALTER TABLE nexus_swarm_overrides ADD COLUMN command VARCHAR(20) NULL",
+                            "ALTER TABLE nexus_swarm_direct_orders ADD COLUMN vc_id BIGINT NULL",
+                            "ALTER TABLE nexus_swarm_direct_orders ADD COLUMN text_channel_id BIGINT NULL",
+                            "ALTER TABLE nexus_swarm_direct_orders ADD COLUMN command VARCHAR(50) NULL",
+                            "ALTER TABLE nexus_swarm_direct_orders ADD COLUMN data TEXT NULL",
+                            "ALTER TABLE nexus_swarm_overrides ADD COLUMN attempts INT NOT NULL DEFAULT 0",
+                            "ALTER TABLE nexus_swarm_overrides ADD COLUMN last_error TEXT NULL",
+                            "ALTER TABLE nexus_swarm_direct_orders ADD COLUMN attempts INT NOT NULL DEFAULT 0",
+                            "ALTER TABLE nexus_swarm_direct_orders ADD COLUMN last_error TEXT NULL",
+                            "ALTER TABLE nexus_swarm_direct_orders ADD COLUMN claimed_at TIMESTAMP NULL",
+                            "ALTER TABLE nexus_swarm_direct_orders ADD COLUMN claim_token VARCHAR(128) NULL",
+                            "ALTER TABLE nexus_swarm_direct_orders ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+                            "ALTER TABLE nexus_swarm_direct_orders ADD INDEX nexus_direct_unclaimed_idx (bot_name, guild_id, claimed_at, id)",
+                            "ALTER TABLE nexus_swarm_direct_orders ADD INDEX nexus_direct_claim_token_idx (claim_token)",
+                            "ALTER TABLE nexus_swarm_direct_orders ADD INDEX nexus_direct_recent_idx (bot_name, guild_id, command, created_at)",
+                        ]:
+                            try:
+                                await cur.execute(stmt)
+                            except Exception:
+                                pass
+            swarm_command_tables_ready = True
+            return True
+        except Exception as exc:
+            now = time.time()
+            swarm_command_tables_retry_after = now + SWARM_COMMAND_TABLES_RECHECK_SECONDS
+            if now - _last_swarm_bridge_db_error_log_at >= SWARM_BRIDGE_DB_ERROR_LOG_INTERVAL_SECONDS:
+                _last_swarm_bridge_db_error_log_at = now
+                logger.warning("Swarm command tables unavailable for nexus; bridge listeners will retry: %s", exc)
+            return False
 
 # --- AUTOMATED BACKGROUND MAINTENANCE ---
 @tasks.loop(seconds=15.0)
@@ -4423,6 +4468,7 @@ class SwarmIntelligence(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.bot_name = 'nexus'
+        self._last_presence_state = None
         self.status_updater.start()
         self.heartbeat.start()
         self.watchdog.start()
@@ -4470,9 +4516,16 @@ class SwarmIntelligence(commands.Cog):
         try:
             title, guild_name = await self._best_presence_title()
             if title:
-                await self.bot.change_presence(status=discord.Status.online, activity=discord.Activity(type=discord.ActivityType.listening, name=str(title).replace("\n", " ").strip()[:120]))
+                activity_type = discord.ActivityType.listening
+                activity_name = str(title).replace("\n", " ").strip()[:120]
+            else:
+                activity_type = discord.ActivityType.watching
+                activity_name = "the Swarm | Idle"
+            presence_state = (activity_type, activity_name)
+            if self._last_presence_state == presence_state:
                 return
-            await self.bot.change_presence(status=discord.Status.online, activity=discord.Activity(type=discord.ActivityType.watching, name="the Swarm | Idle"))
+            await self.bot.change_presence(status=discord.Status.online, activity=discord.Activity(type=activity_type, name=activity_name))
+            self._last_presence_state = presence_state
         except (aiohttp.ClientConnectionResetError, ConnectionResetError):
             logger.debug("[%s] Presence update skipped while the gateway transport was closing.", self.bot_name)
         except Exception:
