@@ -30,3 +30,7 @@
 *
 *
 *
+
+* Smart Auto-DJ learning layer: persists track intelligence, per-user taste, likes/dislikes, and recommendation logs.
+* Smart recommendation command: queues learned suggestions from server history, user playlists, and listener feedback.
+* Taste profile commands: users can like, dislike, and inspect what the recommendation engine has learned.

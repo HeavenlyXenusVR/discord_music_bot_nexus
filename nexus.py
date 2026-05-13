@@ -16,6 +16,7 @@ from discord.ext import commands, tasks
 from discord import app_commands
 import re
 import urllib.parse
+import hashlib
 
 # --- DAVE PROTOCOL MONKEYPATCH (FIXES LAVALINK 4.2.2 E2EE ENCRYPTION) ---
 original_request = aiohttp.ClientSession.request
@@ -638,13 +639,24 @@ REQUESTER_NAME_CACHE_TTL_SECONDS = max(60.0, float(os.getenv(f"{BOT_ENV_PREFIX}_
 AUTO_DJ_CACHE_TTL_SECONDS = max(5.0, float(os.getenv(f"{BOT_ENV_PREFIX}_AUTO_DJ_CACHE_TTL_SECONDS", os.getenv("AUTO_DJ_CACHE_TTL_SECONDS", "30"))))
 GUILD_SETTINGS_CACHE_TTL_SECONDS = max(5.0, float(os.getenv(f"{BOT_ENV_PREFIX}_GUILD_SETTINGS_CACHE_TTL_SECONDS", os.getenv("GUILD_SETTINGS_CACHE_TTL_SECONDS", "30"))))
 HOME_CHANNEL_CACHE_TTL_SECONDS = max(5.0, float(os.getenv(f"{BOT_ENV_PREFIX}_HOME_CHANNEL_CACHE_TTL_SECONDS", os.getenv("HOME_CHANNEL_CACHE_TTL_SECONDS", "30"))))
-SEARCH_CACHE_TTL_SECONDS = max(10.0, float(os.getenv(f"{BOT_ENV_PREFIX}_SEARCH_CACHE_TTL_SECONDS", os.getenv("SEARCH_CACHE_TTL_SECONDS", "120"))))
+SEARCH_CACHE_TTL_SECONDS = max(10.0, float(os.getenv(f"{BOT_ENV_PREFIX}_SEARCH_CACHE_TTL_SECONDS", os.getenv("SEARCH_CACHE_TTL_SECONDS", "900"))))
 VOICE_STATUS_DEDUP_SECONDS = max(10.0, float(os.getenv(f"{BOT_ENV_PREFIX}_VOICE_STATUS_DEDUP_SECONDS", os.getenv("VOICE_STATUS_DEDUP_SECONDS", "60"))))
 STATUS_MESSAGE_DEDUP_SECONDS = max(5.0, float(os.getenv(f"{BOT_ENV_PREFIX}_STATUS_MESSAGE_DEDUP_SECONDS", os.getenv("STATUS_MESSAGE_DEDUP_SECONDS", "20"))))
 VOICE_STATE_DEDUP_SECONDS = max(5.0, float(os.getenv(f"{BOT_ENV_PREFIX}_VOICE_STATE_DEDUP_SECONDS", os.getenv("VOICE_STATE_DEDUP_SECONDS", "12"))))
 AUTODJ_MIN_INTERVAL_SECONDS = max(5.0, float(os.getenv(f"{BOT_ENV_PREFIX}_AUTODJ_MIN_INTERVAL_SECONDS", os.getenv("AUTODJ_MIN_INTERVAL_SECONDS", "20"))))
 AUTODJ_FAILURE_BACKOFF_SECONDS = max(15.0, float(os.getenv(f"{BOT_ENV_PREFIX}_AUTODJ_FAILURE_BACKOFF_SECONDS", os.getenv("AUTODJ_FAILURE_BACKOFF_SECONDS", "90"))))
-MAX_FEATURE_CACHE_ENTRIES = max(64, int(os.getenv(f"{BOT_ENV_PREFIX}_FEATURE_CACHE_MAX", os.getenv("FEATURE_CACHE_MAX", "1024"))))
+MAX_FEATURE_CACHE_ENTRIES = max(64, int(os.getenv(f"{BOT_ENV_PREFIX}_FEATURE_CACHE_MAX", os.getenv("FEATURE_CACHE_MAX", "4096"))))
+LAVALINK_TRACK_CACHE_CAPACITY = max(100, int(os.getenv(f"{BOT_ENV_PREFIX}_LAVALINK_TRACK_CACHE_CAPACITY", os.getenv("LAVALINK_TRACK_CACHE_CAPACITY", "1000"))))
+YTDLP_CACHE_DIR = os.getenv(f"{BOT_ENV_PREFIX}_YTDLP_CACHE_DIR", os.getenv("YTDLP_CACHE_DIR", "/app/.cache/yt-dlp")).strip() or "/app/.cache/yt-dlp"
+try:
+    os.makedirs(YTDLP_CACHE_DIR, exist_ok=True)
+except Exception:
+    pass
+SMART_RECENT_HISTORY_LIMIT = max(12, int(os.getenv(f"{BOT_ENV_PREFIX}_SMART_RECENT_HISTORY_LIMIT", os.getenv("SMART_RECENT_HISTORY_LIMIT", "36"))))
+SMART_SEED_POOL_LIMIT = max(10, int(os.getenv(f"{BOT_ENV_PREFIX}_SMART_SEED_POOL_LIMIT", os.getenv("SMART_SEED_POOL_LIMIT", "40"))))
+SMART_CANDIDATE_SCAN_LIMIT = max(3, int(os.getenv(f"{BOT_ENV_PREFIX}_SMART_CANDIDATE_SCAN_LIMIT", os.getenv("SMART_CANDIDATE_SCAN_LIMIT", "12"))))
+SMART_FEEDBACK_SCORE = float(os.getenv(f"{BOT_ENV_PREFIX}_SMART_FEEDBACK_SCORE", os.getenv("SMART_FEEDBACK_SCORE", "4.0")))
+SMART_AUTODJ_RADIO_SUFFIXES = tuple(part.strip() for part in os.getenv(f"{BOT_ENV_PREFIX}_SMART_AUTODJ_SUFFIXES", os.getenv("SMART_AUTODJ_SUFFIXES", "radio,audio,playlist,mix")).split(",") if part.strip())
 
 def _cache_get(cache, key, ttl_seconds):
     item = cache.get(key)
@@ -1109,7 +1121,7 @@ async def _connect_lavalink_forever():
                 continue
             try:
                 logger.info(f"Connecting to Lavalink at {LAVALINK_URI}")
-                await wavelink.Pool.connect(nodes=[wavelink.Node(uri=LAVALINK_URI, password=LAVALINK_PASSWORD)], client=bot, cache_capacity=100)
+                await wavelink.Pool.connect(nodes=[wavelink.Node(uri=LAVALINK_URI, password=LAVALINK_PASSWORD)], client=bot, cache_capacity=LAVALINK_TRACK_CACHE_CAPACITY)
             except Exception as exc:
                 logger.warning(f"Waiting for Lavalink to boot or authenticate... Retrying in 5s ({exc})")
                 await asyncio.sleep(5)
@@ -1224,24 +1236,10 @@ async def set_autodj_enabled(guild_id, enabled):
     invalidate_feature_caches(guild_id)
     _cache_set(AUTO_DJ_ENABLED_CACHE, int(guild_id), bool(enabled))
 
-async def build_autodj_query(cur, guild_id):
-    await cur.execute("SELECT title FROM nexus_history WHERE guild_id = %s ORDER BY played_at DESC LIMIT 12", (guild_id,))
-    recent_rows = await cur.fetchall()
-    _t = lambda r: r.get("title") if isinstance(r, dict) else r[0]
-    recent_titles = []
-    seen = set()
-    for row in recent_rows:
-        title = _t(row) if row else None
-        cleaned = re.sub(r"\s*\([^)]*\)|\s*\[[^\]]*\]", "", str(title or "")).strip()
-        key = cleaned.lower()
-        if cleaned and key not in seen:
-            recent_titles.append(cleaned)
-            seen.add(key)
-    if recent_titles:
-        seed_title = random.choice(recent_titles[:5])
-        return f"ytmsearch:{seed_title} audio"
-    fallback_terms = ["lofi hip hop", "synthwave mix", "chill electronic", "gaming music", "jazz hop"]
-    return f"ytmsearch:{random.choice(fallback_terms)}"
+async def build_autodj_query(cur, guild_id, listener_ids=None):
+    recommendation = await build_smart_recommendation(cur, guild_id, listener_ids=listener_ids)
+    return recommendation["query"]
+
 
 async def maybe_enqueue_autodj(cur, guild, channel_id):
     now = time.time()
@@ -1252,34 +1250,22 @@ async def maybe_enqueue_autodj(cur, guild, channel_id):
     if not await get_autodj_enabled(guild.id):
         return False
     AUTODJ_LAST_RUN[guild.id] = now
-    query = await build_autodj_query(cur, guild.id)
+    listener_ids = _member_ids_from_voice_channel(guild, channel_id)
     try:
-        entries, _playlist_result = await search_playables(query)
-        history_titles = set()
-        await cur.execute("SELECT title FROM nexus_history WHERE guild_id = %s ORDER BY played_at DESC LIMIT 18", (guild.id,))
-        for row in await cur.fetchall():
-            _rv = row.get("title") if isinstance(row, dict) else row[0]
-            if row and _rv:
-                history_titles.add(str(_rv).strip().lower())
-        chosen = None
-        for entry in entries:
-            title_key = str(getattr(entry, 'title', '')).strip().lower()
-            if title_key and title_key not in history_titles:
-                chosen = entry
-                break
-        if not chosen and entries:
-            chosen = entries[0]
+        chosen, recommendation = await pick_smart_recommendation_track(cur, guild.id, listener_ids=listener_ids)
         if not chosen:
             AUTODJ_FAIL_UNTIL[guild.id] = time.time() + AUTODJ_FAILURE_BACKOFF_SECONDS
             return False
-        await enqueue_track(cur, guild.id, chosen.uri, chosen.title, bot.user.id if bot.user else None)
+        requester_id = bot.user.id if bot.user else None
+        await enqueue_track(cur, guild.id, chosen.uri, chosen.title, requester_id)
+        await record_smart_recommendation(cur, guild.id, requester_id, recommendation, chosen, reason="autodj")
+        logger.info("[%s] Auto-DJ queued smart recommendation '%s' from %s.", guild.id, getattr(chosen, "title", "Unknown"), recommendation.get("reason"))
         schedule_named_task(f"autodj_process_queue:{guild.id}", process_queue(guild, channel_id))
         return True
     except Exception as exc:
         AUTODJ_FAIL_UNTIL[guild.id] = time.time() + AUTODJ_FAILURE_BACKOFF_SECONDS
         logger.warning(f"[{guild.id}] Auto-DJ recommendation failed: {exc}")
         return False
-
 
 async def get_saved_settings_summary(guild_id):
     cached = _cache_get(GUILD_SETTINGS_CACHE, int(guild_id), GUILD_SETTINGS_CACHE_TTL_SECONDS)
@@ -1298,7 +1284,8 @@ ytdl_format_options = {
     'format': 'bestaudio/best', 'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
     'restrictfilenames': True, 'noplaylist': True, 'nocheckcertificate': True,
     'ignoreerrors': True, 'logtostderr': False, 'quiet': True,
-    'no_warnings': True, 'default_search': 'auto', 'source_address': '0.0.0.0'
+    'no_warnings': True, 'default_search': 'auto', 'source_address': '0.0.0.0',
+    'cachedir': YTDLP_CACHE_DIR
 }
 
 # --- DATABASE INITIALIZATION ---
@@ -1331,6 +1318,17 @@ async def init_db():
                 except: pass
                 await cur.execute("CREATE TABLE IF NOT EXISTS nexus_history (id INT AUTO_INCREMENT PRIMARY KEY, guild_id BIGINT, video_url TEXT, title TEXT, played_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, requester_id BIGINT DEFAULT NULL)")
                 await cur.execute("CREATE TABLE IF NOT EXISTS nexus_user_playlists (id INT AUTO_INCREMENT PRIMARY KEY, user_id BIGINT, playlist_name VARCHAR(255), video_url TEXT, title TEXT)")
+                await cur.execute("CREATE TABLE IF NOT EXISTS nexus_track_intelligence (guild_id BIGINT NOT NULL, url_key VARCHAR(64) NOT NULL, video_url TEXT, title TEXT, queued_count INT NOT NULL DEFAULT 0, play_count INT NOT NULL DEFAULT 0, finish_count INT NOT NULL DEFAULT 0, skip_count INT NOT NULL DEFAULT 0, like_count INT NOT NULL DEFAULT 0, dislike_count INT NOT NULL DEFAULT 0, total_listen_seconds INT NOT NULL DEFAULT 0, last_requester_id BIGINT DEFAULT NULL, source VARCHAR(40) DEFAULT 'unknown', first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP, last_queued TIMESTAMP NULL DEFAULT NULL, last_played TIMESTAMP NULL DEFAULT NULL, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, PRIMARY KEY (guild_id, url_key))")
+                await cur.execute("CREATE TABLE IF NOT EXISTS nexus_user_track_affinity (guild_id BIGINT NOT NULL, user_id BIGINT NOT NULL, url_key VARCHAR(64) NOT NULL, video_url TEXT, title TEXT, queued_count INT NOT NULL DEFAULT 0, play_count INT NOT NULL DEFAULT 0, finish_count INT NOT NULL DEFAULT 0, skip_count INT NOT NULL DEFAULT 0, like_count INT NOT NULL DEFAULT 0, dislike_count INT NOT NULL DEFAULT 0, score FLOAT NOT NULL DEFAULT 0, last_requested TIMESTAMP NULL DEFAULT NULL, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, PRIMARY KEY (guild_id, user_id, url_key))")
+                await cur.execute("CREATE TABLE IF NOT EXISTS nexus_smart_recommendations (id INT AUTO_INCREMENT PRIMARY KEY, guild_id BIGINT NOT NULL, requester_id BIGINT DEFAULT NULL, seed_title TEXT, seed_url TEXT, query_text TEXT, chosen_url TEXT, chosen_title TEXT, reason VARCHAR(80), accepted BOOLEAN DEFAULT TRUE, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+                try: await cur.execute("CREATE INDEX nexus_track_intelligence_recent_idx ON nexus_track_intelligence (guild_id, last_played)")
+                except: pass
+                try: await cur.execute("CREATE INDEX nexus_track_intelligence_requester_idx ON nexus_track_intelligence (guild_id, last_requester_id, last_played)")
+                except: pass
+                try: await cur.execute("CREATE INDEX nexus_user_affinity_recent_idx ON nexus_user_track_affinity (guild_id, user_id, last_requested)")
+                except: pass
+                try: await cur.execute("CREATE INDEX nexus_smart_recommendations_recent_idx ON nexus_smart_recommendations (guild_id, created_at)")
+                except: pass
                 await cur.execute("CREATE TABLE IF NOT EXISTS nexus_bot_home_channels (guild_id BIGINT, bot_name VARCHAR(50), home_vc_id BIGINT, PRIMARY KEY (guild_id, bot_name))")
                 await cur.execute("CREATE TABLE IF NOT EXISTS nexus_voice_state (guild_id BIGINT, bot_name VARCHAR(50), last_channel_id BIGINT NULL, connected_channel_id BIGINT NULL, text_channel_id BIGINT NULL, disconnected_at TIMESTAMP NULL, last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, desired_connected BOOLEAN DEFAULT FALSE, reconnect_attempts INT NOT NULL DEFAULT 0, last_error TEXT NULL, PRIMARY KEY (guild_id, bot_name))")
                 await cur.execute("CREATE TABLE IF NOT EXISTS nexus_metrics (guild_id BIGINT, bot_name VARCHAR(50), voice_connected BOOLEAN DEFAULT FALSE, connected_channel_id BIGINT NULL, player_connected BOOLEAN DEFAULT FALSE, player_playing BOOLEAN DEFAULT FALSE, player_paused BOOLEAN DEFAULT FALSE, queue_count INT DEFAULT 0, backup_queue_count INT DEFAULT 0, is_playing_db BOOLEAN DEFAULT FALSE, is_paused_db BOOLEAN DEFAULT FALSE, position_seconds INT DEFAULT 0, recovery_pending BOOLEAN DEFAULT FALSE, heartbeat_age_seconds INT DEFAULT 0, lavalink_ready BOOLEAN DEFAULT FALSE, last_error TEXT NULL, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, PRIMARY KEY (guild_id, bot_name))")
@@ -1462,6 +1460,315 @@ def _row_value(row, key_or_index, default=None):
     if isinstance(key_or_index, int) and isinstance(row, (tuple, list)):
         return row[key_or_index] if len(row) > key_or_index else default
     return default
+def _track_key(video_url, title=None):
+    raw = str(video_url or "").strip()
+    if not raw and title:
+        raw = f"title:{title}"
+    try:
+        parsed = urllib.parse.urlparse(raw)
+        host = (parsed.netloc or "").lower().replace("www.", "")
+        if parsed.scheme and host:
+            query = urllib.parse.parse_qs(parsed.query)
+            if "youtu.be" in host:
+                video_id = parsed.path.strip("/").split("/")[0]
+                if video_id:
+                    raw = f"youtube:{video_id}"
+            elif "youtube" in host and query.get("v"):
+                raw = f"youtube:{query['v'][0]}"
+            else:
+                raw = urllib.parse.urlunparse((parsed.scheme.lower(), host, parsed.path.rstrip("/"), "", parsed.query, ""))
+    except Exception:
+        pass
+    normalized = re.sub(r"\s+", " ", raw.lower()).strip()
+    if not normalized:
+        normalized = re.sub(r"\s+", " ", str(title or "unknown").lower()).strip()
+    return hashlib.sha1(normalized.encode("utf-8", "ignore")).hexdigest()
+
+
+def _clean_smart_title(title):
+    cleaned = re.sub(r"https?://\S+", " ", str(title or ""))
+    cleaned = re.sub(r"\s*\([^)]*\)|\s*\[[^\]]*\]", " ", cleaned)
+    cleaned = re.sub(r"(?i)\b(official|video|audio|lyrics?|visualizer|remaster(?:ed)?|hd|hq|mv)\b", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -_|")
+    return cleaned[:120]
+
+
+def _smart_query_from_title(title):
+    cleaned = _clean_smart_title(title)
+    suffixes = SMART_AUTODJ_RADIO_SUFFIXES or ("radio", "audio", "mix")
+    suffix = random.choice(suffixes)
+    return f"ytmsearch:{cleaned} {suffix}" if cleaned else f"ytmsearch:{random.choice(['lofi hip hop', 'synthwave mix', 'chill electronic', 'gaming music', 'jazz hop'])}"
+
+
+def _member_ids_from_voice_channel(guild, channel_id):
+    channel = guild.get_channel(channel_id) if guild and channel_id else None
+    if not channel:
+        return []
+    try:
+        return [member.id for member in channel.members if not getattr(member, "bot", False)]
+    except Exception:
+        return []
+
+
+def _weighted_smart_pick(rows):
+    choices = []
+    total = 0.0
+    for row in rows or []:
+        title = _row_value(row, "title", _row_value(row, 0))
+        url = _row_value(row, "video_url", _row_value(row, 1))
+        raw_weight = _row_value(row, "weight", _row_value(row, 2, 1.0))
+        reason = _row_value(row, "reason", _row_value(row, 3, "history"))
+        try:
+            weight = max(0.25, float(raw_weight or 0.0))
+        except Exception:
+            weight = 1.0
+        if not title and not url:
+            continue
+        total += weight
+        choices.append((total, str(title or url), str(url or ""), str(reason or "history"), weight))
+    if not choices:
+        return None
+    needle = random.uniform(0.0, total)
+    for upper, title, url, reason, weight in choices:
+        if needle <= upper:
+            return {"title": title, "video_url": url, "reason": reason, "weight": weight}
+    upper, title, url, reason, weight = choices[-1]
+    return {"title": title, "video_url": url, "reason": reason, "weight": weight}
+
+
+async def record_track_queued(cur, guild_id, video_url, title, requester_id):
+    url_key = _track_key(video_url, title)
+    await cur.execute(
+        "INSERT INTO nexus_track_intelligence (guild_id, url_key, video_url, title, queued_count, last_requester_id, last_queued, source) "
+        "VALUES (%s, %s, %s, %s, 1, %s, NOW(), 'queue') "
+        "ON DUPLICATE KEY UPDATE video_url = VALUES(video_url), title = VALUES(title), queued_count = queued_count + 1, last_requester_id = VALUES(last_requester_id), last_queued = NOW(), source = 'queue'",
+        (guild_id, url_key, video_url, title, requester_id),
+    )
+    if requester_id:
+        await cur.execute(
+            "INSERT INTO nexus_user_track_affinity (guild_id, user_id, url_key, video_url, title, queued_count, last_requested, score) "
+            "VALUES (%s, %s, %s, %s, %s, 1, NOW(), 0.15) "
+            "ON DUPLICATE KEY UPDATE video_url = VALUES(video_url), title = VALUES(title), queued_count = queued_count + 1, last_requested = NOW(), score = score + 0.15",
+            (guild_id, requester_id, url_key, video_url, title),
+        )
+
+
+async def record_track_play_started(cur, guild_id, video_url, title, requester_id):
+    url_key = _track_key(video_url, title)
+    await cur.execute(
+        "INSERT INTO nexus_track_intelligence (guild_id, url_key, video_url, title, play_count, last_requester_id, last_played, source) "
+        "VALUES (%s, %s, %s, %s, 1, %s, NOW(), 'playback') "
+        "ON DUPLICATE KEY UPDATE video_url = VALUES(video_url), title = VALUES(title), play_count = play_count + 1, last_requester_id = VALUES(last_requester_id), last_played = NOW(), source = 'playback'",
+        (guild_id, url_key, video_url, title, requester_id),
+    )
+    if requester_id:
+        await cur.execute(
+            "INSERT INTO nexus_user_track_affinity (guild_id, user_id, url_key, video_url, title, play_count, last_requested, score) "
+            "VALUES (%s, %s, %s, %s, %s, 1, NOW(), 1.0) "
+            "ON DUPLICATE KEY UPDATE video_url = VALUES(video_url), title = VALUES(title), play_count = play_count + 1, last_requested = NOW(), score = score + 1.0",
+            (guild_id, requester_id, url_key, video_url, title),
+        )
+
+
+async def record_track_outcome(cur, guild_id, video_url, title, requester_id, *, outcome, listen_seconds=0):
+    if not video_url and not title:
+        return
+    url_key = _track_key(video_url, title)
+    listen_seconds = max(0, int(listen_seconds or 0))
+    finished = outcome == "finished"
+    finish_delta = 1 if finished else 0
+    skip_delta = 0 if finished else 1
+    score_delta = 1.25 if finished else -1.75
+    await cur.execute(
+        "INSERT INTO nexus_track_intelligence (guild_id, url_key, video_url, title, finish_count, skip_count, total_listen_seconds, last_requester_id, last_played, source) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), 'playback') "
+        "ON DUPLICATE KEY UPDATE video_url = VALUES(video_url), title = VALUES(title), finish_count = finish_count + VALUES(finish_count), skip_count = skip_count + VALUES(skip_count), total_listen_seconds = total_listen_seconds + VALUES(total_listen_seconds), last_requester_id = VALUES(last_requester_id), last_played = NOW(), source = 'playback'",
+        (guild_id, url_key, video_url, title, finish_delta, skip_delta, listen_seconds, requester_id),
+    )
+    if requester_id:
+        await cur.execute(
+            "INSERT INTO nexus_user_track_affinity (guild_id, user_id, url_key, video_url, title, finish_count, skip_count, score, last_requested) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW()) "
+            "ON DUPLICATE KEY UPDATE video_url = VALUES(video_url), title = VALUES(title), finish_count = finish_count + VALUES(finish_count), skip_count = skip_count + VALUES(skip_count), score = score + VALUES(score), last_requested = NOW()",
+            (guild_id, requester_id, url_key, video_url, title, finish_delta, skip_delta, score_delta),
+        )
+
+
+async def record_track_feedback(cur, guild_id, user_id, video_url, title, liked=True):
+    url_key = _track_key(video_url, title)
+    like_delta = 1 if liked else 0
+    dislike_delta = 0 if liked else 1
+    score_delta = SMART_FEEDBACK_SCORE if liked else -SMART_FEEDBACK_SCORE
+    await cur.execute(
+        "INSERT INTO nexus_track_intelligence (guild_id, url_key, video_url, title, like_count, dislike_count, last_requester_id, source) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, 'feedback') "
+        "ON DUPLICATE KEY UPDATE video_url = VALUES(video_url), title = VALUES(title), like_count = like_count + VALUES(like_count), dislike_count = dislike_count + VALUES(dislike_count), last_requester_id = VALUES(last_requester_id), source = 'feedback'",
+        (guild_id, url_key, video_url, title, like_delta, dislike_delta, user_id),
+    )
+    await cur.execute(
+        "INSERT INTO nexus_user_track_affinity (guild_id, user_id, url_key, video_url, title, like_count, dislike_count, score, last_requested) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW()) "
+        "ON DUPLICATE KEY UPDATE video_url = VALUES(video_url), title = VALUES(title), like_count = like_count + VALUES(like_count), dislike_count = dislike_count + VALUES(dislike_count), score = score + VALUES(score), last_requested = NOW()",
+        (guild_id, user_id, url_key, video_url, title, like_delta, dislike_delta, score_delta),
+    )
+
+
+async def get_current_track_snapshot(guild_id):
+    data = playback_tracking.get(guild_id) or playback_tracking.get(str(guild_id))
+    if data and (data.get("url") or data.get("title")):
+        return {"url": data.get("url"), "title": data.get("title"), "requester_id": data.get("requester_id")}
+    async with DBPoolManager() as pool:
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT video_url, title FROM nexus_playback_state WHERE guild_id = %s AND bot_name = 'nexus' AND (is_playing = TRUE OR is_paused = TRUE) ORDER BY is_playing DESC LIMIT 1",
+                    (guild_id,),
+                )
+                row = await cur.fetchone()
+    if not row:
+        return None
+    return {"url": _row_value(row, 0), "title": _row_value(row, 1), "requester_id": None}
+
+
+async def load_smart_avoid_keys(cur, guild_id, listener_ids=None):
+    avoid = set()
+    await cur.execute("SELECT video_url, title FROM nexus_history WHERE guild_id = %s ORDER BY played_at DESC LIMIT %s", (guild_id, SMART_RECENT_HISTORY_LIMIT))
+    for row in await cur.fetchall():
+        avoid.add(_track_key(_row_value(row, "video_url", _row_value(row, 0)), _row_value(row, "title", _row_value(row, 1))))
+    await cur.execute("SELECT video_url, title FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus' ORDER BY id ASC LIMIT %s", (guild_id, SMART_RECENT_HISTORY_LIMIT))
+    for row in await cur.fetchall():
+        avoid.add(_track_key(_row_value(row, "video_url", _row_value(row, 0)), _row_value(row, "title", _row_value(row, 1))))
+    ids = sorted({int(v) for v in (listener_ids or []) if v})
+    if ids:
+        placeholders = ",".join(["%s"] * len(ids))
+        await cur.execute(
+            f"SELECT url_key FROM nexus_user_track_affinity WHERE guild_id = %s AND user_id IN ({placeholders}) AND dislike_count > like_count",
+            (guild_id, *ids),
+        )
+        for row in await cur.fetchall():
+            key = _row_value(row, "url_key", _row_value(row, 0))
+            if key:
+                avoid.add(str(key))
+    return avoid
+
+
+async def build_smart_recommendation(cur, guild_id, listener_ids=None):
+    candidates = []
+    ids = sorted({int(v) for v in (listener_ids or []) if v})
+    if ids:
+        placeholders = ",".join(["%s"] * len(ids))
+        await cur.execute(
+            f"""SELECT title, video_url,
+                       (score + play_count * 1.35 + finish_count * 1.5 + like_count * 3.0 - skip_count * 1.25 - dislike_count * 4.0) AS weight,
+                       'listener taste' AS reason
+                FROM nexus_user_track_affinity
+                WHERE guild_id = %s AND user_id IN ({placeholders}) AND (dislike_count <= like_count OR like_count > 0)
+                ORDER BY weight DESC, last_requested DESC
+                LIMIT %s""",
+            (guild_id, *ids, SMART_SEED_POOL_LIMIT),
+        )
+        candidates.extend(await cur.fetchall())
+
+        await cur.execute(
+            f"""SELECT title, video_url,
+                       (COUNT(*) * 1.1) AS weight,
+                       'saved playlist' AS reason
+                FROM nexus_user_playlists
+                WHERE user_id IN ({placeholders})
+                GROUP BY title, video_url
+                ORDER BY weight DESC
+                LIMIT %s""",
+            (*ids, max(5, SMART_SEED_POOL_LIMIT // 2)),
+        )
+        candidates.extend(await cur.fetchall())
+
+    await cur.execute(
+        """SELECT title, video_url,
+                   (play_count * 1.1 + finish_count * 1.6 + like_count * 3.0 + queued_count * 0.2 - skip_count * 1.2 - dislike_count * 4.0) AS weight,
+                   'server taste' AS reason
+            FROM nexus_track_intelligence
+            WHERE guild_id = %s AND (dislike_count <= like_count OR like_count > 0)
+            ORDER BY weight DESC, COALESCE(last_played, last_queued, first_seen) DESC
+            LIMIT %s""",
+        (guild_id, SMART_SEED_POOL_LIMIT),
+    )
+    candidates.extend(await cur.fetchall())
+
+    if not candidates:
+        await cur.execute("SELECT title, video_url, 1.0 AS weight, 'recent history' AS reason FROM nexus_history WHERE guild_id = %s ORDER BY played_at DESC LIMIT %s", (guild_id, SMART_SEED_POOL_LIMIT))
+        candidates.extend(await cur.fetchall())
+
+    seed = _weighted_smart_pick(candidates)
+    if seed:
+        query = _smart_query_from_title(seed["title"])
+        return {"query": query, "seed_title": seed["title"], "seed_url": seed.get("video_url"), "reason": seed.get("reason", "history")}
+
+    fallback_terms = ["lofi hip hop", "synthwave mix", "chill electronic", "gaming music", "jazz hop"]
+    term = random.choice(fallback_terms)
+    return {"query": f"ytmsearch:{term}", "seed_title": term, "seed_url": None, "reason": "fallback"}
+
+
+async def pick_smart_recommendation_track(cur, guild_id, listener_ids=None):
+    recommendation = await build_smart_recommendation(cur, guild_id, listener_ids=listener_ids)
+    avoid_keys = await load_smart_avoid_keys(cur, guild_id, listener_ids=listener_ids)
+    entries, _playlist_result = await search_playables(recommendation["query"])
+    chosen = None
+    scanned = 0
+    for entry in entries:
+        scanned += 1
+        title = str(getattr(entry, "title", "") or "").strip()
+        uri = str(getattr(entry, "uri", "") or "").strip()
+        if not title and not uri:
+            continue
+        if _track_key(uri, title) in avoid_keys:
+            if scanned < SMART_CANDIDATE_SCAN_LIMIT:
+                continue
+        chosen = entry
+        break
+    if not chosen and entries:
+        chosen = entries[0]
+    return chosen, recommendation
+
+
+async def record_smart_recommendation(cur, guild_id, requester_id, recommendation, chosen, *, reason):
+    await cur.execute(
+        "INSERT INTO nexus_smart_recommendations (guild_id, requester_id, seed_title, seed_url, query_text, chosen_url, chosen_title, reason) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+        (
+            guild_id,
+            requester_id,
+            recommendation.get("seed_title"),
+            recommendation.get("seed_url"),
+            recommendation.get("query"),
+            getattr(chosen, "uri", None),
+            getattr(chosen, "title", None),
+            reason or recommendation.get("reason"),
+        ),
+    )
+
+
+async def build_user_taste_summary(guild_id, user_id):
+    async with DBPoolManager() as pool:
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """SELECT title, video_url, play_count, finish_count, like_count, dislike_count, skip_count, score
+                       FROM nexus_user_track_affinity
+                       WHERE guild_id = %s AND user_id = %s
+                       ORDER BY score DESC, last_requested DESC
+                       LIMIT 10""",
+                    (guild_id, user_id),
+                )
+                top_tracks = await cur.fetchall()
+                await cur.execute(
+                    """SELECT COALESCE(SUM(play_count), 0), COALESCE(SUM(finish_count), 0), COALESCE(SUM(like_count), 0), COALESCE(SUM(dislike_count), 0), COALESCE(SUM(skip_count), 0)
+                       FROM nexus_user_track_affinity
+                       WHERE guild_id = %s AND user_id = %s""",
+                    (guild_id, user_id),
+                )
+                totals = await cur.fetchone()
+    return top_tracks, totals
+
+
 
 def get_process_queue_lock(guild_id):
     lock = process_queue_locks.get(guild_id)
@@ -1751,7 +2058,7 @@ async def collect_and_persist_metrics(guild=None):
                         elif voice_connected and (player_playing or player_paused or g.id in playback_tracking):
                             await cur.execute(
                                 "UPDATE nexus_playback_state SET channel_id = COALESCE(%s, channel_id), is_playing = %s, is_paused = %s, position_seconds = %s WHERE guild_id = %s AND bot_name = 'nexus'",
-                                (channel_id, player_playing, player_paused, int(live_position or playback_row.get("position_seconds") or 0), g.id),
+                                (channel_id, player_playing, player_paused, int(live_position or metrics_row.get("position_seconds") or 0), g.id),
                             )
                         await cur.execute(
                             """
@@ -1772,7 +2079,7 @@ async def collect_and_persist_metrics(guild=None):
                                 int(metrics_row.get("backup_total") or 0),
                                 bool(metrics_row.get("is_playing")) if voice_connected else False,
                                 bool(metrics_row.get("is_paused")) if voice_connected else False,
-                                int(live_position or playback_row.get("position_seconds") or 0),
+                                int(live_position or metrics_row.get("position_seconds") or 0),
                                 g.id in recovering_guilds or str(g.id) in guild_states,
                                 bool(lavalink_ready),
                                 metrics_last_errors.get(g.id),
@@ -1914,6 +2221,10 @@ async def enqueue_track(cur, guild_id, video_url, title, requester_id, *, backup
         (guild_id, video_url, title, requester_id),
     )
     if backup:
+        try:
+            await record_track_queued(cur, guild_id, video_url, title, requester_id)
+        except Exception:
+            logger.debug("[nexus] Track intelligence queue write skipped.", exc_info=True)
         await backup_track(cur, guild_id, video_url, title, requester_id)
     return 1
 
@@ -2330,6 +2641,22 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
                             loop_mode = mode_row[0] if mode_row and mode_row[0] else 'queue'
                             track_data = playback_tracking.get(payload.player.guild.id, {})
                             original_requester = track_data.get('requester_id', bot.user.id if bot.user else None)
+                            try:
+                                if reason == "FINISHED":
+                                    listen_seconds = int(track_data.get('duration') or current_track_position(payload.player.guild.id) or 0)
+                                else:
+                                    listen_seconds = int(current_track_position(payload.player.guild.id) or 0)
+                                await record_track_outcome(
+                                    cur,
+                                    payload.player.guild.id,
+                                    getattr(payload.track, 'uri', None) or track_data.get('url'),
+                                    getattr(payload.track, 'title', None) or track_data.get('title'),
+                                    original_requester,
+                                    outcome="finished" if reason == "FINISHED" else "skipped",
+                                    listen_seconds=listen_seconds,
+                                )
+                            except Exception:
+                                logger.debug("[%s] Track intelligence outcome write skipped.", payload.player.guild.id, exc_info=True)
 
                             if reason == "FINISHED":
                                 if loop_mode == 'queue':
@@ -2479,6 +2806,7 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
                 schedule_named_task(f"stage_topic:{guild.id}", update_stage_topic(guild, title, requester_id))
 
                 await cur.execute("INSERT INTO nexus_history (guild_id, video_url, title, requester_id) VALUES (%s, %s, %s, %s)", (guild.id, url, title, requester_id))
+                await record_track_play_started(cur, guild.id, url, title, requester_id)
                 await bot.change_presence(status=discord.Status.online, activity=discord.Activity(type=discord.ActivityType.listening, name=str(title).replace("\\n", " ").strip()[:120]))
                 playback_tracking[guild.id] = {'start_time': time.time(), 'offset': start_position, 'url': url, 'channel_id': channel_id, 'title': title, 'duration': duration, 'speed': c_speed, 'current_filter': filter_mode, 'requester_id': requester_id, 'transition_mode': trans_mode, 'volume': vol, 'paused': False}
 
@@ -3493,6 +3821,88 @@ async def grab(interaction: discord.Interaction):
             await interaction.response.send_message(embed=discord.Embed(description="❌ I can't DM you! Please check your privacy settings.", color=discord.Color.red()), ephemeral=True)
     else:
         await interaction.response.send_message(embed=discord.Embed(description="Nothing is currently playing.", color=discord.Color.red()), ephemeral=True)
+
+@bot.tree.command(name="nexus_main_like", description="Teach Auto-DJ to play more tracks like the current one for you.")
+async def like_track(interaction: discord.Interaction):
+    snapshot = await get_current_track_snapshot(interaction.guild.id)
+    if not snapshot:
+        return await interaction.response.send_message("Nothing is playing right now.", ephemeral=True)
+    async with DBPoolManager() as pool:
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await record_track_feedback(cur, interaction.guild.id, interaction.user.id, snapshot.get("url"), snapshot.get("title"), liked=True)
+    await interaction.response.send_message(embed=discord.Embed(description=f"Saved your like for **{snapshot.get('title') or 'this track'}**. Auto-DJ will lean toward similar picks.", color=discord.Color.green()), ephemeral=True)
+
+
+@bot.tree.command(name="nexus_main_dislike", description="Teach Auto-DJ to avoid the current track for your future recommendations.")
+async def dislike_track(interaction: discord.Interaction):
+    snapshot = await get_current_track_snapshot(interaction.guild.id)
+    if not snapshot:
+        return await interaction.response.send_message("Nothing is playing right now.", ephemeral=True)
+    async with DBPoolManager() as pool:
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await record_track_feedback(cur, interaction.guild.id, interaction.user.id, snapshot.get("url"), snapshot.get("title"), liked=False)
+    await interaction.response.send_message(embed=discord.Embed(description=f"Saved your dislike for **{snapshot.get('title') or 'this track'}**. Auto-DJ will avoid it for you.", color=discord.Color.orange()), ephemeral=True)
+
+
+@bot.tree.command(name="nexus_main_recommend", description="Queue a smart recommendation learned from server taste, playlists, and listener feedback.")
+async def recommend(interaction: discord.Interaction, member: discord.Member = None):
+    await interaction.response.defer()
+    target = member or interaction.user
+    channel = None
+    if interaction.guild.voice_client and getattr(interaction.guild.voice_client, "channel", None):
+        channel = interaction.guild.voice_client.channel
+    if not channel:
+        channel = await get_home_channel(interaction.guild)
+    if not channel:
+        channel = interaction.user.voice.channel if interaction.user.voice else None
+    if not channel:
+        return await interaction.followup.send(embed=discord.Embed(title="Source Error", description="Join a channel first or set a home channel.", color=discord.Color.red()))
+
+    async with DBPoolManager() as pool:
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                chosen, recommendation = await pick_smart_recommendation_track(cur, interaction.guild.id, listener_ids=[target.id])
+                if not chosen:
+                    return await interaction.followup.send(embed=discord.Embed(description="I could not find a recommendation yet. Play a few tracks or save a playlist first.", color=discord.Color.red()))
+                await enqueue_track(cur, interaction.guild.id, chosen.uri, chosen.title, interaction.user.id)
+                await record_smart_recommendation(cur, interaction.guild.id, interaction.user.id, recommendation, chosen, reason=f"slash:{target.id}")
+                await cur.execute("SELECT COUNT(*) FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus'", (interaction.guild.id,))
+                q_len_row = await cur.fetchone()
+                q_len = q_len_row[0] if q_len_row else 0
+
+    vc = interaction.guild.voice_client
+    if not vc or not _player_is_active(vc):
+        await process_queue(interaction.guild, channel.id)
+        title = "Smart Recommendation Starting"
+    else:
+        title = "Smart Recommendation Queued"
+    embed = discord.Embed(title=title, description=f"Added **{chosen.title}** based on **{recommendation.get('reason', 'saved taste')}**. Queue size: {q_len}", color=discord.Color.green())
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="nexus_main_taste", description="Show the saved taste profile Auto-DJ has learned for you or another member.")
+async def taste(interaction: discord.Interaction, member: discord.Member = None):
+    target = member or interaction.user
+    top_tracks, totals = await build_user_taste_summary(interaction.guild.id, target.id)
+    if not top_tracks:
+        return await interaction.response.send_message(f"No saved taste profile for {target.display_name} yet.", ephemeral=True)
+    lines = []
+    for idx, row in enumerate(top_tracks[:8], start=1):
+        title = _clean_smart_title(_row_value(row, "title", _row_value(row, 0))) or "Unknown Track"
+        score = _row_value(row, "score", _row_value(row, 7, 0))
+        try:
+            score_text = f"{float(score):.1f}"
+        except Exception:
+            score_text = str(score)
+        lines.append(f"**{idx}.** {title} *(score {score_text})*")
+    played, finished, liked, disliked, skipped = totals if totals else (0, 0, 0, 0, 0)
+    embed = discord.Embed(title=f"NEXUS Taste Profile: {target.display_name}", description="\n".join(lines), color=discord.Color.blurple())
+    embed.add_field(name="Signals", value=f"plays {played} | finishes {finished} | likes {liked} | dislikes {disliked} | skips {skipped}", inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 
 # --- MODIFIERS & FILTERS ---
 @bot.tree.command(name="nexus_main_volume", description="Set the playback volume for this server from 1 to 200 percent.")
