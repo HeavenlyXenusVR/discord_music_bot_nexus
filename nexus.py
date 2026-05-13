@@ -6,7 +6,6 @@ import aiohttp
 import os
 import time
 import logging
-import warnings
 import random
 import datetime
 import sys
@@ -16,9 +15,7 @@ import wavelink
 from discord.ext import commands, tasks
 from discord import app_commands
 import re
-
-warnings.filterwarnings("ignore", message=".*already exists.*", category=Warning, module=r"aiomysql\..*")
-warnings.filterwarnings("ignore", message="Can't create database .*; database exists", category=Warning, module=r"aiomysql\..*")
+import urllib.parse
 
 # --- DAVE PROTOCOL MONKEYPATCH (FIXES LAVALINK 4.2.2 E2EE ENCRYPTION) ---
 original_request = aiohttp.ClientSession.request
@@ -135,34 +132,38 @@ async def ensure_database_exists():
     )
     try:
         async with conn.cursor() as cur:
-            await cur.execute("SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = %s", (db_name,))
-            if not await cur.fetchone():
-                await cur.execute(f"CREATE DATABASE `{db_name}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
+            await cur.execute(f"CREATE DATABASE IF NOT EXISTS `{db_name}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
     finally:
         conn.close()
 
 class DBPoolManager:
     _pool = None
     _lock = asyncio.Lock()
+    _last_ping = 0.0
 
     async def __aenter__(self):
         async with DBPoolManager._lock:
             pool = DBPoolManager._pool
             if pool is None or getattr(pool, "closed", False):
                 await ensure_database_exists()
-                DBPoolManager._pool = await aiomysql.create_pool(minsize=1, maxsize=10, **DB_CONFIG)
+                DBPoolManager._pool = await aiomysql.create_pool(minsize=DB_POOL_MINSIZE, maxsize=DB_POOL_MAXSIZE, **DB_CONFIG)
+                DBPoolManager._last_ping = time.time()
             else:
-                try:
-                    async with pool.acquire() as conn:
-                        await conn.ping(reconnect=True)
-                except Exception:
+                now = time.time()
+                if now - DBPoolManager._last_ping >= DB_POOL_PING_INTERVAL_SECONDS:
                     try:
-                        pool.close()
-                        await pool.wait_closed()
+                        async with pool.acquire() as conn:
+                            await conn.ping(reconnect=True)
+                        DBPoolManager._last_ping = now
                     except Exception:
-                        pass
-                    await ensure_database_exists()
-                    DBPoolManager._pool = await aiomysql.create_pool(minsize=1, maxsize=10, **DB_CONFIG)
+                        try:
+                            pool.close()
+                            await pool.wait_closed()
+                        except Exception:
+                            pass
+                        await ensure_database_exists()
+                        DBPoolManager._pool = await aiomysql.create_pool(minsize=DB_POOL_MINSIZE, maxsize=DB_POOL_MAXSIZE, **DB_CONFIG)
+                        DBPoolManager._last_ping = time.time()
         return DBPoolManager._pool
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -172,21 +173,68 @@ class HTTPSessionManager:
     _session = None
     async def __aenter__(self):
         if not HTTPSessionManager._session or HTTPSessionManager._session.closed:
-            HTTPSessionManager._session = aiohttp.ClientSession()
+            # One bounded shared session prevents webhook/status helpers from leaking sockets
+            # or hanging the bot during Discord/API/network stalls.
+            timeout = aiohttp.ClientTimeout(total=float(os.getenv(f"{BOT_ENV_PREFIX}_HTTP_TIMEOUT_SECONDS", os.getenv("MUSIC_BOT_HTTP_TIMEOUT_SECONDS", "20")))) if "BOT_ENV_PREFIX" in globals() else aiohttp.ClientTimeout(total=20)
+            connector = aiohttp.TCPConnector(limit=int(os.getenv(f"{BOT_ENV_PREFIX}_HTTP_CONNECTOR_LIMIT", os.getenv("MUSIC_BOT_HTTP_CONNECTOR_LIMIT", "32"))) if "BOT_ENV_PREFIX" in globals() else 32, ttl_dns_cache=300)
+            HTTPSessionManager._session = aiohttp.ClientSession(timeout=timeout, connector=connector)
         return HTTPSessionManager._session
     async def __aexit__(self, exc_type, exc_val, exc_tb): pass
 
-# --- LOGGING SETUP (Per-bot logs) ---
-import os
+# --- LOGGING SETUP (console + host-visible per-bot rotating file) ---
 from logging.handlers import RotatingFileHandler
 
-BOT_ENV_PREFIX = "NEXUS"
-log_dir = "logs"
+try:
+    _bot_name = os.path.basename(__file__).replace(".py", "").lower()
+except NameError:
+    _bot_name = "bot"
+
+_log_env_prefix = _bot_name.upper()
+log_dir = os.getenv(f"{_log_env_prefix}_LOG_DIR") or os.getenv("MUSIC_BOT_LOG_DIR") or "/app/logs"
+log_dir = os.path.abspath(log_dir)
 os.makedirs(log_dir, exist_ok=True)
-log_filename = os.path.join(log_dir, f"{BOT_ENV_PREFIX.lower()}.log")
-file_handler = RotatingFileHandler(filename=log_filename, encoding="utf-8", mode="a", maxBytes=10*1024*1024, backupCount=5)
-discord.utils.setup_logging(handler=file_handler, level=logging.INFO)
+
+log_filename = os.path.join(log_dir, f"{_bot_name}.log")
+# Create the file immediately so `ls logs/` proves logging is mounted/writable even before the first warning/error.
+with open(log_filename, "a", encoding="utf-8"):
+    pass
+
+_log_formatter = logging.Formatter(
+    fmt="%(asctime)s %(levelname)-8s %(name)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(_log_formatter)
+
+file_handler = RotatingFileHandler(
+    filename=log_filename,
+    encoding="utf-8",
+    mode="a",
+    maxBytes=int(os.getenv("MUSIC_BOT_LOG_MAX_BYTES", str(10 * 1024 * 1024))),
+    backupCount=int(os.getenv("MUSIC_BOT_LOG_BACKUP_COUNT", "5")),
+)
+file_handler.setLevel(logging.INFO)
+file_handler.setFormatter(_log_formatter)
+
+# Replace only normal console/file handlers so repeated imports or discord.setup_logging do not duplicate lines.
+for _handler in list(root_logger.handlers):
+    if isinstance(_handler, (logging.StreamHandler, RotatingFileHandler)):
+        root_logger.removeHandler(_handler)
+root_logger.addHandler(console_handler)
+root_logger.addHandler(file_handler)
+
+for _logger_name in ("discord", "wavelink", "aiohttp", "asyncio"):
+    _lib_logger = logging.getLogger(_logger_name)
+    _lib_logger.setLevel(logging.INFO)
+    _lib_logger.propagate = True
+
 logger = logging.getLogger("discord")
+logger.info("[%s] File logging active at %s", _bot_name, log_filename)
 
 def _player_is_playing(player):
     """Robust Wavelink/discord.py playback detector.
@@ -306,8 +354,12 @@ DB_CONFIG = {
     'password': os.getenv(f"{BOT_ENV_PREFIX}_DB_PASSWORD") or os.getenv("DB_PASSWORD") or os.getenv("MYSQL_PASSWORD") or "",
     'db': os.getenv(f"{BOT_ENV_PREFIX}_DB_NAME") or "discord_music_nexus",
     'autocommit': True,
-    'pool_recycle': 280
+    'pool_recycle': int(os.getenv(f"{BOT_ENV_PREFIX}_DB_POOL_RECYCLE_SECONDS", os.getenv("DB_POOL_RECYCLE_SECONDS", "280"))),
+    'connect_timeout': int(os.getenv(f"{BOT_ENV_PREFIX}_DB_CONNECT_TIMEOUT_SECONDS", os.getenv("DB_CONNECT_TIMEOUT_SECONDS", "10"))),
 }
+DB_POOL_MINSIZE = max(1, int(os.getenv(f"{BOT_ENV_PREFIX}_DB_POOL_MINSIZE", os.getenv("DB_POOL_MINSIZE", "1"))))
+DB_POOL_MAXSIZE = max(DB_POOL_MINSIZE, int(os.getenv(f"{BOT_ENV_PREFIX}_DB_POOL_MAXSIZE", os.getenv("DB_POOL_MAXSIZE", "5"))))
+DB_POOL_PING_INTERVAL_SECONDS = max(5.0, float(os.getenv(f"{BOT_ENV_PREFIX}_DB_POOL_PING_INTERVAL_SECONDS", os.getenv("DB_POOL_PING_INTERVAL_SECONDS", "30"))))
 DEFAULT_LAVALINK_URI = os.getenv("LAVALINK_URI") or os.getenv("LAVALINK_URL") or os.getenv("LAVALINK_HOST") or "http://127.0.0.1:2333"
 DEFAULT_LAVALINK_PASSWORD = os.getenv("LAVALINK_PASSWORD", "gws_swarm_secret_password")
 LAVALINK_URI = os.getenv(f"{BOT_ENV_PREFIX}_LAVALINK_URI", DEFAULT_LAVALINK_URI).strip()
@@ -320,6 +372,36 @@ ERROR_WEBHOOK_URL = (
     or os.getenv("SWARM_WEBHOOK_ERROR_URL", "").strip()
 )
 error_reporting_installed = False
+ERROR_REPORT_THROTTLE_SECONDS = max(
+    60.0,
+    float(os.getenv(f"{BOT_ENV_PREFIX}_ERROR_REPORT_THROTTLE_SECONDS", os.getenv("MUSIC_BOT_ERROR_REPORT_THROTTLE_SECONDS", "300"))),
+)
+_error_report_last_sent = {}
+
+
+def _error_report_key(message, traceback_text=None):
+    message_key = str(message or "").strip().splitlines()[0][:240]
+    traceback_key = ""
+    if traceback_text:
+        traceback_key = str(traceback_text).strip().splitlines()[-1][:240]
+    return f"{message_key}|{traceback_key}"
+
+
+def _should_throttle_error_report(message, traceback_text=None):
+    if ERROR_REPORT_THROTTLE_SECONDS <= 0:
+        return False
+    now = time.time()
+    key = _error_report_key(message, traceback_text)
+    last_sent = _error_report_last_sent.get(key, 0.0)
+    if now - last_sent < ERROR_REPORT_THROTTLE_SECONDS:
+        return True
+    _error_report_last_sent[key] = now
+    if len(_error_report_last_sent) > 256:
+        stale_before = now - (ERROR_REPORT_THROTTLE_SECONDS * 2)
+        for old_key, sent_at in list(_error_report_last_sent.items()):
+            if sent_at < stale_before:
+                _error_report_last_sent.pop(old_key, None)
+    return False
 
 
 def _shorten_error_text(value, limit=1800):
@@ -444,6 +526,8 @@ class SwarmErrorWebhookHandler(logging.Handler):
         traceback_text = None
         if record.exc_info:
             traceback_text = ''.join(__import__('traceback').format_exception(*record.exc_info))
+        if _should_throttle_error_report(message, traceback_text):
+            return
         dispatch_runtime_error(
             f"Python Log Error [{record.name}]",
             description=message,
@@ -496,13 +580,16 @@ def _normalize_lavalink_uri(uri: str) -> str:
     return value or "http://127.0.0.1:2333"
 
 LAVALINK_URI = _normalize_lavalink_uri(LAVALINK_URI)
+LAVALINK_SEARCH_TIMEOUT_SECONDS = max(8.0, float(os.getenv(f"{BOT_ENV_PREFIX}_LAVALINK_SEARCH_TIMEOUT_SECONDS", os.getenv("LAVALINK_SEARCH_TIMEOUT_SECONDS", "25"))))
+LAVALINK_PLAY_TIMEOUT_SECONDS = max(8.0, float(os.getenv(f"{BOT_ENV_PREFIX}_LAVALINK_PLAY_TIMEOUT_SECONDS", os.getenv("LAVALINK_PLAY_TIMEOUT_SECONDS", "20"))))
+PLAYLIST_SYNC_EXTRACT_TIMEOUT_SECONDS = max(30.0, float(os.getenv(f"{BOT_ENV_PREFIX}_PLAYLIST_SYNC_EXTRACT_TIMEOUT_SECONDS", os.getenv("PLAYLIST_SYNC_EXTRACT_TIMEOUT_SECONDS", "180"))))
 POSITION_UPDATER_INTERVAL = max(5.0, float(os.getenv(f"{BOT_ENV_PREFIX}_POSITION_UPDATER_INTERVAL", "10")))
 POSITION_PERSIST_INTERVAL = max(POSITION_UPDATER_INTERVAL, float(os.getenv(f"{BOT_ENV_PREFIX}_POSITION_PERSIST_INTERVAL", "15")))
 PLAYLIST_SYNC_INTERVAL = max(45.0, float(os.getenv(f"{BOT_ENV_PREFIX}_PLAYLIST_SYNC_INTERVAL", "90")))
 AUTO_HEAL_INTERVAL = max(15.0, float(os.getenv(f"{BOT_ENV_PREFIX}_AUTO_HEAL_INTERVAL", "20")))
 AUTO_IMPORT_IDLE_SECONDS = max(45.0, float(os.getenv(f"{BOT_ENV_PREFIX}_AUTO_IMPORT_IDLE_SECONDS", "45")))
-RECOVERY_RETRY_BASE_DELAY = max(3.0, float(os.getenv(f"{BOT_ENV_PREFIX}_RECOVERY_RETRY_BASE_DELAY", "5")))
-RECOVERY_RETRY_MAX_DELAY = max(RECOVERY_RETRY_BASE_DELAY, float(os.getenv(f"{BOT_ENV_PREFIX}_RECOVERY_RETRY_MAX_DELAY", "30")))
+RECOVERY_RETRY_BASE_DELAY = max(5.0, float(os.getenv(f"{BOT_ENV_PREFIX}_RECOVERY_RETRY_BASE_DELAY", os.getenv("RECOVERY_RETRY_BASE_DELAY", "12"))))
+RECOVERY_RETRY_MAX_DELAY = max(RECOVERY_RETRY_BASE_DELAY, float(os.getenv(f"{BOT_ENV_PREFIX}_RECOVERY_RETRY_MAX_DELAY", os.getenv("RECOVERY_RETRY_MAX_DELAY", "75"))))
 MAX_RECOVERY_RETRIES = max(3, int(os.getenv(f"{BOT_ENV_PREFIX}_MAX_RECOVERY_RETRIES", "6")))
 WATCHDOG_REVIVAL_COOLDOWN = max(10.0, float(os.getenv(f"{BOT_ENV_PREFIX}_WATCHDOG_REVIVAL_COOLDOWN", "15")))
 WATCHDOG_MAX_REVIVALS = max(3, int(os.getenv(f"{BOT_ENV_PREFIX}_WATCHDOG_MAX_REVIVALS", "6")))
@@ -526,10 +613,76 @@ playlist_db_lock = asyncio.Lock()
 recovery_retry_tasks = {}
 recovery_retry_counts = {}
 recovery_exhausted_until = {}
+voice_disconnect_grace_tasks = {}
 idle_voice_since = {}
 auto_restore_snooze_until = {}
 startup_task_registry = {}
 MAX_RUNTIME_GUILD_CACHE_ENTRIES = max(64, int(os.getenv(f"{BOT_ENV_PREFIX}_RUNTIME_GUILD_CACHE_MAX", os.getenv("RUNTIME_GUILD_CACHE_MAX", "512"))))
+
+
+# --- FEATURE OPTIMIZATION CACHE LAYER ---
+# These caches only optimize already-built features; they do not change feature ownership.
+REQUESTER_NAME_CACHE = {}
+AUTO_DJ_ENABLED_CACHE = {}
+GUILD_SETTINGS_CACHE = {}
+HOME_CHANNEL_CACHE = {}
+SEARCH_RESULT_CACHE = {}
+VOICE_STATUS_CACHE = {}
+STATUS_MESSAGE_CACHE = {}
+VOICE_STATE_PERSIST_CACHE = {}
+AUTODJ_LAST_RUN = {}
+AUTODJ_FAIL_UNTIL = {}
+
+REQUESTER_NAME_CACHE_TTL_SECONDS = max(60.0, float(os.getenv(f"{BOT_ENV_PREFIX}_REQUESTER_NAME_CACHE_TTL_SECONDS", os.getenv("REQUESTER_NAME_CACHE_TTL_SECONDS", "900"))))
+AUTO_DJ_CACHE_TTL_SECONDS = max(5.0, float(os.getenv(f"{BOT_ENV_PREFIX}_AUTO_DJ_CACHE_TTL_SECONDS", os.getenv("AUTO_DJ_CACHE_TTL_SECONDS", "30"))))
+GUILD_SETTINGS_CACHE_TTL_SECONDS = max(5.0, float(os.getenv(f"{BOT_ENV_PREFIX}_GUILD_SETTINGS_CACHE_TTL_SECONDS", os.getenv("GUILD_SETTINGS_CACHE_TTL_SECONDS", "30"))))
+HOME_CHANNEL_CACHE_TTL_SECONDS = max(5.0, float(os.getenv(f"{BOT_ENV_PREFIX}_HOME_CHANNEL_CACHE_TTL_SECONDS", os.getenv("HOME_CHANNEL_CACHE_TTL_SECONDS", "30"))))
+SEARCH_CACHE_TTL_SECONDS = max(10.0, float(os.getenv(f"{BOT_ENV_PREFIX}_SEARCH_CACHE_TTL_SECONDS", os.getenv("SEARCH_CACHE_TTL_SECONDS", "120"))))
+VOICE_STATUS_DEDUP_SECONDS = max(10.0, float(os.getenv(f"{BOT_ENV_PREFIX}_VOICE_STATUS_DEDUP_SECONDS", os.getenv("VOICE_STATUS_DEDUP_SECONDS", "60"))))
+STATUS_MESSAGE_DEDUP_SECONDS = max(5.0, float(os.getenv(f"{BOT_ENV_PREFIX}_STATUS_MESSAGE_DEDUP_SECONDS", os.getenv("STATUS_MESSAGE_DEDUP_SECONDS", "20"))))
+VOICE_STATE_DEDUP_SECONDS = max(5.0, float(os.getenv(f"{BOT_ENV_PREFIX}_VOICE_STATE_DEDUP_SECONDS", os.getenv("VOICE_STATE_DEDUP_SECONDS", "12"))))
+AUTODJ_MIN_INTERVAL_SECONDS = max(5.0, float(os.getenv(f"{BOT_ENV_PREFIX}_AUTODJ_MIN_INTERVAL_SECONDS", os.getenv("AUTODJ_MIN_INTERVAL_SECONDS", "20"))))
+AUTODJ_FAILURE_BACKOFF_SECONDS = max(15.0, float(os.getenv(f"{BOT_ENV_PREFIX}_AUTODJ_FAILURE_BACKOFF_SECONDS", os.getenv("AUTODJ_FAILURE_BACKOFF_SECONDS", "90"))))
+MAX_FEATURE_CACHE_ENTRIES = max(64, int(os.getenv(f"{BOT_ENV_PREFIX}_FEATURE_CACHE_MAX", os.getenv("FEATURE_CACHE_MAX", "1024"))))
+
+def _cache_get(cache, key, ttl_seconds):
+    item = cache.get(key)
+    if not item:
+        return None
+    value, timestamp = item
+    if time.time() - timestamp > ttl_seconds:
+        cache.pop(key, None)
+        return None
+    return value
+
+def _cache_set(cache, key, value):
+    cache[key] = (value, time.time())
+    if len(cache) > MAX_FEATURE_CACHE_ENTRIES:
+        oldest = sorted(cache.items(), key=lambda kv: kv[1][1])[: max(1, len(cache) - MAX_FEATURE_CACHE_ENTRIES)]
+        for old_key, _ in oldest:
+            cache.pop(old_key, None)
+    return value
+
+def _cache_drop_guild(cache, guild_id):
+    gid = _runtime_key(guild_id)
+    for key in list(cache.keys()):
+        if _runtime_key(key) == gid or (isinstance(key, tuple) and key and _runtime_key(key[0]) == gid):
+            cache.pop(key, None)
+
+def invalidate_feature_caches(guild_id=None):
+    if guild_id is None:
+        for cache in (AUTO_DJ_ENABLED_CACHE, GUILD_SETTINGS_CACHE, HOME_CHANNEL_CACHE, VOICE_STATUS_CACHE, STATUS_MESSAGE_CACHE, VOICE_STATE_PERSIST_CACHE, AUTODJ_LAST_RUN, AUTODJ_FAIL_UNTIL):
+            cache.clear()
+        return
+    for cache in (AUTO_DJ_ENABLED_CACHE, GUILD_SETTINGS_CACHE, HOME_CHANNEL_CACHE, VOICE_STATUS_CACHE, STATUS_MESSAGE_CACHE, VOICE_STATE_PERSIST_CACHE, AUTODJ_LAST_RUN, AUTODJ_FAIL_UNTIL):
+        _cache_drop_guild(cache, guild_id)
+
+def _embed_fingerprint(embed):
+    try:
+        fields = tuple((str(field.name), str(field.value), bool(field.inline)) for field in getattr(embed, "fields", []) or [])
+        return (str(getattr(embed, "title", "") or ""), str(getattr(embed, "description", "") or ""), fields)
+    except Exception:
+        return (repr(embed),)
 
 def _runtime_key(value):
     try:
@@ -591,8 +744,43 @@ def schedule_named_task(name, coro):
     return task
 
 
+async def flush_runtime_state_before_restart(reason: str = "restart"):
+    """Persist the freshest playback position before the intentional supervisor restart path."""
+    try:
+        async with DBPoolManager() as pool:
+            async with pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    for guild_id, data in list(playback_tracking.items()):
+                        try:
+                            position = current_track_position(guild_id)
+                            await cur.execute(
+                                "UPDATE nexus_playback_state SET position_seconds = %s, is_playing = %s, is_paused = %s WHERE guild_id = %s AND bot_name = %s",
+                                (position, not bool(data.get('paused')), bool(data.get('paused')), guild_id, BOT_ENV_PREFIX.lower()),
+                            )
+                        except Exception:
+                            logger.debug("[%s] Failed to flush playback position for guild %s before %s.", BOT_ENV_PREFIX.lower(), guild_id, reason, exc_info=True)
+    except Exception:
+        logger.debug("[%s] Runtime flush skipped before %s.", BOT_ENV_PREFIX.lower(), reason, exc_info=True)
+
+async def close_shared_runtime_resources():
+    try:
+        session = HTTPSessionManager._session
+        if session and not session.closed:
+            await session.close()
+    except Exception:
+        logger.debug("[%s] Failed closing HTTP session.", BOT_ENV_PREFIX.lower(), exc_info=True)
+    try:
+        pool = DBPoolManager._pool
+        if pool is not None and not getattr(pool, "closed", False):
+            pool.close()
+            await pool.wait_closed()
+        DBPoolManager._pool = None
+    except Exception:
+        logger.debug("[%s] Failed closing DB pool.", BOT_ENV_PREFIX.lower(), exc_info=True)
+
 async def request_supervisor_restart(reason: str, *, announce: bool = True):
     logger.warning("[%s] Restart requested (%s); exiting for container supervisor restart.", BOT_ENV_PREFIX.lower(), reason)
+    await flush_runtime_state_before_restart(reason)
     if announce:
         try:
             await send_webhook_log(
@@ -604,6 +792,7 @@ async def request_supervisor_restart(reason: str, *, announce: bool = True):
         except Exception:
             logger.debug("[%s] Failed to publish restart webhook.", BOT_ENV_PREFIX.lower(), exc_info=True)
     await bot.close()
+    await close_shared_runtime_resources()
     sys.exit(0)
 
 
@@ -611,36 +800,297 @@ vote_skip_sessions = {}
 metrics_last_errors = {}
 METRICS_HEARTBEAT_INTERVAL = max(5, int(os.getenv(f"{BOT_ENV_PREFIX}_METRICS_HEARTBEAT_INTERVAL", os.getenv("METRICS_HEARTBEAT_INTERVAL", "15"))))
 VOICE_REJOIN_DELAY_SECONDS = max(1, int(os.getenv(f"{BOT_ENV_PREFIX}_VOICE_REJOIN_DELAY_SECONDS", os.getenv("VOICE_REJOIN_DELAY_SECONDS", "5"))))
-VOICE_CONNECT_TIMEOUT_SECONDS = max(10.0, float(os.getenv(f"{BOT_ENV_PREFIX}_VOICE_CONNECT_TIMEOUT_SECONDS", os.getenv("VOICE_CONNECT_TIMEOUT_SECONDS", "30"))))
-VOICE_CONNECT_TIMEOUT_BACKOFF_SECONDS = max(120.0, float(os.getenv(f"{BOT_ENV_PREFIX}_VOICE_CONNECT_TIMEOUT_BACKOFF_SECONDS", os.getenv("VOICE_CONNECT_TIMEOUT_BACKOFF_SECONDS", "30"))))
+VOICE_CONNECT_TIMEOUT_SECONDS = max(30.0, float(os.getenv(f"{BOT_ENV_PREFIX}_VOICE_CONNECT_TIMEOUT_SECONDS", os.getenv("VOICE_CONNECT_TIMEOUT_SECONDS", "90"))))
+VOICE_CONNECT_TIMEOUT_BACKOFF_SECONDS = max(15.0, float(os.getenv(f"{BOT_ENV_PREFIX}_VOICE_CONNECT_TIMEOUT_BACKOFF_SECONDS", os.getenv("VOICE_CONNECT_TIMEOUT_BACKOFF_SECONDS", "45"))))
+LAVALINK_HEALTH_STARTUP_GRACE_SECONDS = max(5.0, float(os.getenv(f"{BOT_ENV_PREFIX}_LAVALINK_HEALTH_STARTUP_GRACE_SECONDS", os.getenv("LAVALINK_HEALTH_STARTUP_GRACE_SECONDS", "25"))))
+STARTUP_RECOVERY_JITTER_SECONDS = max(0.0, float(os.getenv(f"{BOT_ENV_PREFIX}_STARTUP_RECOVERY_JITTER_SECONDS", os.getenv("STARTUP_RECOVERY_JITTER_SECONDS", "12"))))
+VOICE_REJOIN_JITTER_MIN_SECONDS = max(0.0, float(os.getenv(f"{BOT_ENV_PREFIX}_VOICE_REJOIN_JITTER_MIN_SECONDS", os.getenv("VOICE_REJOIN_JITTER_MIN_SECONDS", "2"))))
+VOICE_REJOIN_JITTER_MAX_SECONDS = max(VOICE_REJOIN_JITTER_MIN_SECONDS, float(os.getenv(f"{BOT_ENV_PREFIX}_VOICE_REJOIN_JITTER_MAX_SECONDS", os.getenv("VOICE_REJOIN_JITTER_MAX_SECONDS", "8"))))
+RECOVERY_RETRY_JITTER_SECONDS = max(0.0, float(os.getenv(f"{BOT_ENV_PREFIX}_RECOVERY_RETRY_JITTER_SECONDS", os.getenv("RECOVERY_RETRY_JITTER_SECONDS", "8"))))
+VOICE_DISCONNECT_GRACE_SECONDS = max(5.0, float(os.getenv(f"{BOT_ENV_PREFIX}_VOICE_DISCONNECT_GRACE_SECONDS", os.getenv("VOICE_DISCONNECT_GRACE_SECONDS", "35"))))
+VOICE_DISCONNECT_GRACE_JITTER_SECONDS = max(0.0, float(os.getenv(f"{BOT_ENV_PREFIX}_VOICE_DISCONNECT_GRACE_JITTER_SECONDS", os.getenv("VOICE_DISCONNECT_GRACE_JITTER_SECONDS", "8"))))
+SOFT_VOICE_DISCONNECT_RECOVERY = os.getenv(f"{BOT_ENV_PREFIX}_SOFT_VOICE_DISCONNECT_RECOVERY", os.getenv("SOFT_VOICE_DISCONNECT_RECOVERY", "true")).strip().lower() not in {"0", "false", "off", "no"}
+VOICE_DISCONNECT_REJOIN_RECOVERY = os.getenv(f"{BOT_ENV_PREFIX}_VOICE_DISCONNECT_REJOIN_RECOVERY", os.getenv("VOICE_DISCONNECT_REJOIN_RECOVERY", "false")).strip().lower() not in {"0", "false", "off", "no"}
+PERSISTENT_VOICE_RESTORE_ON_STARTUP = os.getenv(f"{BOT_ENV_PREFIX}_PERSISTENT_VOICE_RESTORE_ON_STARTUP", os.getenv("PERSISTENT_VOICE_RESTORE_ON_STARTUP", "true")).strip().lower() not in {"0", "false", "off", "no"}
+VOICE_FORCE_STALE_CLIENT_REJOIN = os.getenv(f"{BOT_ENV_PREFIX}_VOICE_FORCE_STALE_CLIENT_REJOIN", os.getenv("VOICE_FORCE_STALE_CLIENT_REJOIN", "false")).strip().lower() not in {"0", "false", "off", "no"}
+VOICE_IDLE_REJOIN_RECOVERY = os.getenv(f"{BOT_ENV_PREFIX}_VOICE_IDLE_REJOIN_RECOVERY", os.getenv("VOICE_IDLE_REJOIN_RECOVERY", "false")).strip().lower() not in {"0", "false", "off", "no"}
+
+# Aria is the recovery authority. Direct-order controls keep RECOVER/doctoring
+# idempotent and prevent duplicate workers/restarts from grabbing the same order.
+ARIA_RECOVERY_AUTHORITY = os.getenv(f"{BOT_ENV_PREFIX}_ARIA_RECOVERY_AUTHORITY", os.getenv("ARIA_RECOVERY_AUTHORITY", "true")).strip().lower() not in {"0", "false", "off", "no"}
+DIRECT_ORDER_FETCH_LIMIT = max(1, int(os.getenv(f"{BOT_ENV_PREFIX}_DIRECT_ORDER_FETCH_LIMIT", os.getenv("DIRECT_ORDER_FETCH_LIMIT", "8"))))
+DIRECT_ORDER_MAX_ATTEMPTS = max(1, int(os.getenv(f"{BOT_ENV_PREFIX}_DIRECT_ORDER_MAX_ATTEMPTS", os.getenv("DIRECT_ORDER_MAX_ATTEMPTS", "3"))))
+DIRECT_ORDER_CLAIM_TIMEOUT_SECONDS = max(10, int(os.getenv(f"{BOT_ENV_PREFIX}_DIRECT_ORDER_CLAIM_TIMEOUT_SECONDS", os.getenv("DIRECT_ORDER_CLAIM_TIMEOUT_SECONDS", "90"))))
+DIRECT_ORDER_RETRY_DELAY_SECONDS = max(5, int(os.getenv(f"{BOT_ENV_PREFIX}_DIRECT_ORDER_RETRY_DELAY_SECONDS", os.getenv("DIRECT_ORDER_RETRY_DELAY_SECONDS", "20"))))
+DIRECT_ORDER_RETRY_BACKDATE_SECONDS = max(0, DIRECT_ORDER_CLAIM_TIMEOUT_SECONDS - DIRECT_ORDER_RETRY_DELAY_SECONDS)
+DIRECT_ORDER_STALE_SECONDS = max(300, int(os.getenv(f"{BOT_ENV_PREFIX}_DIRECT_ORDER_STALE_SECONDS", os.getenv("DIRECT_ORDER_STALE_SECONDS", "900"))))
+DIRECT_ORDER_CLAIM_TOKEN = f"{BOT_ENV_PREFIX.lower()}:{os.getpid()}:{random.randint(100000, 999999)}"
+SWARM_BRIDGE_DB_ERROR_LOG_INTERVAL_SECONDS = max(
+    30.0,
+    float(os.getenv(f"{BOT_ENV_PREFIX}_SWARM_BRIDGE_DB_ERROR_LOG_INTERVAL_SECONDS", os.getenv("SWARM_BRIDGE_DB_ERROR_LOG_INTERVAL_SECONDS", "120"))),
+)
+_last_swarm_bridge_db_error_log_at = 0.0
+
+# Discord can rate-limit /users/@me when all swarm containers login at once
+# or when Docker restart:always creates a fast crash loop. These delays keep
+# failures inside the process long enough to stop a login stampede.
+BOT_LOGIN_STARTUP_JITTER_SECONDS = max(0.0, float(os.getenv(f"{BOT_ENV_PREFIX}_BOT_LOGIN_STARTUP_JITTER_SECONDS", os.getenv("BOT_LOGIN_STARTUP_JITTER_SECONDS", "20"))))
+BOT_LOGIN_STAGGER_SLOT_SECONDS = max(0.0, float(os.getenv(f"{BOT_ENV_PREFIX}_BOT_LOGIN_STAGGER_SLOT_SECONDS", os.getenv("BOT_LOGIN_STAGGER_SLOT_SECONDS", "35"))))
+BOT_LOGIN_STAGGER_MAX_SECONDS = max(0.0, float(os.getenv(f"{BOT_ENV_PREFIX}_BOT_LOGIN_STAGGER_MAX_SECONDS", os.getenv("BOT_LOGIN_STAGGER_MAX_SECONDS", "420"))))
+BOT_LOGIN_FAILURE_SLEEP_SECONDS = max(60.0, float(os.getenv(f"{BOT_ENV_PREFIX}_BOT_LOGIN_FAILURE_SLEEP_SECONDS", os.getenv("BOT_LOGIN_FAILURE_SLEEP_SECONDS", "300"))))
+BOT_LOGIN_FAILURE_JITTER_SECONDS = max(0.0, float(os.getenv(f"{BOT_ENV_PREFIX}_BOT_LOGIN_FAILURE_JITTER_SECONDS", os.getenv("BOT_LOGIN_FAILURE_JITTER_SECONDS", "120"))))
+BOT_LOGIN_FAILURE_BACKOFF_FACTOR = max(1.0, float(os.getenv(f"{BOT_ENV_PREFIX}_BOT_LOGIN_FAILURE_BACKOFF_FACTOR", os.getenv("BOT_LOGIN_FAILURE_BACKOFF_FACTOR", "1.8"))))
+BOT_LOGIN_FAILURE_MAX_SLEEP_SECONDS = max(BOT_LOGIN_FAILURE_SLEEP_SECONDS, float(os.getenv(f"{BOT_ENV_PREFIX}_BOT_LOGIN_FAILURE_MAX_SLEEP_SECONDS", os.getenv("BOT_LOGIN_FAILURE_MAX_SLEEP_SECONDS", "3600"))))
+GLOBAL_DISCORD_LOGIN_GATE_ENABLED = os.getenv(f"{BOT_ENV_PREFIX}_GLOBAL_DISCORD_LOGIN_GATE_ENABLED", os.getenv("GLOBAL_DISCORD_LOGIN_GATE_ENABLED", "true")).strip().lower() not in {"0", "false", "off", "no"}
+GLOBAL_DISCORD_LOGIN_MIN_INTERVAL_SECONDS = max(30.0, float(os.getenv(f"{BOT_ENV_PREFIX}_GLOBAL_DISCORD_LOGIN_MIN_INTERVAL_SECONDS", os.getenv("GLOBAL_DISCORD_LOGIN_MIN_INTERVAL_SECONDS", "150"))))
+GLOBAL_DISCORD_LOGIN_JITTER_SECONDS = max(0.0, float(os.getenv(f"{BOT_ENV_PREFIX}_GLOBAL_DISCORD_LOGIN_JITTER_SECONDS", os.getenv("GLOBAL_DISCORD_LOGIN_JITTER_SECONDS", "45"))))
+GLOBAL_DISCORD_LOGIN_PRESSURE_COOLDOWN_SECONDS = max(300.0, float(os.getenv(f"{BOT_ENV_PREFIX}_GLOBAL_DISCORD_LOGIN_PRESSURE_COOLDOWN_SECONDS", os.getenv("GLOBAL_DISCORD_LOGIN_PRESSURE_COOLDOWN_SECONDS", "2700"))))
+GLOBAL_DISCORD_LOGIN_COOLDOWN_POLL_SECONDS = max(30.0, float(os.getenv(f"{BOT_ENV_PREFIX}_GLOBAL_DISCORD_LOGIN_COOLDOWN_POLL_SECONDS", os.getenv("GLOBAL_DISCORD_LOGIN_COOLDOWN_POLL_SECONDS", "120"))))
+GLOBAL_DISCORD_LOGIN_LOCK_POLL_SECONDS = max(1.0, float(os.getenv(f"{BOT_ENV_PREFIX}_GLOBAL_DISCORD_LOGIN_LOCK_POLL_SECONDS", os.getenv("GLOBAL_DISCORD_LOGIN_LOCK_POLL_SECONDS", "2"))))
+GLOBAL_DISCORD_LOGIN_LOCK_STALE_SECONDS = max(30.0, float(os.getenv(f"{BOT_ENV_PREFIX}_GLOBAL_DISCORD_LOGIN_LOCK_STALE_SECONDS", os.getenv("GLOBAL_DISCORD_LOGIN_LOCK_STALE_SECONDS", "300"))))
+MUSIC_BOT_RUNTIME_DIR = os.getenv(f"{BOT_ENV_PREFIX}_RUNTIME_DIR", os.getenv("MUSIC_BOT_RUNTIME_DIR", "/app/.runtime"))
+BOT_STAGGER_SLOTS = {
+    "GWS": 0, "HARMONIC": 1, "MAESTRO": 2, "MELODIC": 3, "NEXUS": 4,
+    "RHYTHM": 5, "SYMPHONY": 6, "TUNESTREAM": 7, "ALUCARD": 8, "SAPPHIRE": 9,
+}
+
+
+def _runtime_path(name: str) -> str:
+    try:
+        os.makedirs(MUSIC_BOT_RUNTIME_DIR, exist_ok=True)
+    except Exception:
+        pass
+    return os.path.join(MUSIC_BOT_RUNTIME_DIR, name)
+
+
+
+def _runtime_file_float(path: str, default: float = 0.0) -> float:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return float((handle.read() or "0").strip() or "0")
+    except Exception:
+        return default
+
+
+def _runtime_write_float(path: str, value: float) -> None:
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(str(float(value)))
+    except Exception:
+        logger.debug("[%s] Could not write runtime float file %s", BOT_ENV_PREFIX.lower(), path, exc_info=True)
+
+
+def _global_login_next_path() -> str:
+    return _runtime_path("swarm_next_discord_login_at.txt")
+
+
+def _global_login_cooldown_path() -> str:
+    return _runtime_path("swarm_discord_login_cooldown_until.txt")
+
+
+def _global_login_lock_dir() -> str:
+    return _runtime_path("swarm_discord_login_gate.lock")
+
+
+def _is_discord_login_pressure_error(exc: Exception | None) -> bool:
+    text = (str(exc or "") + " " + exc.__class__.__name__).lower()
+    return any(token in text for token in (
+        "429", "too many requests", "40062", "rate limited",
+        "503", "504", "no healthy upstream", "overflow", "cloudflare", "service unavailable",
+    ))
+
+
+def _set_global_discord_login_cooldown(seconds: float, reason: str = "discord_login_pressure") -> None:
+    until = time.time() + max(0.0, seconds)
+    current = _runtime_file_float(_global_login_cooldown_path(), 0.0)
+    if until > current:
+        _runtime_write_float(_global_login_cooldown_path(), until)
+        logger.warning(
+            "[%s] Global Discord login cooldown armed for %.0fs after %s. Shared runtime dir: %s",
+            BOT_ENV_PREFIX.lower(), max(0.0, until - time.time()), reason, MUSIC_BOT_RUNTIME_DIR,
+        )
+
+
+def _wait_for_global_discord_login_gate() -> None:
+    """Serialize Discord /users/@me login attempts across all music bot containers.
+
+    The runtime directory is mounted from ./runtime into every bot container.  A
+    tiny directory lock is enough here because we only protect the startup login
+    attempt; the goal is to avoid all ten tokens hitting Discord's login route
+    together after rebuilds or Docker restart loops.
+    """
+    if not GLOBAL_DISCORD_LOGIN_GATE_ENABLED:
+        return
+
+    warned_shared = False
+    while True:
+        now = time.time()
+        cooldown_until = _runtime_file_float(_global_login_cooldown_path(), 0.0)
+        if cooldown_until > now:
+            wait_for = min(GLOBAL_DISCORD_LOGIN_COOLDOWN_POLL_SECONDS, cooldown_until - now)
+            logger.warning(
+                "[%s] Waiting %.0fs for shared Discord login cooldown to clear before login.",
+                BOT_ENV_PREFIX.lower(), max(1.0, cooldown_until - now),
+            )
+            time.sleep(max(1.0, wait_for))
+            continue
+
+        lock_dir = _global_login_lock_dir()
+        try:
+            os.mkdir(lock_dir)
+        except FileExistsError:
+            # A crashed container can leave the gate behind; clear it when stale.
+            try:
+                age = time.time() - os.path.getmtime(lock_dir)
+                if age > GLOBAL_DISCORD_LOGIN_LOCK_STALE_SECONDS:
+                    os.rmdir(lock_dir)
+                    continue
+            except Exception:
+                pass
+            if not warned_shared:
+                logger.info("[%s] Another music bot is reserving the Discord login gate; waiting.", BOT_ENV_PREFIX.lower())
+                warned_shared = True
+            time.sleep(GLOBAL_DISCORD_LOGIN_LOCK_POLL_SECONDS)
+            continue
+        except Exception:
+            logger.warning("[%s] Could not create shared login gate in %s; continuing with local-only stagger.", BOT_ENV_PREFIX.lower(), MUSIC_BOT_RUNTIME_DIR, exc_info=True)
+            return
+
+        try:
+            next_allowed = _runtime_file_float(_global_login_next_path(), 0.0)
+            now = time.time()
+            if next_allowed > now:
+                wait_for = next_allowed - now
+                logger.info("[%s] Shared Discord login gate waiting %.1fs for previous bot attempt spacing.", BOT_ENV_PREFIX.lower(), wait_for)
+                time.sleep(wait_for)
+                now = time.time()
+            reserve_until = now + GLOBAL_DISCORD_LOGIN_MIN_INTERVAL_SECONDS + random.uniform(0.0, GLOBAL_DISCORD_LOGIN_JITTER_SECONDS)
+            _runtime_write_float(_global_login_next_path(), reserve_until)
+            logger.info(
+                "[%s] Shared Discord login gate reserved; next bot login allowed in %.1fs.",
+                BOT_ENV_PREFIX.lower(), max(0.0, reserve_until - now),
+            )
+            return
+        finally:
+            try:
+                os.rmdir(lock_dir)
+            except Exception:
+                pass
+
+def _login_failure_counter_path() -> str:
+    return _runtime_path(f"{BOT_ENV_PREFIX.lower()}_login_failures.txt")
+
+def _read_login_failure_count() -> int:
+    try:
+        with open(_login_failure_counter_path(), "r", encoding="utf-8") as handle:
+            return max(0, int((handle.read() or "0").strip() or "0"))
+    except Exception:
+        return 0
+
+def _write_login_failure_count(count: int) -> None:
+    try:
+        with open(_login_failure_counter_path(), "w", encoding="utf-8") as handle:
+            handle.write(str(max(0, int(count))))
+    except Exception:
+        logger.debug("[%s] Could not persist login failure count.", BOT_ENV_PREFIX.lower(), exc_info=True)
+
+def reset_login_failure_backoff() -> None:
+    _write_login_failure_count(0)
+
+def compute_login_startup_delay() -> float:
+    slot = BOT_STAGGER_SLOTS.get(BOT_ENV_PREFIX.upper(), 10)
+    deterministic = min(BOT_LOGIN_STAGGER_MAX_SECONDS, slot * BOT_LOGIN_STAGGER_SLOT_SECONDS)
+    return deterministic + random.uniform(0.0, BOT_LOGIN_STARTUP_JITTER_SECONDS)
+
+def compute_login_failure_delay(exc: Exception | None = None) -> float:
+    failures = _read_login_failure_count() + 1
+    _write_login_failure_count(failures)
+    if _is_discord_login_pressure_error(exc):
+        _set_global_discord_login_cooldown(GLOBAL_DISCORD_LOGIN_PRESSURE_COOLDOWN_SECONDS, reason=exc.__class__.__name__)
+    exponential = BOT_LOGIN_FAILURE_SLEEP_SECONDS * (BOT_LOGIN_FAILURE_BACKOFF_FACTOR ** max(0, failures - 1))
+    capped = min(BOT_LOGIN_FAILURE_MAX_SLEEP_SECONDS, exponential)
+    # Pressure errors should wait at least the shared cooldown window locally too; otherwise
+    # Docker restart:always can keep re-entering the login route while Discord is angry.
+    if _is_discord_login_pressure_error(exc):
+        capped = max(capped, min(BOT_LOGIN_FAILURE_MAX_SLEEP_SECONDS, GLOBAL_DISCORD_LOGIN_PRESSURE_COOLDOWN_SECONDS))
+    return capped + random.uniform(0.0, BOT_LOGIN_FAILURE_JITTER_SECONDS)
+
+def _parse_lavalink_endpoint():
+    parsed = urllib.parse.urlparse(LAVALINK_URI)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    return host, port
+
+async def _wait_for_lavalink_tcp(timeout: float = 1.5) -> bool:
+    host, port = _parse_lavalink_endpoint()
+    try:
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+def _has_connecting_lavalink_node() -> bool:
+    for node in _get_pool_nodes():
+        try:
+            status = getattr(node, "status", None)
+            status_text = str(status).upper()
+            if status_text == "CONNECTING" or status_text.endswith(".CONNECTING"):
+                return True
+        except Exception:
+            continue
+    return False
 
 lavalink_connect_task = None
 lavalink_connect_lock = asyncio.Lock()
-lavalink_recovery_bootstrapped = False
-BOT_RECOVERY_ORDER = ["GWS", "HARMONIC", "MAESTRO", "MELODIC", "NEXUS", "RHYTHM", "SYMPHONY", "TUNESTREAM", "ALUCARD", "SAPPHIRE"]
-BOT_RECOVERY_STAGGER_SECONDS = max(0.0, float(os.getenv(f"{BOT_ENV_PREFIX}_RECOVERY_STARTUP_STAGGER_SECONDS", os.getenv("RECOVERY_STARTUP_STAGGER_SECONDS", str((BOT_RECOVERY_ORDER.index(BOT_ENV_PREFIX) if BOT_ENV_PREFIX in BOT_RECOVERY_ORDER else 0) * 8)))))
 
 def _get_pool_nodes():
-    nodes = getattr(wavelink.Pool, "nodes", None)
-    if isinstance(nodes, dict):
-        return list(nodes.values())
-    if isinstance(nodes, (list, tuple, set)):
-        return list(nodes)
+    try:
+        # Wavelink 3.x exposes Pool.nodes as a dictionary of node objects.
+        nodes = getattr(wavelink.Pool, "nodes", None)
+        if isinstance(nodes, dict):
+            return list(nodes.values())
+        if isinstance(nodes, (list, tuple, set)):
+            return list(nodes)
+    except Exception:
+        logger.debug("[%s] Unable to inspect Wavelink node pool.", BOT_ENV_PREFIX.lower(), exc_info=True)
     return []
 
 def _has_connected_lavalink_node() -> bool:
+    try:
+        connected_status = getattr(getattr(wavelink, "NodeStatus", None), "CONNECTED", None)
+    except Exception:
+        connected_status = None
+
     for node in _get_pool_nodes():
-        if getattr(node, "available", False) or getattr(node, "connected", False):
-            return True
-        status = str(getattr(node, "status", ""))
-        if "CONNECTED" in status.upper():
-            return True
+        try:
+            status = getattr(node, "status", None)
+            if connected_status is not None and status == connected_status:
+                return True
+            status_text = str(status).upper()
+            if status_text == "CONNECTED" or status_text.endswith(".CONNECTED"):
+                return True
+            if getattr(node, "connected", False):
+                return True
+        except Exception:
+            continue
     return False
 
 async def _connect_lavalink_forever():
     await bot.wait_until_ready()
     async with lavalink_connect_lock:
         while not _has_connected_lavalink_node():
+            if _has_connecting_lavalink_node():
+                await asyncio.sleep(5)
+                continue
+            if not await _wait_for_lavalink_tcp():
+                logger.info(f"Lavalink is not listening at {LAVALINK_URI} yet; waiting before opening a Wavelink node.")
+                await asyncio.sleep(5)
+                continue
             try:
                 logger.info(f"Connecting to Lavalink at {LAVALINK_URI}")
                 await wavelink.Pool.connect(nodes=[wavelink.Node(uri=LAVALINK_URI, password=LAVALINK_PASSWORD)], client=bot, cache_capacity=100)
@@ -648,11 +1098,9 @@ async def _connect_lavalink_forever():
                 logger.warning(f"Waiting for Lavalink to boot or authenticate... Retrying in 5s ({exc})")
                 await asyncio.sleep(5)
             else:
-                for _ in range(40):
-                    if _has_connected_lavalink_node():
-                        return
-                    await asyncio.sleep(0.5)
-                logger.warning("Lavalink connection attempt did not become ready within 20s; retrying.")
+                await asyncio.sleep(2)
+                if _has_connected_lavalink_node():
+                    break
 
 def ensure_lavalink_connection_task():
     global lavalink_connect_task
@@ -685,9 +1133,18 @@ async def lavalink_health_monitor():
                     if channel_id:
                         position = int((state or {}).get("position", 0) or 0)
                         await remember_recovery_state(guild.id, channel_id, position)
-                        schedule_recovery_retry(guild.id, channel_id, start_position=position, reason="lavalink_health")
+                        if not ARIA_RECOVERY_AUTHORITY:
+                            schedule_recovery_retry(guild.id, channel_id, start_position=position, reason="lavalink_health")
+                        else:
+                            logger.info("[%s] Lavalink degraded; preserving state and letting Aria decide recovery.", guild.id)
     except Exception:
         logger.exception("[nexus] Lavalink health monitor failed.")
+
+@lavalink_health_monitor.before_loop
+async def before_lavalink_health_monitor():
+    await bot.wait_until_ready()
+    # Avoid a false-positive Lavalink failure while the websocket is still connecting.
+    await asyncio.sleep(LAVALINK_HEALTH_STARTUP_GRACE_SECONDS + random.uniform(0.0, STARTUP_RECOVERY_JITTER_SECONDS))
 
 async def on_ready_lavalink_health():
     ensure_lavalink_connection_task()
@@ -701,33 +1158,45 @@ def _safe_display_name(member_or_user):
         return "Unknown User"
     return getattr(member_or_user, "display_name", None) or getattr(member_or_user, "global_name", None) or getattr(member_or_user, "name", None) or "Unknown User"
 
+
 async def resolve_requester_name(guild, requester_id):
     if not requester_id:
         return "Unknown User"
+    guild_key = getattr(guild, "id", 0) or 0
+    cache_key = (guild_key, int(requester_id))
+    cached = _cache_get(REQUESTER_NAME_CACHE, cache_key, REQUESTER_NAME_CACHE_TTL_SECONDS)
+    if cached:
+        return cached
     try:
-        requester_id = int(requester_id)
+        member = guild.get_member(requester_id) if guild else None
     except Exception:
-        return "Unknown User"
-    member = guild.get_member(requester_id) if guild else None
+        member = None
     if member:
-        return _safe_display_name(member)
+        return _cache_set(REQUESTER_NAME_CACHE, cache_key, _safe_display_name(member))
     user = bot.get_user(requester_id)
     if user:
-        return _safe_display_name(user)
+        return _cache_set(REQUESTER_NAME_CACHE, cache_key, _safe_display_name(user))
     try:
         user = await bot.fetch_user(requester_id)
-        return _safe_display_name(user)
+        return _cache_set(REQUESTER_NAME_CACHE, cache_key, _safe_display_name(user))
     except Exception:
-        return f"User {requester_id}"
+        fallback = f"User {requester_id}"
+        return _cache_set(REQUESTER_NAME_CACHE, cache_key, fallback)
+
 
 async def get_autodj_enabled(guild_id):
+    cached = _cache_get(AUTO_DJ_ENABLED_CACHE, int(guild_id), AUTO_DJ_CACHE_TTL_SECONDS)
+    if cached is not None:
+        return bool(cached)
     try:
         async with DBPoolManager() as pool:
             async with pool.acquire() as conn:
                 async with conn.cursor(aiomysql.DictCursor) as cur:
                     await cur.execute("SELECT auto_dj FROM nexus_swarm_toggles WHERE guild_id = %s", (guild_id,))
                     row = await cur.fetchone()
-                    return bool(row and row.get('auto_dj'))
+                    value = bool(row and row.get('auto_dj'))
+                    _cache_set(AUTO_DJ_ENABLED_CACHE, int(guild_id), value)
+                    return value
     except Exception:
         return False
 
@@ -736,29 +1205,44 @@ async def set_autodj_enabled(guild_id, enabled):
         async with pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute("INSERT INTO nexus_swarm_toggles (guild_id, auto_dj) VALUES (%s, %s) ON DUPLICATE KEY UPDATE auto_dj = VALUES(auto_dj)", (guild_id, bool(enabled)))
+    invalidate_feature_caches(guild_id)
+    _cache_set(AUTO_DJ_ENABLED_CACHE, int(guild_id), bool(enabled))
 
 async def build_autodj_query(cur, guild_id):
-    await cur.execute("SELECT title FROM nexus_history WHERE guild_id = %s ORDER BY played_at DESC LIMIT 8", (guild_id,))
+    await cur.execute("SELECT title FROM nexus_history WHERE guild_id = %s ORDER BY played_at DESC LIMIT 12", (guild_id,))
     recent_rows = await cur.fetchall()
-    _t = lambda r: r.get("title") if isinstance(r, dict) else r[0]  # DictCursor-safe
-    recent_titles = [_t(row) for row in recent_rows if row and _t(row)]
-    for title in recent_titles:
-        cleaned = re.sub(r"\s*\([^)]*\)|\s*\[[^\]]*\]", "", title).strip()
-        if cleaned:
-            return f"ytmsearch:{cleaned} audio"
+    _t = lambda r: r.get("title") if isinstance(r, dict) else r[0]
+    recent_titles = []
+    seen = set()
+    for row in recent_rows:
+        title = _t(row) if row else None
+        cleaned = re.sub(r"\s*\([^)]*\)|\s*\[[^\]]*\]", "", str(title or "")).strip()
+        key = cleaned.lower()
+        if cleaned and key not in seen:
+            recent_titles.append(cleaned)
+            seen.add(key)
+    if recent_titles:
+        seed_title = random.choice(recent_titles[:5])
+        return f"ytmsearch:{seed_title} audio"
     fallback_terms = ["lofi hip hop", "synthwave mix", "chill electronic", "gaming music", "jazz hop"]
     return f"ytmsearch:{random.choice(fallback_terms)}"
 
 async def maybe_enqueue_autodj(cur, guild, channel_id):
+    now = time.time()
+    if now < AUTODJ_FAIL_UNTIL.get(guild.id, 0):
+        return False
+    if now - AUTODJ_LAST_RUN.get(guild.id, 0) < AUTODJ_MIN_INTERVAL_SECONDS:
+        return False
     if not await get_autodj_enabled(guild.id):
         return False
+    AUTODJ_LAST_RUN[guild.id] = now
     query = await build_autodj_query(cur, guild.id)
     try:
         entries, _playlist_result = await search_playables(query)
         history_titles = set()
-        await cur.execute("SELECT title FROM nexus_history WHERE guild_id = %s ORDER BY played_at DESC LIMIT 12", (guild.id,))
+        await cur.execute("SELECT title FROM nexus_history WHERE guild_id = %s ORDER BY played_at DESC LIMIT 18", (guild.id,))
         for row in await cur.fetchall():
-            _rv = row.get("title") if isinstance(row, dict) else row[0]  # DictCursor-safe
+            _rv = row.get("title") if isinstance(row, dict) else row[0]
             if row and _rv:
                 history_titles.add(str(_rv).strip().lower())
         chosen = None
@@ -770,21 +1254,29 @@ async def maybe_enqueue_autodj(cur, guild, channel_id):
         if not chosen and entries:
             chosen = entries[0]
         if not chosen:
+            AUTODJ_FAIL_UNTIL[guild.id] = time.time() + AUTODJ_FAILURE_BACKOFF_SECONDS
             return False
         await enqueue_track(cur, guild.id, chosen.uri, chosen.title, bot.user.id if bot.user else None)
         schedule_named_task(f"autodj_process_queue:{guild.id}", process_queue(guild, channel_id))
         return True
     except Exception as exc:
+        AUTODJ_FAIL_UNTIL[guild.id] = time.time() + AUTODJ_FAILURE_BACKOFF_SECONDS
         logger.warning(f"[{guild.id}] Auto-DJ recommendation failed: {exc}")
         return False
 
+
 async def get_saved_settings_summary(guild_id):
+    cached = _cache_get(GUILD_SETTINGS_CACHE, int(guild_id), GUILD_SETTINGS_CACHE_TTL_SECONDS)
+    if cached is not None:
+        return cached
     await ensure_guild_settings(guild_id)
     async with DBPoolManager() as pool:
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("SELECT home_vc_id, volume, loop_mode, filter_mode, dj_role_id, feedback_channel_id, transition_mode, custom_speed, custom_pitch, custom_modifiers_left, dj_only_mode, stay_in_vc FROM nexus_guild_settings WHERE guild_id = %s", (guild_id,))
-                return await cur.fetchone()
+                row = await cur.fetchone()
+                _cache_set(GUILD_SETTINGS_CACHE, int(guild_id), row)
+                return row
 
 ytdl_format_options = {
     'format': 'bestaudio/best', 'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
@@ -839,7 +1331,7 @@ async def init_db():
                 except: pass
                 await cur.execute("CREATE TABLE IF NOT EXISTS nexus_swarm_toggles (guild_id BIGINT PRIMARY KEY, auto_dj BOOLEAN DEFAULT FALSE, audio_filter VARCHAR(20) DEFAULT 'normal')")
                 await cur.execute("CREATE TABLE IF NOT EXISTS nexus_swarm_overrides (guild_id BIGINT, bot_name VARCHAR(50), command VARCHAR(20), attempts INT NOT NULL DEFAULT 0, last_error TEXT NULL, PRIMARY KEY(guild_id, bot_name))")
-                await cur.execute("CREATE TABLE IF NOT EXISTS nexus_swarm_direct_orders (id INT AUTO_INCREMENT PRIMARY KEY, bot_name VARCHAR(50), guild_id BIGINT, vc_id BIGINT, text_channel_id BIGINT, command VARCHAR(50), data TEXT, attempts INT NOT NULL DEFAULT 0, last_error TEXT NULL)")
+                await cur.execute("CREATE TABLE IF NOT EXISTS nexus_swarm_direct_orders (id INT AUTO_INCREMENT PRIMARY KEY, bot_name VARCHAR(50), guild_id BIGINT, vc_id BIGINT, text_channel_id BIGINT, command VARCHAR(50), data TEXT, attempts INT NOT NULL DEFAULT 0, last_error TEXT NULL, claimed_at TIMESTAMP NULL, claim_token VARCHAR(128) NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
                 await cur.execute("CREATE TABLE IF NOT EXISTS swarm_health (bot_name VARCHAR(50) PRIMARY KEY, last_pulse TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, status VARCHAR(20))")
                 await cur.execute(f"CREATE TABLE IF NOT EXISTS {BOT_ENV_PREFIX.lower()}_error_events (id INT AUTO_INCREMENT PRIMARY KEY, bot_name VARCHAR(50) NOT NULL, guild_id BIGINT NULL, error_level VARCHAR(20) NOT NULL DEFAULT 'error', error_type VARCHAR(50) NOT NULL DEFAULT 'runtime', title VARCHAR(255) NOT NULL, description TEXT NULL, traceback_text MEDIUMTEXT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
                 try: await cur.execute("CREATE INDEX nexus_queue_lookup_idx ON nexus_queue (guild_id, bot_name, id)")
@@ -878,26 +1370,45 @@ async def init_db_with_retries(attempts=12, delay=5):
 
 # --- RUNTIME HOT PATH: keep helpers small; queue, recovery, and panel sync call these frequently. ---
 # --- CORE LOGIC & HELPERS ---
+
 async def save_state(guild_id):
-    state = guild_states.get(guild_id)
-    if not state: return
+    state = guild_states.get(guild_id) or guild_states.get(str(guild_id))
+    if not state:
+        return
+    path = f"state_{guild_id}.json"
+    tmp_path = f"{path}.tmp"
     try:
-        with open(f"state_{guild_id}.json", "w") as f: json.dump(state, f)
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.replace(tmp_path, path)
     except Exception:
-        pass
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
 
 async def load_states():
     states = {}
     for file in os.listdir():
         if file.startswith("state_") and file.endswith(".json"):
             try:
-                gid = file.replace("state_", "").replace(".json", "")
-                with open(file) as f: states[gid] = json.load(f)
+                gid_text = file.replace("state_", "").replace(".json", "")
+                gid = int(gid_text)
+                with open(file, encoding="utf-8") as f:
+                    states[gid] = json.load(f)
             except Exception:
                 pass
     return states
 
 async def delete_state(guild_id):
+    for key in (guild_id, str(guild_id)):
+        guild_states.pop(key, None)
     try:
         os.remove(f"state_{guild_id}.json")
     except FileNotFoundError:
@@ -956,7 +1467,14 @@ def current_track_position(guild_id, now=None):
     if data.get('paused'):
         return max(0, int(data.get('offset', 0)))
     now = now or time.time()
-    return max(0, int((now - data.get('start_time', now)) * data.get('speed', 1.0) + data.get('offset', 0)))
+    position = max(0, int((now - data.get('start_time', now)) * data.get('speed', 1.0) + data.get('offset', 0)))
+    try:
+        duration = int(data.get('duration') or 0)
+        if duration > 0:
+            position = min(position, duration)
+    except Exception:
+        pass
+    return position
 
 def clear_auto_restore_snooze(guild_id):
     auto_restore_snooze_until.pop(guild_id, None)
@@ -977,7 +1495,8 @@ def clear_recovery_backoff(guild_id):
 def arm_recovery_backoff(guild_id, *, seconds=RECOVERY_EXHAUSTED_COOLDOWN_SECONDS, reason="recovery_exhausted"):
     cooldown = max(30.0, float(seconds))
     recovery_exhausted_until[guild_id] = time.time() + cooldown
-    playback_tracking.pop(guild_id, None)
+    # Keep playback state around during network/Discord voice lag so recovery
+    # can resume the same track instead of treating the guild as fully stopped.
     recovering_guilds.discard(guild_id)
     snooze_auto_restore(guild_id, cooldown)
     logger.warning(f"[{guild_id}] Recovery paused for {int(cooldown)}s after {reason}.")
@@ -992,6 +1511,87 @@ def clear_recovery_retry(guild_id):
     if retry_task and retry_task is not current_task and not retry_task.done():
         retry_task.cancel()
 
+def clear_voice_disconnect_grace(guild_id):
+    grace_task = voice_disconnect_grace_tasks.pop(guild_id, None)
+    current_task = asyncio.current_task()
+    if grace_task and grace_task is not current_task and not grace_task.done():
+        grace_task.cancel()
+
+def freeze_playback_for_soft_disconnect(guild_id, position=None):
+    tracked = playback_tracking.get(guild_id)
+    if not tracked:
+        return
+    frozen_position = max(0, int(position if position is not None else current_track_position(guild_id)))
+    tracked["offset"] = frozen_position
+    tracked["start_time"] = time.time()
+    tracked["paused"] = True
+    tracked["voice_soft_disconnected"] = True
+
+def unfreeze_playback_after_voice_return(guild_id):
+    tracked = playback_tracking.get(guild_id)
+    if not tracked or not tracked.get("voice_soft_disconnected"):
+        return
+    tracked["start_time"] = time.time()
+    tracked["paused"] = False
+    tracked.pop("voice_soft_disconnected", None)
+
+async def _run_soft_voice_recovery_after_grace(guild_id, channel_id, position, reason, delay):
+    try:
+        await asyncio.sleep(delay)
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            return
+
+        vc = guild.voice_client
+        vc_channel_id = getattr(getattr(vc, "channel", None), "id", None) if vc else None
+        if vc and _voice_client_connected(vc) and vc_channel_id == channel_id:
+            await persist_voice_state(guild_id, channel_id, desired_connected=True, connected=True)
+            if _player_is_active(vc):
+                unfreeze_playback_after_voice_return(guild_id)
+                clear_recovery_retry(guild_id)
+                clear_recovery_backoff(guild_id)
+                logger.info(f"[{guild_id}] Voice link recovered during soft-disconnect grace; skipping hard rejoin.")
+                return
+
+        if recovery_backoff_remaining(guild_id) > 0:
+            return
+
+        tracked = playback_tracking.get(guild_id)
+        if tracked and tracked.get("voice_soft_disconnected"):
+            # Let restore_guild_state rebuild the active track from persisted state.
+            playback_tracking.pop(guild_id, None)
+
+        logger.warning(f"[{guild_id}] Voice link stayed down for {int(delay)}s after {reason}; starting gentle recovery from {int(position)}s.")
+        await restore_guild_state(guild_id, {"voice_channel_id": channel_id, "position": max(0, int(position))})
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception(f"[{guild_id}] Soft voice recovery grace task failed.")
+        schedule_recovery_retry(guild_id, channel_id, start_position=position, reason=f"{reason}_grace_failure")
+    finally:
+        current = asyncio.current_task()
+        if voice_disconnect_grace_tasks.get(guild_id) is current:
+            voice_disconnect_grace_tasks.pop(guild_id, None)
+
+def schedule_soft_voice_recovery(guild_id, channel_id, *, start_position=0, reason="voice_disconnect"):
+    if not channel_id:
+        return False
+    if not VOICE_DISCONNECT_REJOIN_RECOVERY:
+        logger.info(f"[{guild_id}] Bot-side voice disconnect rejoin recovery is disabled; preserving playback state for Aria-managed recovery ({reason}).")
+        return False
+    if not SOFT_VOICE_DISCONNECT_RECOVERY:
+        return schedule_recovery_retry(guild_id, channel_id, start_position=start_position, reason=reason)
+    if recovery_backoff_remaining(guild_id) > 0:
+        return False
+    existing = voice_disconnect_grace_tasks.get(guild_id)
+    if existing and not existing.done():
+        return False
+    clear_recovery_retry(guild_id)
+    delay = VOICE_DISCONNECT_GRACE_SECONDS + random.uniform(0.0, VOICE_DISCONNECT_GRACE_JITTER_SECONDS)
+    task = asyncio.create_task(_run_soft_voice_recovery_after_grace(guild_id, channel_id, start_position, reason, delay))
+    voice_disconnect_grace_tasks[guild_id] = task
+    return True
+
 async def remember_recovery_state(guild_id, channel_id, position=0):
     if not channel_id:
         return
@@ -1005,6 +1605,12 @@ async def persist_voice_state(guild_id, channel_id=None, *, text_channel_id=None
     """Persist desired/actual voice channel so restarts and Discord voice drops can recover safely."""
     if not guild_id:
         return
+    cache_key = int(guild_id)
+    fingerprint = (channel_id, text_channel_id, bool(desired_connected), bool(connected), str(last_error or ""))
+    cached = VOICE_STATE_PERSIST_CACHE.get(cache_key)
+    if not last_error and cached and cached[0] == fingerprint and time.time() - cached[1] < VOICE_STATE_DEDUP_SECONDS:
+        return
+    VOICE_STATE_PERSIST_CACHE[cache_key] = (fingerprint, time.time())
     try:
         async with DBPoolManager() as pool:
             async with pool.acquire() as conn:
@@ -1097,7 +1703,7 @@ async def collect_and_persist_metrics(guild=None):
                             continue
                         vc = g.voice_client
                         channel_id = getattr(getattr(vc, "channel", None), "id", None)
-                        voice_connected = bool(vc and getattr(vc, "is_connected", lambda: False)())
+                        voice_connected = bool(vc and _voice_client_connected(vc))
                         player_playing = bool(vc and _player_is_playing(vc))
                         player_paused = bool(vc and _player_is_paused(vc))
                         live_position = current_track_position(g.id) if (player_playing or player_paused or g.id in playback_tracking) else 0
@@ -1146,8 +1752,15 @@ async def collect_and_persist_metrics(guild=None):
 async def restore_persistent_voice_states():
     """Rejoin desired voice channels after bot restart / Discord voice reconnect edges."""
     try:
-        if BOT_RECOVERY_STAGGER_SECONDS:
-            await asyncio.sleep(BOT_RECOVERY_STAGGER_SECONDS)
+        await bot.wait_until_ready()
+        if not PERSISTENT_VOICE_RESTORE_ON_STARTUP:
+            logger.info(f"[{BOT_ENV_PREFIX.lower()}] Persistent voice restore is disabled by configuration; not auto-joining saved voice channels on startup.")
+            return
+        # Spread the fleet out at boot so all bot containers do not hit Discord voice at once.
+        await asyncio.sleep(random.uniform(0.0, STARTUP_RECOVERY_JITTER_SECONDS))
+        if not await ensure_lavalink_ready(timeout=LAVALINK_HEALTH_STARTUP_GRACE_SECONDS):
+            logger.warning("[%s] Persistent voice restore skipped because Lavalink is not ready yet.", BOT_ENV_PREFIX.lower())
+            return
         async with DBPoolManager() as pool:
             async with pool.acquire() as conn:
                 async with conn.cursor(aiomysql.DictCursor) as cur:
@@ -1187,12 +1800,12 @@ async def restore_persistent_voice_states():
                 if not state and not stay_in_vc:
                     await persist_voice_state(guild.id, channel_id, desired_connected=False, connected=False, last_error="no_recoverable_playback")
                     continue
-                await asyncio.sleep(VOICE_REJOIN_DELAY_SECONDS)
+                await asyncio.sleep(VOICE_REJOIN_DELAY_SECONDS + random.uniform(VOICE_REJOIN_JITTER_MIN_SECONDS, VOICE_REJOIN_JITTER_MAX_SECONDS))
                 vc = await ensure_voice_connection(guild, channel_id, respect_recovery_backoff=True)
                 if vc:
                     await persist_voice_state(guild.id, channel_id, desired_connected=bool(stay_in_vc or state), connected=True)
                     if state:
-                        schedule_recovery_retry(guild.id, channel_id, start_position=state.get("position", 0), reason="persistent_voice_restore")
+                        schedule_named_task(f"persistent_voice_restore_process_queue:{guild.id}", process_queue(guild, channel_id, start_position=state.get("position", 0), allow_recovery_restore=True))
                 else:
                     async with DBPoolManager() as pool:
                         async with pool.acquire() as conn:
@@ -1334,6 +1947,20 @@ def schedule_recovery_retry(guild_id, channel_id, *, start_position=0, reason="r
     if not channel_id:
         return False
 
+    reason_text = str(reason or "").lower()
+    voice_rejoin_reason = any(token in reason_text for token in (
+        "voice_disconnect",
+        "voice_connect",
+        "restore_voice",
+        "persistent_voice_restore",
+        "idle_restore",
+        "zombie_restore",
+        "lavalink_health",
+    ))
+    if voice_rejoin_reason and not VOICE_DISCONNECT_REJOIN_RECOVERY:
+        logger.info(f"[{guild_id}] Skipping {reason} recovery retry because bot-side voice rejoin recovery is disabled; Aria-managed recovery remains available.")
+        return False
+
     if recovery_backoff_remaining(guild_id) > 0:
         return False
 
@@ -1349,7 +1976,7 @@ def schedule_recovery_retry(guild_id, channel_id, *, start_position=0, reason="r
         return False
 
     recovery_retry_counts[guild_id] = attempts
-    delay = min(RECOVERY_RETRY_BASE_DELAY * attempts, RECOVERY_RETRY_MAX_DELAY)
+    delay = min(RECOVERY_RETRY_BASE_DELAY * attempts, RECOVERY_RETRY_MAX_DELAY) + random.uniform(0.0, RECOVERY_RETRY_JITTER_SECONDS)
     current_task = None
 
     async def _retry():
@@ -1384,14 +2011,29 @@ def schedule_recovery_retry(guild_id, channel_id, *, start_position=0, reason="r
     return True
 
 async def requeue_failed_track(cur, guild_id, channel_id, url, title, requester_id, *, position=0, reason="recovery"):
-    await insert_queue_front(cur, "nexus_queue", guild_id, "nexus", url, title, requester_id)
-    # FIX 6: Re-add the failed track to the backup so it survives a crash.
-    # After FIX 1 the backup loses the track the moment it is popped to play;
-    # if playback then fails we must restore backup parity.
+    # A voice timeout can trigger more than one queued recovery path. Keep the
+    # failed track at the front once, instead of duplicating it on every overlap.
     await cur.execute(
-        "INSERT INTO nexus_queue_backup (guild_id, bot_name, video_url, title, requester_id) VALUES (%s, 'nexus', %s, %s, %s)",
-        (guild_id, url, title, requester_id),
+        "SELECT video_url FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus' ORDER BY id ASC LIMIT 1",
+        (guild_id,),
     )
+    existing = await cur.fetchone()
+    existing_url = _row_value(existing, "video_url", _row_value(existing, 0))
+    if not existing_url or str(existing_url).strip() != str(url).strip():
+        await insert_queue_front(cur, "nexus_queue", guild_id, "nexus", url, title, requester_id)
+
+    # Keep backup parity, but do not spam duplicate backup entries during storms.
+    await cur.execute(
+        "SELECT COUNT(*) FROM nexus_queue_backup WHERE guild_id = %s AND bot_name = 'nexus' AND video_url = %s AND title = %s",
+        (guild_id, url, title),
+    )
+    backup_count_row = await cur.fetchone()
+    backup_count = _scalar_from_row(backup_count_row, 0) or 0
+    if backup_count <= 0:
+        await cur.execute(
+            "INSERT INTO nexus_queue_backup (guild_id, bot_name, video_url, title, requester_id) VALUES (%s, 'nexus', %s, %s, %s)",
+            (guild_id, url, title, requester_id),
+        )
     await cur.execute(
         "UPDATE nexus_playback_state SET is_playing = FALSE, is_paused = FALSE, position_seconds = %s WHERE guild_id = %s AND bot_name = 'nexus'",
         (position, guild_id),
@@ -1399,15 +2041,19 @@ async def requeue_failed_track(cur, guild_id, channel_id, url, title, requester_
     await remember_recovery_state(guild_id, channel_id, position)
     schedule_recovery_retry(guild_id, channel_id, start_position=position, reason=reason)
 
+
 async def get_home_channel(guild):
+    cached = _cache_get(HOME_CHANNEL_CACHE, int(guild.id), HOME_CHANNEL_CACHE_TTL_SECONDS)
+    if cached is not None:
+        return guild.get_channel(int(cached)) if cached else None
     async with DBPoolManager() as pool:
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("SELECT home_vc_id FROM nexus_bot_home_channels WHERE guild_id = %s AND bot_name = 'nexus'", (guild.id,))
                 res = await cur.fetchone()
-    if res and res[0]:
-        return guild.get_channel(res[0])
-    return None
+    channel_id = int(res[0]) if res and res[0] else 0
+    _cache_set(HOME_CHANNEL_CACHE, int(guild.id), channel_id)
+    return guild.get_channel(channel_id) if channel_id else None
 
 async def _fade_volume(voice_client, start_volume, end_volume, duration=5.0, steps=10):
     if not voice_client:
@@ -1422,13 +2068,13 @@ async def _fade_volume(voice_client, start_volume, end_volume, duration=5.0, ste
         if step < steps:
             await asyncio.sleep(step_delay)
 
+
 async def update_stage_topic(guild, title, requester_id):
     """Update Stage topic AND Voice/Stage channel status for the current song.
 
-    Stage channels use StageInstance.topic. Newer Discord voice channel
-    statuses use channel.edit(status=...). Older discord.py builds may not
-    expose that keyword, so this helper is best-effort and must never stop
-    playback.
+    This is intentionally best-effort. A small dedup cache prevents repeated
+    Discord channel/status edits for the same track during reconnects, queue
+    retries, or duplicate now-playing events.
     """
     try:
         vc = guild.voice_client
@@ -1436,8 +2082,13 @@ async def update_stage_topic(guild, title, requester_id):
             return
         channel = vc.channel
         requester_name = await resolve_requester_name(guild, requester_id)
-        stage_topic = f"🎵 {title[:60]} | 👤 Req: {requester_name}"
-        voice_status = f"🎵 {title[:80]}"
+        safe_title = str(title or "Unknown Track").replace("\n", " ").strip()
+        stage_topic = f"🎵 {safe_title[:60]} | 👤 Req: {requester_name}"
+        voice_status = f"🎵 {safe_title[:80]}"
+        fingerprint = (getattr(channel, "id", None), stage_topic, voice_status)
+        cached = VOICE_STATUS_CACHE.get(guild.id)
+        if cached and cached[0] == fingerprint and time.time() - cached[1] < VOICE_STATUS_DEDUP_SECONDS:
+            return
 
         if isinstance(channel, discord.StageChannel):
             try:
@@ -1460,10 +2111,13 @@ async def update_stage_topic(guild, title, requester_id):
                     logger.warning(f"[{guild.id}] Voice channel status update failed: {e}")
             except Exception as e:
                 logger.warning(f"[{guild.id}] Voice channel status update failed: {e}")
+        VOICE_STATUS_CACHE[guild.id] = (fingerprint, time.time())
     except Exception as e:
         logger.error(f"[STAGE/VOICE STATUS ERROR] {e}")
 
+
 async def clear_voice_channel_status(guild):
+    VOICE_STATUS_CACHE.pop(getattr(guild, "id", None), None)
     try:
         vc = guild.voice_client
         channel = getattr(vc, "channel", None) if vc else None
@@ -1478,8 +2132,13 @@ async def clear_voice_channel_status(guild):
     except Exception:
         pass
 
+
 async def send_or_update_status_message(guild, embed):
-    """Maintain one live now-playing/status message per guild."""
+    """Maintain one live now-playing/status message per guild without duplicate edits."""
+    fingerprint = _embed_fingerprint(embed)
+    cached = STATUS_MESSAGE_CACHE.get(guild.id)
+    if cached and cached.get("fingerprint") == fingerprint and time.time() - cached.get("updated_at", 0) < STATUS_MESSAGE_DEDUP_SECONDS:
+        return
     async with DBPoolManager() as pool:
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
@@ -1491,21 +2150,25 @@ async def send_or_update_status_message(guild, embed):
                 channel = guild.get_channel(int(res[0]))
                 if not channel:
                     return
-                await cur.execute("SELECT message_id FROM nexus_status_messages WHERE guild_id = %s AND bot_name = 'nexus' LIMIT 1", (guild.id,))
-                msg_row = await cur.fetchone()
-                message_id = int(msg_row[0]) if msg_row and msg_row[0] else None
+                cached_message_id = cached.get("message_id") if cached and cached.get("channel_id") == channel.id else None
+                if cached_message_id:
+                    message_id = int(cached_message_id)
+                else:
+                    await cur.execute("SELECT message_id FROM nexus_status_messages WHERE guild_id = %s AND bot_name = 'nexus' LIMIT 1", (guild.id,))
+                    msg_row = await cur.fetchone()
+                    message_id = int(msg_row[0]) if msg_row and msg_row[0] else None
                 message = None
                 if message_id:
                     try:
-                        message = await channel.fetch_message(message_id)
+                        message = channel.get_partial_message(message_id)
+                        await message.edit(embed=embed)
+                        new_message_id = message_id
                     except Exception:
                         message = None
-                if message:
-                    await message.edit(embed=embed)
-                    new_message_id = message.id
-                else:
+                if not message:
                     message = await channel.send(embed=embed)
                     new_message_id = message.id
+                STATUS_MESSAGE_CACHE[guild.id] = {"fingerprint": fingerprint, "updated_at": time.time(), "message_id": new_message_id, "channel_id": channel.id}
                 await cur.execute("REPLACE INTO nexus_status_messages (guild_id, bot_name, feedback_channel_id, message_id) VALUES (%s, 'nexus', %s, %s)", (guild.id, channel.id, new_message_id))
 
 async def send_feedback(guild, embed):
@@ -1532,7 +2195,7 @@ async def ensure_self_deaf(guild, voice_client):
     except Exception as e:
         logger.warning(f"[{guild.id}] Failed to self-deafen voice connection: {e}")
 
-async def ensure_voice_connection(guild, channel_id, *, respect_recovery_backoff=False):
+async def ensure_voice_connection(guild, channel_id, *, respect_recovery_backoff=False, allow_stale_rejoin=False):
     channel = guild.get_channel(channel_id)
     if not channel: return None
     lock = get_voice_connect_lock(guild.id)
@@ -1554,6 +2217,9 @@ async def ensure_voice_connection(guild, channel_id, *, respect_recovery_backoff
                     and not _player_is_active(voice_client)
                 )
             ):
+                if not (VOICE_FORCE_STALE_CLIENT_REJOIN or allow_stale_rejoin):
+                    logger.warning(f"[{guild.id}] Voice client looks unstable, but this caller is not allowed to force a disconnect/rejoin; leaving it alone for Aria-managed recovery.")
+                    return voice_client
                 try:
                     await voice_client.disconnect()
                 except Exception:
@@ -1561,9 +2227,7 @@ async def ensure_voice_connection(guild, channel_id, *, respect_recovery_backoff
                 voice_client = None
 
             if not voice_client:
-                if respect_recovery_backoff and BOT_RECOVERY_STAGGER_SECONDS:
-                    await asyncio.sleep(min(BOT_RECOVERY_STAGGER_SECONDS, 45.0))
-                voice_client = await channel.connect(cls=wavelink.Player, timeout=VOICE_CONNECT_TIMEOUT_SECONDS, self_deaf=True)
+                voice_client = await channel.connect(cls=wavelink.Player, timeout=VOICE_CONNECT_TIMEOUT_SECONDS)
             elif voice_client.channel.id != channel_id:
                 await voice_client.move_to(channel)
             await ensure_self_deaf(guild, voice_client)
@@ -1725,7 +2389,7 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
                     await requeue_failed_track(cur, guild.id, channel_id, url, title, requester_id, position=start_position, reason="search_failure")
                     return
 
-                voice_client = await ensure_voice_connection(guild, channel_id, respect_recovery_backoff=allow_recovery_restore)
+                voice_client = await ensure_voice_connection(guild, channel_id, respect_recovery_backoff=allow_recovery_restore, allow_stale_rejoin=allow_recovery_restore)
                 if not voice_client:
                     logger.warning(f"[{guild.id}] Voice connection unavailable. Requeueing '{title}' for recovery.")
                     await requeue_failed_track(cur, guild.id, channel_id, url, title, requester_id, position=start_position, reason="voice_connect")
@@ -1757,15 +2421,18 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
                 except Exception as e:
                     logger.error(f"[{guild.id}] Player preparation failed for '{title}': {e}")
                     if _is_stale_lavalink_player_error(e) and guild.voice_client:
-                        try:
-                            await guild.voice_client.disconnect()
-                        except Exception:
-                            logger.debug(f"[{guild.id}] Failed to recycle stale Lavalink player cleanly.", exc_info=True)
+                        if VOICE_FORCE_STALE_CLIENT_REJOIN:
+                            try:
+                                await guild.voice_client.disconnect()
+                            except Exception:
+                                logger.debug(f"[{guild.id}] Failed to recycle stale Lavalink player cleanly.", exc_info=True)
+                        else:
+                            logger.warning(f"[{guild.id}] Stale Lavalink player detected, but this playback path is not allowed to recycle/rejoin automatically; waiting for Aria or a manual command.")
                     await requeue_failed_track(cur, guild.id, channel_id, url, title, requester_id, position=start_position, reason="player_prepare")
                     return
 
                 try:
-                    await voice_client.play(track)
+                    await asyncio.wait_for(voice_client.play(track), timeout=LAVALINK_PLAY_TIMEOUT_SECONDS)
                     if start_position > 0:
                         await voice_client.seek(int(start_position * 1000))
                     elif trans_mode == 'fade':
@@ -1788,6 +2455,7 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
                 guild_states[guild.id] = {"voice_channel_id": channel_id, "position": start_position}
                 invalidate_position_persist(guild.id)
                 clear_recovery_retry(guild.id)
+                clear_voice_disconnect_grace(guild.id)
                 clear_recovery_backoff(guild.id)
                 clear_auto_restore_snooze(guild.id)
                 clear_idle_restore_state(guild.id)
@@ -1800,8 +2468,12 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
                 await send_or_update_status_message(guild, embed)
 
 async def process_queue(guild, channel_id, start_position=0, *, allow_recovery_restore=False):
+    if allow_recovery_restore and recovery_backoff_remaining(guild.id) > 0:
+        return
     lock = get_process_queue_lock(guild.id)
     async with lock:
+        if allow_recovery_restore and recovery_backoff_remaining(guild.id) > 0:
+            return
         vc = guild.voice_client
         current_track = _player_current_track(vc) if vc else None
         if vc and current_track is not None:
@@ -1817,6 +2489,7 @@ async def stop_playback(guild):
     recovering_guilds.discard(guild.id)
     invalidate_position_persist(guild.id)
     clear_recovery_retry(guild.id)
+    clear_voice_disconnect_grace(guild.id)
     clear_idle_restore_state(guild.id)
     await delete_state(guild.id)
     async with DBPoolManager() as pool:
@@ -1827,7 +2500,11 @@ async def stop_playback(guild):
                 await cur.execute("DELETE FROM nexus_queue_backup WHERE guild_id = %s AND bot_name = 'nexus'", (guild.id,))
                 await cur.execute("UPDATE nexus_voice_state SET desired_connected = FALSE, connected_channel_id = NULL, disconnected_at = CURRENT_TIMESTAMP WHERE guild_id = %s AND bot_name = 'nexus'", (guild.id,))
     await clear_voice_channel_status(guild)
-    if guild.voice_client: await guild.voice_client.disconnect()
+    if guild.voice_client:
+        try:
+            await guild.voice_client.disconnect()
+        except Exception:
+            logger.debug("[%s] Voice disconnect failed during stop_playback.", guild.id, exc_info=True)
     await bot.change_presence(status=discord.Status.online, activity=discord.Activity(type=discord.ActivityType.watching, name="the Swarm | Idle"))
 
 async def restore_guild_state(guild_id, state, *, override_backoff=False):
@@ -1835,12 +2512,15 @@ async def restore_guild_state(guild_id, state, *, override_backoff=False):
     guild = bot.get_guild(target_guild_id)
     vc = guild.voice_client if guild else None
 
+    # FIX 2: Gate on recovering_guilds BEFORE the backoff check to prevent
+    # simultaneous recoveries when multiple healer loops fire at once.
     if target_guild_id in recovering_guilds:
         logger.debug(f"[{target_guild_id}] Recovery already active; aborting overlapping heal task.")
         return
 
     if not override_backoff and recovery_backoff_remaining(target_guild_id) > 0 and not (vc and _player_is_active(vc)):
         return
+
 
     if target_guild_id in playback_tracking:
         if vc and _player_is_active(vc):
@@ -1853,24 +2533,28 @@ async def restore_guild_state(guild_id, state, *, override_backoff=False):
     try:
         if not guild:
             return
-
         vc_id = state.get("voice_channel_id")
         channel = None
-
         if vc_id:
             channel = guild.get_channel(vc_id)
-
-        # NEW: Fallback to home channel if no saved voice channel
+        # Fallback to configured home channel if no saved voice channel
         if not channel:
-            channel = await get_home_channel(guild)
-            if channel:
-                logger.info(f"[{target_guild_id}] No saved voice channel — falling back to home channel {channel.id}")
-
+            try:
+                async with DBPoolManager() as pool:
+                    async with pool.acquire() as conn:
+                        async with conn.cursor() as cur:
+                            await cur.execute(
+                                "SELECT home_vc_id FROM nexus_bot_home_channels WHERE guild_id = %s AND bot_name = 'nexus' LIMIT 1",
+                                (target_guild_id,),
+                            )
+                            home_row = await cur.fetchone()
+                            if home_row and home_row[0]:
+                                channel = guild.get_channel(home_row[0])
+            except Exception:
+                pass
         if not channel:
-            logger.warning(f"[{target_guild_id}] Could not resolve any voice channel for recovery.")
+            logger.warning(f"[{target_guild_id}] Could not resolve any voice channel (saved or home) for recovery.")
             return
-
-        vc_id = channel.id
 
         async with DBPoolManager() as pool:
             async with pool.acquire() as conn:
@@ -1888,7 +2572,9 @@ async def restore_guild_state(guild_id, state, *, override_backoff=False):
         resume_position = max(0, int(db_position if db_position is not None else state.get("position", 0)))
         await remember_recovery_state(target_guild_id, vc_id, resume_position)
 
-        vc = await ensure_voice_connection(guild, vc_id, respect_recovery_backoff=not override_backoff)
+        if not override_backoff:
+            await asyncio.sleep(random.uniform(0.0, min(STARTUP_RECOVERY_JITTER_SECONDS, 8.0)))
+        vc = await ensure_voice_connection(guild, vc_id, respect_recovery_backoff=not override_backoff, allow_stale_rejoin=override_backoff)
         if not vc:
             schedule_recovery_retry(target_guild_id, vc_id, start_position=resume_position, reason="restore_voice")
             return
@@ -1983,9 +2669,10 @@ async def bootstrap_recovery_states_from_db():
     return recovered
 
 async def bootstrap_recovery_after_ready():
+    if not PERSISTENT_VOICE_RESTORE_ON_STARTUP:
+        logger.info(f"[{BOT_ENV_PREFIX.lower()}] Startup playback restore is disabled by configuration; not restoring saved playback on ready.")
+        return
     try:
-        if BOT_RECOVERY_STAGGER_SECONDS:
-            await asyncio.sleep(BOT_RECOVERY_STAGGER_SECONDS)
         states = await bootstrap_recovery_states_from_db()
         for gid, state in states.items():
             schedule_named_task(f"restore_guild_state:{gid}", restore_guild_state(gid, state))
@@ -1995,6 +2682,12 @@ async def bootstrap_recovery_after_ready():
 @tasks.loop(seconds=AUTO_HEAL_INTERVAL)
 async def auto_heal_loop():
     global auto_heal_initialized
+
+    if not VOICE_DISCONNECT_REJOIN_RECOVERY:
+        if not auto_heal_initialized:
+            auto_heal_initialized = True
+            logger.info(f"[{BOT_ENV_PREFIX.lower()}] Bot-side voice-disconnect rejoin recovery is disabled; Aria remains responsible for recovery/doctor orders.")
+        return
 
     if not auto_heal_initialized:
         db_states = await bootstrap_recovery_states_from_db()
@@ -2028,13 +2721,10 @@ async def setup_hook():
 
 @bot.event
 async def on_wavelink_node_ready(payload: wavelink.NodeReadyEventPayload):
-    global lavalink_recovery_bootstrapped
     logger.info(f"🔥 Lavalink Bridge Officially Connected and Locked! (Node: {payload.node.identifier})")
-    if lavalink_recovery_bootstrapped:
+    if not PERSISTENT_VOICE_RESTORE_ON_STARTUP:
+        logger.info("Orphaned playback auto-resume is disabled by configuration.")
         return
-    lavalink_recovery_bootstrapped = True
-    if BOT_RECOVERY_STAGGER_SECONDS:
-        await asyncio.sleep(BOT_RECOVERY_STAGGER_SECONDS)
     logger.info("Checking for orphaned playback states to auto-resume...")
     try:
         async with DBPoolManager() as pool:
@@ -2055,22 +2745,23 @@ async def on_wavelink_node_ready(payload: wavelink.NodeReadyEventPayload):
                                 playback_tracking.pop(guild.id, None)
                             recovering_guilds.add(guild.id)
                             await restore_active_playback_entry(cur, guild.id)
-                            schedule_named_task(f"orphan_restore_process_queue:{guild.id}", process_queue(guild, orphan['channel_id'], start_position=orphan['position_seconds'], allow_recovery_restore=True))
+                            schedule_named_task(f"orphan_restore_process_queue:{guild.id}", process_queue(guild, orphan['channel_id'], start_position=orphan['position_seconds']))
     except Exception as e:
         logger.error(f"Auto-resume error: {e}")
 
 @bot.event
 async def on_wavelink_node_closed(node: wavelink.Node, disconnected):
-    global lavalink_recovery_bootstrapped
-    lavalink_recovery_bootstrapped = False
-    logger.warning("⚠️ Lavalink Connection Lost! Native self-healing activated...")
+    logger.warning("⚠️ Lavalink connection lost. Reconnecting Lavalink only; bot-side voice leave/rejoin recovery stays disabled so Aria can coordinate recovery.")
     ensure_lavalink_connection_task()
+    if not VOICE_DISCONNECT_REJOIN_RECOVERY:
+        return
     for guild_id, state in list(guild_states.items()):
         schedule_recovery_retry(int(guild_id), state.get("voice_channel_id"), start_position=state.get("position", 0), reason="node_closed")
 
 @bot.event
 async def on_ready():
     logger.info(f'Logged in as {bot.user}')
+    reset_login_failure_backoff()
 
     ensure_lavalink_connection_task()
 
@@ -2093,6 +2784,8 @@ async def on_voice_state_update(member, before, after):
         guild_id = member.guild.id
         if after.channel is not None:
             pending_voice_channels[guild_id] = after.channel.id
+            clear_voice_disconnect_grace(guild_id)
+            unfreeze_playback_after_voice_return(guild_id)
             await persist_voice_state(guild_id, after.channel.id, desired_connected=True, connected=True)
             await reconcile_runtime_playback_state(member.guild)
             return
@@ -2109,13 +2802,21 @@ async def on_voice_state_update(member, before, after):
 
         if (tracked or guild_id in guild_states) and remembered_channel_id:
             position = current_track_position(guild_id)
-            playback_tracking.pop(guild_id, None)
+            if not VOICE_DISCONNECT_REJOIN_RECOVERY:
+                recovering_guilds.discard(guild_id)
+                clear_recovery_retry(guild_id)
+                clear_voice_disconnect_grace(guild_id)
+                await remember_recovery_state(guild_id, remembered_channel_id, position)
+                await mark_voice_disconnected(guild_id, remembered_channel_id, desired_connected=True, reason="voice_disconnect_rejoin_disabled")
+                logger.warning(f"[{guild_id}] Voice link dropped unexpectedly. Bot-side leave/rejoin recovery is disabled; preserving playback state at {position}s for Aria-managed recovery.")
+                return
+            freeze_playback_for_soft_disconnect(guild_id, position)
             recovering_guilds.discard(guild_id)
             await remember_recovery_state(guild_id, remembered_channel_id, position)
-            await mark_voice_disconnected(guild_id, remembered_channel_id, desired_connected=True, reason="voice_disconnect")
-            scheduled = schedule_recovery_retry(guild_id, remembered_channel_id, start_position=position, reason="voice_disconnect")
+            await mark_voice_disconnected(guild_id, remembered_channel_id, desired_connected=True, reason="voice_disconnect_soft_grace")
+            scheduled = schedule_soft_voice_recovery(guild_id, remembered_channel_id, start_position=position, reason="voice_disconnect")
             if scheduled:
-                logger.warning(f"[{guild_id}] Voice link dropped unexpectedly. Queued recovery from {position}s.")
+                logger.warning(f"[{guild_id}] Voice link dropped unexpectedly. Holding playback state for {int(VOICE_DISCONNECT_GRACE_SECONDS)}s before recovery from {position}s.")
             else:
                 remaining = recovery_backoff_remaining(guild_id)
                 if remaining > 0:
@@ -2127,6 +2828,7 @@ async def on_voice_state_update(member, before, after):
         recovering_guilds.discard(guild_id)
         invalidate_position_persist(guild_id)
         clear_recovery_retry(guild_id)
+        clear_voice_disconnect_grace(guild_id)
         clear_idle_restore_state(guild_id)
         await mark_voice_disconnected(guild_id, getattr(before.channel, "id", None), desired_connected=False, reason="manual_or_idle_disconnect")
         await delete_state(guild_id)
@@ -2146,6 +2848,8 @@ async def metrics_heartbeat_loop():
 
 @tasks.loop(seconds=POSITION_UPDATER_INTERVAL)
 async def position_updater():
+    if not playback_tracking:
+        return
     now = time.time()
     async with DBPoolManager() as pool:
         async with pool.acquire() as conn:
@@ -2156,7 +2860,7 @@ async def position_updater():
                         continue
                     guild = bot.get_guild(guild_id)
                     if guild and guild.voice_client and _player_is_playing(guild.voice_client):
-                        pos = int((time.time() - data['start_time']) * data.get('speed', 1.0) + data['offset'])
+                        pos = current_track_position(guild_id)
                         await cur.execute("REPLACE INTO nexus_playback_state (guild_id, bot_name, channel_id, video_url, position_seconds, is_playing, is_paused, title) VALUES (%s, 'nexus', %s, %s, %s, TRUE, FALSE, %s)", (guild_id, data['channel_id'], data['url'], pos, data['title']))
                         last_position_persist[guild_id] = now
 
@@ -2168,6 +2872,7 @@ async def sethome(interaction: discord.Interaction, channel: discord.VoiceChanne
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("REPLACE INTO nexus_bot_home_channels (guild_id, bot_name, home_vc_id) VALUES (%s, %s, %s)", (interaction.guild.id, 'nexus', channel.id))
+    invalidate_feature_caches(interaction.guild.id)
     await interaction.response.send_message(embed=discord.Embed(title="🏠 Home Set", description=f"Home channel set to {channel.mention}.", color=discord.Color.green()), ephemeral=True)
 
 @bot.tree.command(name="nexus_main_setfeedback", description="Choose the text channel for updates, queue actions, and recovery notices.")
@@ -2178,6 +2883,7 @@ async def setfeedback(interaction: discord.Interaction, channel: discord.TextCha
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("UPDATE nexus_guild_settings SET feedback_channel_id = %s WHERE guild_id = %s", (channel.id, interaction.guild.id))
+    invalidate_feature_caches(interaction.guild.id)
     await interaction.response.send_message(embed=discord.Embed(title="✅ Feedback Channel Set", description=f"Updates will be sent to {channel.mention}.", color=discord.Color.green()), ephemeral=True)
 
 @bot.tree.command(name="nexus_main_djrole", description="Set the server DJ role that can manage restricted playback, queue, and settings commands.")
@@ -2188,6 +2894,7 @@ async def djrole(interaction: discord.Interaction, role: discord.Role):
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("UPDATE nexus_guild_settings SET dj_role_id = %s WHERE guild_id = %s", (role.id, interaction.guild.id))
+    invalidate_feature_caches(interaction.guild.id)
     await interaction.response.send_message(embed=discord.Embed(description=f"🎧 DJ role set to {role.mention}", color=discord.Color.green()), ephemeral=True)
 
 @bot.tree.command(name="nexus_main_removedj", description="Clear the configured DJ role so only admins or open-access mode can control restricted commands.")
@@ -2198,6 +2905,7 @@ async def removedj(interaction: discord.Interaction):
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("UPDATE nexus_guild_settings SET dj_role_id = NULL WHERE guild_id = %s", (interaction.guild.id,))
+    invalidate_feature_caches(interaction.guild.id)
     await interaction.response.send_message(embed=discord.Embed(description="DJ role requirements removed.", color=discord.Color.green()), ephemeral=True)
 
 @bot.tree.command(name="nexus_main_djmode", description="Enable or disable Strict DJ Mode so only admins and the DJ role can use control commands.")
@@ -2211,6 +2919,7 @@ async def toggle_djmode(interaction: discord.Interaction):
                 res = await cur.fetchone()
                 new_val = not res[0] if res else True
                 await cur.execute("UPDATE nexus_guild_settings SET dj_only_mode = %s WHERE guild_id = %s", (new_val, interaction.guild.id))
+    invalidate_feature_caches(interaction.guild.id)
     state = "ENABLED" if new_val else "DISABLED"
     await interaction.response.send_message(embed=discord.Embed(description=f"🎧 Strict DJ Mode is now **{state}**.", color=discord.Color.green()), ephemeral=True)
 
@@ -2225,6 +2934,7 @@ async def toggle_247(interaction: discord.Interaction):
                 res = await cur.fetchone()
                 new_val = not res[0] if res else True
                 await cur.execute("UPDATE nexus_guild_settings SET stay_in_vc = %s WHERE guild_id = %s", (new_val, interaction.guild.id))
+    invalidate_feature_caches(interaction.guild.id)
     state = "ENABLED" if new_val else "DISABLED"
     await interaction.response.send_message(embed=discord.Embed(description=f"🕰️ 24/7 Mode is now **{state}**.", color=discord.Color.green()), ephemeral=True)
 
@@ -2385,6 +3095,7 @@ async def clear(interaction: discord.Interaction):
     recovering_guilds.discard(interaction.guild.id)
     invalidate_position_persist(interaction.guild.id)
     clear_recovery_retry(interaction.guild.id)
+    clear_voice_disconnect_grace(interaction.guild.id)
     clear_idle_restore_state(interaction.guild.id)
     await delete_state(interaction.guild.id)
     await clear_active_playlist(interaction.guild.id)
@@ -2414,7 +3125,7 @@ async def join(interaction: discord.Interaction):
         channel = interaction.user.voice.channel if interaction.user.voice else None
 
     if channel:
-        await ensure_voice_connection(interaction.guild, channel.id)
+        await ensure_voice_connection(interaction.guild, channel.id, allow_stale_rejoin=True)
         await interaction.followup.send(embed=discord.Embed(description=f"Joined {channel.mention}.", color=discord.Color.green()))
     else:
         await interaction.followup.send("Join a channel first, or set a home channel.", ephemeral=True)
@@ -2429,6 +3140,7 @@ async def leave(interaction: discord.Interaction):
         recovering_guilds.discard(interaction.guild.id)
         invalidate_position_persist(interaction.guild.id)
         clear_recovery_retry(interaction.guild.id)
+        clear_voice_disconnect_grace(interaction.guild.id)
         clear_idle_restore_state(interaction.guild.id)
         await delete_state(interaction.guild.id)
         await clear_active_playlist(interaction.guild.id)
@@ -2446,6 +3158,7 @@ async def leave(interaction: discord.Interaction):
 
 @bot.tree.command(name="nexus_main_queue", description="Show the current queue with paging, requester names, and track positions")
 async def queue_cmd(interaction: discord.Interaction, page: int = 1):
+    await interaction.response.defer(ephemeral=True)
     page = max(1, page)
     per_page = 10
     offset = (page - 1) * per_page
@@ -2458,7 +3171,7 @@ async def queue_cmd(interaction: discord.Interaction, page: int = 1):
                 await cur.execute("SELECT title, requester_id FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus' ORDER BY id ASC LIMIT %s OFFSET %s", (interaction.guild.id, per_page, offset))
                 songs = await cur.fetchall()
     if not songs:
-        return await interaction.response.send_message(embed=discord.Embed(description="Queue empty.", color=discord.Color.red()), ephemeral=True)
+        return await interaction.followup.send(embed=discord.Embed(description="Queue empty.", color=discord.Color.red()), ephemeral=True)
     lines = []
     for idx, row in enumerate(songs, start=offset + 1):
         title, requester_id = row
@@ -2467,7 +3180,7 @@ async def queue_cmd(interaction: discord.Interaction, page: int = 1):
     pages = max(1, (total + per_page - 1) // per_page)
     embed = discord.Embed(title="📜 Queue", description="\n".join(lines), color=discord.Color.blurple())
     embed.set_footer(text=f"Page {page}/{pages} • {total} queued track(s)")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="nexus_main_shuffle", description="Randomize the order of the upcoming queue while keeping the currently playing track untouched.")
 async def shuffle(interaction: discord.Interaction):
@@ -2850,7 +3563,6 @@ async def seek(interaction: discord.Interaction, seconds: int):
 async def forward(interaction: discord.Interaction, seconds: int):
     if not await is_dj(interaction): return
     if interaction.guild.id not in playback_tracking: return await interaction.response.send_message("Nothing playing.", ephemeral=True)
-    data = playback_tracking[interaction.guild.id]
     current = current_track_position(interaction.guild.id)
     new_pos = current + seconds
     if interaction.guild.voice_client:
@@ -2864,7 +3576,6 @@ async def forward(interaction: discord.Interaction, seconds: int):
 async def rewind(interaction: discord.Interaction, seconds: int):
     if not await is_dj(interaction): return
     if interaction.guild.id not in playback_tracking: return await interaction.response.send_message("Nothing playing.", ephemeral=True)
-    data = playback_tracking[interaction.guild.id]
     current = current_track_position(interaction.guild.id)
     new_pos = max(0, current - seconds)
     if interaction.guild.voice_client:
@@ -2921,7 +3632,6 @@ async def panel(interaction: discord.Interaction):
         async def rw(self, i: discord.Interaction, b: discord.ui.Button):
             if not await is_dj(i): return
             if i.guild.id not in playback_tracking: return await i.response.send_message("Nothing playing.", ephemeral=True)
-            data = playback_tracking[i.guild.id]
             current = current_track_position(i.guild.id)
             new_pos = max(0, current - 10)
             if i.guild.voice_client:
@@ -2934,7 +3644,6 @@ async def panel(interaction: discord.Interaction):
         async def fw(self, i: discord.Interaction, b: discord.ui.Button):
             if not await is_dj(i): return
             if i.guild.id not in playback_tracking: return await i.response.send_message("Nothing playing.", ephemeral=True)
-            data = playback_tracking[i.guild.id]
             current = current_track_position(i.guild.id)
             new_pos = current + 10
             if i.guild.voice_client:
@@ -3084,16 +3793,27 @@ def _is_explicit_lavalink_query(value):
         return True
     return bool(re.match(r"^[a-z0-9_]+search:", text))
 
+
 async def search_playables(query):
     cleaned = str(query or "").strip()
     if not cleaned:
         return [], None
     if not _is_explicit_lavalink_query(cleaned):
         cleaned = f"ytmsearch:{cleaned}"
+    cache_key = cleaned.casefold()
+    cacheable = not cleaned.startswith(("http://", "https://")) and "list=" not in cleaned
+    if cacheable:
+        cached = _cache_get(SEARCH_RESULT_CACHE, cache_key, SEARCH_CACHE_TTL_SECONDS)
+        if cached is not None:
+            entries, playlist_result = cached
+            return list(entries), playlist_result
     if not await ensure_lavalink_ready():
         raise RuntimeError("Lavalink is still starting up. Try again in a few seconds.")
-    results = await wavelink.Playable.search(cleaned)
-    return unwrap_search_results(results)
+    results = await asyncio.wait_for(wavelink.Playable.search(cleaned), timeout=LAVALINK_SEARCH_TIMEOUT_SECONDS)
+    entries, playlist_result = unwrap_search_results(results)
+    if cacheable and entries:
+        _cache_set(SEARCH_RESULT_CACHE, cache_key, (tuple(entries), playlist_result))
+    return entries, playlist_result
 
 def _is_direct_media_url(value):
     text = str(value or "").strip().lower()
@@ -3181,7 +3901,7 @@ async def playlist_sync_loop():
 
     for guild_id, url, known_count, req_id, channel_id in playlists:
         try:
-            data = await loop.run_in_executor(None, lambda playlist_url=url: ydl.extract_info(playlist_url, download=False))
+            data = await asyncio.wait_for(loop.run_in_executor(None, lambda playlist_url=url: ydl.extract_info(playlist_url, download=False)), timeout=PLAYLIST_SYNC_EXTRACT_TIMEOUT_SECONDS)
             if not data or 'entries' not in data: continue
 
             entries = [e for e in data['entries'] if e is not None]
@@ -3225,7 +3945,8 @@ bot.add_listener(on_ready_sync, 'on_ready')
 @tasks.loop(seconds=2.0)
 async def aria_command_listener():
     try:
-        await ensure_swarm_command_tables()
+        if not await ensure_swarm_command_tables():
+            return
         async with DBPoolManager() as pool:
             async with pool.acquire() as conn:
                 async with conn.cursor(aiomysql.DictCursor) as cur:
@@ -3292,7 +4013,7 @@ async def aria_command_listener():
             async with DBPoolManager() as pool:
                 async with pool.acquire() as conn:
                     async with conn.cursor() as cur:
-                        if executed or attempts >= 2 or not guild:
+                        if executed or attempts + 1 >= DIRECT_ORDER_MAX_ATTEMPTS or not guild:
                             await cur.execute("DELETE FROM nexus_swarm_overrides WHERE guild_id = %s AND bot_name = %s", (guild_id, 'nexus'))
                         else:
                             await cur.execute("UPDATE nexus_swarm_overrides SET attempts = COALESCE(attempts, 0) + 1, last_error = %s WHERE guild_id = %s AND bot_name = %s", (f"state_mismatch:{cmd}", guild_id, 'nexus'))
@@ -3306,6 +4027,7 @@ bot.add_listener(on_ready_aria_listener, 'on_ready')
 
 
 async def ensure_swarm_command_tables():
+    global _last_swarm_bridge_db_error_log_at
     try:
         async with DBPoolManager() as pool:
             async with pool.acquire() as conn:
@@ -3323,13 +4045,24 @@ async def ensure_swarm_command_tables():
                         "ALTER TABLE nexus_swarm_overrides ADD COLUMN last_error TEXT NULL",
                         "ALTER TABLE nexus_swarm_direct_orders ADD COLUMN attempts INT NOT NULL DEFAULT 0",
                         "ALTER TABLE nexus_swarm_direct_orders ADD COLUMN last_error TEXT NULL",
+                        "ALTER TABLE nexus_swarm_direct_orders ADD COLUMN claimed_at TIMESTAMP NULL",
+                        "ALTER TABLE nexus_swarm_direct_orders ADD COLUMN claim_token VARCHAR(128) NULL",
+                        "ALTER TABLE nexus_swarm_direct_orders ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+                        "ALTER TABLE nexus_swarm_direct_orders ADD INDEX nexus_direct_unclaimed_idx (bot_name, guild_id, claimed_at, id)",
+                        "ALTER TABLE nexus_swarm_direct_orders ADD INDEX nexus_direct_claim_token_idx (claim_token)",
+                        "ALTER TABLE nexus_swarm_direct_orders ADD INDEX nexus_direct_recent_idx (bot_name, guild_id, command, created_at)",
                     ]:
                         try:
                             await cur.execute(stmt)
                         except Exception:
                             pass
-    except Exception:
-        logger.exception("Failed ensuring swarm command tables for nexus.")
+        return True
+    except Exception as exc:
+        now = time.time()
+        if now - _last_swarm_bridge_db_error_log_at >= SWARM_BRIDGE_DB_ERROR_LOG_INTERVAL_SECONDS:
+            _last_swarm_bridge_db_error_log_at = now
+            logger.warning("Swarm command tables unavailable for nexus; bridge listeners will retry: %s", exc)
+        return False
 
 # --- AUTOMATED BACKGROUND MAINTENANCE ---
 @tasks.loop(seconds=15.0)
@@ -3397,14 +4130,20 @@ async def resilience_loop():
 
                         await remember_recovery_state(guild.id, target_channel_id, 0)
                         clear_idle_restore_state(guild.id)
-                        schedule_recovery_retry(guild.id, target_channel_id, start_position=0, reason="idle_restore")
-                        logger.info(f"[{guild.id}] Restored {restored} backup tracks after idle/home recovery.")
-                        schedule_named_task(f"idle_restore_process_queue:{guild.id}", process_queue(guild, target_channel_id, allow_recovery_restore=True))
+                        scheduled = schedule_recovery_retry(guild.id, target_channel_id, start_position=0, reason="idle_restore")
+                        if scheduled:
+                            logger.info(f"[{guild.id}] Restored {restored} backup tracks after idle/home recovery.")
+                            schedule_named_task(f"idle_restore_process_queue:{guild.id}", process_queue(guild, target_channel_id, allow_recovery_restore=True))
+                        else:
+                            logger.info(f"[{guild.id}] Idle/home voice rejoin recovery is disabled; preserved {restored} backup tracks without forcing a rejoin.")
     except Exception as e:
         logger.error(f"Resilience Loop Error: {e}")
 
 @tasks.loop(minutes=5.0)
 async def zombie_reaper_loop():
+    if not VOICE_IDLE_REJOIN_RECOVERY:
+        logger.debug(f"[{BOT_ENV_PREFIX.lower()}] Zombie reaper voice cleanup is disabled while Aria manages voice recovery.")
+        return
     for guild in bot.guilds:
         vc = guild.voice_client
         if vc and not _player_is_active(vc):
@@ -3435,8 +4174,11 @@ async def zombie_reaper_loop():
                                         restored = await restore_queue_from_backup(cur, guild.id)
                                         if restored > 0:
                                             clear_idle_restore_state(guild.id)
-                                            schedule_recovery_retry(guild.id, recovery_channel_id, start_position=0, reason="zombie_restore")
-                                            schedule_named_task(f"zombie_restore_process_queue:{guild.id}", process_queue(guild, recovery_channel_id, allow_recovery_restore=True))
+                                            scheduled = schedule_recovery_retry(guild.id, recovery_channel_id, start_position=0, reason="zombie_restore")
+                                            if scheduled:
+                                                schedule_named_task(f"zombie_restore_process_queue:{guild.id}", process_queue(guild, recovery_channel_id, allow_recovery_restore=True))
+                                            else:
+                                                logger.info(f"[{guild.id}] Zombie voice rejoin recovery is disabled; preserved backup tracks without forcing a rejoin.")
                                     else:
                                         await cur.execute("DELETE FROM nexus_queue_backup WHERE guild_id = %s AND bot_name = 'nexus'", (guild.id,))
                                     playback_tracking.pop(guild.id, None)
@@ -3487,13 +4229,55 @@ bot.add_listener(on_ready_maintenance, 'on_ready')
 # --- ARIA DIRECT DRONE CONTROL ---
 @tasks.loop(seconds=2.0)
 async def direct_order_listener():
+    orders = []
     try:
-        await ensure_swarm_command_tables()
+        if not await ensure_swarm_command_tables():
+            return
         async with DBPoolManager() as pool:
             async with pool.acquire() as conn:
                 async with conn.cursor(aiomysql.DictCursor) as cur:
-                    await cur.execute("SELECT id, bot_name, guild_id, vc_id, text_channel_id, command, data, COALESCE(attempts, 0) AS attempts FROM nexus_swarm_direct_orders WHERE bot_name = %s ORDER BY id ASC", ('nexus',))
-                    orders = await cur.fetchall()
+                    # Clear stale/unclaimed direct orders before fetching. Aria will re-issue if still needed.
+                    await cur.execute("DELETE FROM nexus_swarm_direct_orders WHERE bot_name = %s AND created_at < NOW() - INTERVAL %s SECOND", ('nexus', DIRECT_ORDER_STALE_SECONDS))
+                    await cur.execute(
+                        """
+                        SELECT id
+                        FROM nexus_swarm_direct_orders
+                        WHERE bot_name = %s
+                          AND COALESCE(attempts, 0) < %s
+                          AND (claimed_at IS NULL OR claimed_at <= NOW() - INTERVAL %s SECOND)
+                        ORDER BY id ASC
+                        LIMIT %s
+                        """,
+                        ('nexus', DIRECT_ORDER_MAX_ATTEMPTS, DIRECT_ORDER_CLAIM_TIMEOUT_SECONDS, DIRECT_ORDER_FETCH_LIMIT),
+                    )
+                    candidates = await cur.fetchall()
+                    ids = [int(o['id']) for o in candidates if o.get('id') is not None]
+                    if ids:
+                        placeholders = ','.join(['%s'] * len(ids))
+                        await cur.execute(
+                            f"""UPDATE nexus_swarm_direct_orders
+                                SET claimed_at = NOW(), claim_token = %s
+                                WHERE id IN ({placeholders})
+                                  AND bot_name = %s
+                                  AND COALESCE(attempts, 0) < %s
+                                  AND (claimed_at IS NULL OR claimed_at <= NOW() - INTERVAL %s SECOND)""",
+                            (DIRECT_ORDER_CLAIM_TOKEN, *ids, 'nexus', DIRECT_ORDER_MAX_ATTEMPTS, DIRECT_ORDER_CLAIM_TIMEOUT_SECONDS),
+                        )
+                        await cur.execute(
+                            """
+                            SELECT id, bot_name, guild_id, vc_id, text_channel_id, command, data, COALESCE(attempts, 0) AS attempts
+                            FROM nexus_swarm_direct_orders
+                            WHERE claim_token = %s
+                            ORDER BY id ASC
+                            LIMIT %s
+                            """,
+                            (DIRECT_ORDER_CLAIM_TOKEN, DIRECT_ORDER_FETCH_LIMIT),
+                        )
+                        orders = await cur.fetchall()
+                        try:
+                            await conn.commit()
+                        except Exception:
+                            pass
 
         if not orders: return
 
@@ -3513,7 +4297,7 @@ async def direct_order_listener():
                         vc_target = await get_home_channel(guild)
 
                     if vc_target:
-                        await ensure_voice_connection(guild, vc_target.id)
+                        await ensure_voice_connection(guild, vc_target.id, allow_stale_rejoin=True)
                         try:
                             entries, playlist_result = await search_playables(data)
                             if entries:
@@ -3577,26 +4361,21 @@ async def direct_order_listener():
                     executed = True
 
                 elif cmd == 'RECOVER':
-                    force_recover = isinstance(data, str) and data.strip().lower() in {'force', 'override', 'admin'}
-                    remaining_backoff = recovery_backoff_remaining(guild.id)
-                    if remaining_backoff > 0 and not force_recover:
-                        logger.info("[%s] Dropped RECOVER order for guild %s because recovery is paused for another %ss.", BOT_ENV_PREFIX.lower(), guild.id, remaining_backoff)
+                    # RECOVER is now considered an Aria/manual doctoring order.
+                    # Bot-side automatic voice-disconnect recovery can stay disabled,
+                    # but explicit Aria recovery orders must still be obeyed.
+                    state = await derive_recovery_state_from_db(guild.id)
+                    recover_channel_id = order.get('vc_id') or (state or {}).get('voice_channel_id')
+                    if recover_channel_id:
+                        recover_state = dict(state or {})
+                        recover_state['voice_channel_id'] = recover_channel_id
+                        recover_state['position'] = int((state or {}).get('position', 0) or 0)
+                        clear_recovery_backoff(guild.id)
+                        clear_auto_restore_snooze(guild.id)
+                        await restore_guild_state(guild.id, recover_state, override_backoff=True)
                         executed = True
                     else:
-                        state = await derive_recovery_state_from_db(guild.id)
-                        recover_channel_id = order.get('vc_id') or (state or {}).get('voice_channel_id')
-                        if recover_channel_id:
-                            recover_state = dict(state or {})
-                            recover_state['voice_channel_id'] = recover_channel_id
-                            recover_state['position'] = int((state or {}).get('position', 0) or 0)
-                            if force_recover:
-                                clear_recovery_backoff(guild.id)
-                                clear_auto_restore_snooze(guild.id)
-                            await restore_guild_state(guild.id, recover_state, override_backoff=force_recover)
-                            executed = True
-                        else:
-                            logger.warning("[%s] Could not resolve RECOVER target for guild %s.", BOT_ENV_PREFIX.lower(), guild.id)
-
+                        logger.warning("[%s] Could not resolve RECOVER target for guild %s.", BOT_ENV_PREFIX.lower(), guild.id)
                 elif cmd == 'LEAVE':
                     force_leave = isinstance(data, str) and data.strip().lower() in {'force', 'override', 'admin'}
                     if guild.voice_client and _has_human_listeners(guild.voice_client) and not force_leave:
@@ -3626,10 +4405,10 @@ async def direct_order_listener():
             async with DBPoolManager() as pool:
                 async with pool.acquire() as conn:
                     async with conn.cursor() as cur:
-                        if executed or attempts >= 2 or not guild:
+                        if executed or attempts + 1 >= DIRECT_ORDER_MAX_ATTEMPTS or not guild:
                             await cur.execute("DELETE FROM nexus_swarm_direct_orders WHERE id = %s", (oid,))
                         else:
-                            await cur.execute("UPDATE nexus_swarm_direct_orders SET attempts = COALESCE(attempts, 0) + 1, last_error = %s WHERE id = %s", (f"unexecuted:{cmd}", oid))
+                            await cur.execute("UPDATE nexus_swarm_direct_orders SET attempts = COALESCE(attempts, 0) + 1, last_error = %s, claimed_at = DATE_SUB(NOW(), INTERVAL %s SECOND), claim_token = NULL WHERE id = %s", (f"unexecuted:{cmd}", DIRECT_ORDER_RETRY_BACKDATE_SECONDS, oid))
 
     except Exception:
         logger.exception("Direct order listener failed for nexus.")
@@ -3834,7 +4613,25 @@ bot.add_listener(on_ready_error_reporting, 'on_ready')
 def main():
     validate_runtime_config()
     install_error_reporting()
-    bot.run(TOKEN)
+    startup_delay = compute_login_startup_delay()
+    if startup_delay > 0:
+        logger.info(f"[{BOT_ENV_PREFIX.lower()}] Deterministic login stagger active; waiting {startup_delay:.1f}s before Discord login.")
+        time.sleep(startup_delay)
+    _wait_for_global_discord_login_gate()
+    try:
+        bot.run(TOKEN)
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:
+        delay = compute_login_failure_delay(exc)
+        logger.exception(f"[{BOT_ENV_PREFIX.lower()}] Discord client stopped during startup/runtime; sleeping {delay:.1f}s before Docker may restart it.")
+        time.sleep(delay)
+        raise
+    finally:
+        try:
+            asyncio.run(close_shared_runtime_resources())
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
