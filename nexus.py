@@ -1282,7 +1282,7 @@ async def get_saved_settings_summary(guild_id):
 
 ytdl_format_options = {
     'format': 'bestaudio/best', 'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
-    'restrictfilenames': True, 'noplaylist': True, 'nocheckcertificate': True,
+    'restrictfilenames': True, 'noplaylist': True, 'extract_flat': 'in_playlist', 'skip_download': True, 'nocheckcertificate': True,
     'ignoreerrors': True, 'logtostderr': False, 'quiet': True,
     'no_warnings': True, 'default_search': 'auto', 'source_address': '0.0.0.0',
     'cachedir': YTDLP_CACHE_DIR
@@ -1299,8 +1299,12 @@ async def init_db():
                 except: pass
                 try: await cur.execute("ALTER TABLE nexus_playback_state ADD COLUMN is_paused BOOLEAN DEFAULT FALSE")
                 except: pass
-                await cur.execute("CREATE TABLE IF NOT EXISTS nexus_guild_settings (guild_id BIGINT PRIMARY KEY, home_vc_id BIGINT, volume INT DEFAULT 100, loop_mode VARCHAR(10) DEFAULT 'queue', filter_mode VARCHAR(20) DEFAULT 'none', dj_role_id BIGINT DEFAULT NULL, feedback_channel_id BIGINT DEFAULT NULL, transition_mode VARCHAR(10) DEFAULT 'off', custom_speed FLOAT DEFAULT 1.0, custom_pitch FLOAT DEFAULT 1.0, custom_modifiers_left INT DEFAULT 0, dj_only_mode BOOLEAN DEFAULT FALSE, stay_in_vc BOOLEAN DEFAULT FALSE)")
+                await cur.execute("CREATE TABLE IF NOT EXISTS nexus_guild_settings (guild_id BIGINT PRIMARY KEY, home_vc_id BIGINT, volume INT DEFAULT 100, loop_mode VARCHAR(10) DEFAULT 'queue', filter_mode VARCHAR(20) DEFAULT 'none', dj_role_id BIGINT DEFAULT NULL, feedback_channel_id BIGINT DEFAULT NULL, transition_mode VARCHAR(10) DEFAULT 'off', fade_seconds FLOAT DEFAULT 5.0, fade_curve VARCHAR(20) DEFAULT 'linear', custom_speed FLOAT DEFAULT 1.0, custom_pitch FLOAT DEFAULT 1.0, custom_modifiers_left INT DEFAULT 0, dj_only_mode BOOLEAN DEFAULT FALSE, stay_in_vc BOOLEAN DEFAULT FALSE)")
                 try: await cur.execute("ALTER TABLE nexus_guild_settings MODIFY loop_mode VARCHAR(10) DEFAULT 'queue'")
+                except: pass
+                try: await cur.execute("ALTER TABLE nexus_guild_settings ADD COLUMN fade_seconds FLOAT DEFAULT 5.0")
+                except: pass
+                try: await cur.execute("ALTER TABLE nexus_guild_settings ADD COLUMN fade_curve VARCHAR(20) DEFAULT 'linear'")
                 except: pass
                 try: await cur.execute("UPDATE nexus_guild_settings SET loop_mode = 'queue' WHERE loop_mode IS NULL OR loop_mode NOT IN ('off', 'song', 'queue')")
                 except: pass
@@ -2211,9 +2215,17 @@ async def snapshot_queue_backup(cur, guild_id):
 
 async def backup_track(cur, guild_id, video_url, title, requester_id):
     await cur.execute(
+        "SELECT COUNT(*) FROM nexus_queue_backup WHERE guild_id = %s AND bot_name = 'nexus' AND video_url = %s AND title = %s",
+        (guild_id, video_url, title),
+    )
+    existing = await cur.fetchone()
+    if existing and int(_scalar_from_row(existing, 0) or 0) > 0:
+        return 0
+    await cur.execute(
         "INSERT INTO nexus_queue_backup (guild_id, bot_name, video_url, title, requester_id) VALUES (%s, 'nexus', %s, %s, %s)",
         (guild_id, video_url, title, requester_id),
     )
+    return 1
 
 async def enqueue_track(cur, guild_id, video_url, title, requester_id, *, backup=True):
     await cur.execute(
@@ -2227,6 +2239,40 @@ async def enqueue_track(cur, guild_id, video_url, title, requester_id, *, backup
             logger.debug("[nexus] Track intelligence queue write skipped.", exc_info=True)
         await backup_track(cur, guild_id, video_url, title, requester_id)
     return 1
+
+async def shuffle_queue_rows(cur, guild_id, *, preserve_first=True):
+    await cur.execute("SELECT id, guild_id, bot_name, video_url, title, requester_id FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus' ORDER BY id ASC", (guild_id,))
+    rows = list(await cur.fetchall() or [])
+    if len(rows) <= 1:
+        return len(rows)
+    head = []
+    if preserve_first:
+        head = [rows.pop(0)]
+    random.shuffle(rows)
+    rows = head + rows
+    await cur.execute("DELETE FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus'", (guild_id,))
+    for row in rows:
+        await cur.execute(
+            "INSERT INTO nexus_queue (guild_id, bot_name, video_url, title, requester_id) VALUES (%s, 'nexus', %s, %s, %s)",
+            (
+                _row_value(row, "guild_id", _row_value(row, 1, guild_id)),
+                _row_value(row, "video_url", _row_value(row, 3)),
+                _row_value(row, "title", _row_value(row, 4)),
+                _row_value(row, "requester_id", _row_value(row, 5)),
+            ),
+        )
+    return len(rows)
+
+async def requeue_finished_track(cur, guild_id, video_url, title, requester_id):
+    await enqueue_track(cur, guild_id, video_url, title, requester_id, backup=False)
+    return await shuffle_queue_rows(cur, guild_id, preserve_first=True)
+
+async def prime_loop_queue_defaults(cur, guild_id):
+    await cur.execute(
+        "INSERT INTO nexus_guild_settings (guild_id, loop_mode) VALUES (%s, 'queue') ON DUPLICATE KEY UPDATE loop_mode = 'queue'",
+        (guild_id,),
+    )
+    return await shuffle_queue_rows(cur, guild_id, preserve_first=True)
 
 async def restore_queue_from_backup(cur, guild_id, requester_id=None):
     await cur.execute("SELECT COUNT(*) FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus'", (guild_id,))
@@ -2399,18 +2445,51 @@ async def get_home_channel(guild):
     _cache_set(HOME_CHANNEL_CACHE, int(guild.id), channel_id)
     return guild.get_channel(channel_id) if channel_id else None
 
-async def _fade_volume(voice_client, start_volume, end_volume, duration=5.0, steps=10):
+def _fade_curve_progress(progress, curve='linear'):
+    progress = max(0.0, min(1.0, float(progress)))
+    curve = str(curve or 'linear').lower()
+    if curve in {'smooth', 'ease'}:
+        return progress * progress * (3 - 2 * progress)
+    if curve in {'ease_in', 'slow_start'}:
+        return progress * progress
+    if curve in {'ease_out', 'soft_land'}:
+        return 1 - ((1 - progress) * (1 - progress))
+    return progress
+
+async def _fade_volume(voice_client, start_volume, end_volume, duration=5.0, steps=None, curve='linear'):
     if not voice_client:
         return
+    duration = max(0.5, min(20.0, float(duration or 5.0)))
+    steps = steps or max(5, min(40, int(duration * 3)))
     step_delay = duration / steps if steps > 0 else duration
     for step in range(steps + 1):
-        volume = int(round(start_volume + (end_volume - start_volume) * (step / steps)))
+        eased = _fade_curve_progress(step / steps if steps else 1, curve)
+        volume = int(round(start_volume + (end_volume - start_volume) * eased))
         try:
             await voice_client.set_volume(max(0, min(200, volume)))
         except Exception:
             return
         if step < steps:
             await asyncio.sleep(step_delay)
+
+def choose_fade_duration(mode, configured_seconds, track_duration, filter_mode, title):
+    if mode != 'smart':
+        return max(0.5, min(20.0, float(configured_seconds or 5.0)))
+    duration = float(track_duration or 0)
+    filter_name = str(filter_mode or 'none').lower()
+    title_text = str(title or '').lower()
+    seconds = 6.0
+    if duration and duration < 120:
+        seconds = 3.0
+    elif duration and duration > 420:
+        seconds = 8.0
+    if filter_name in {'nightcore', 'party', 'electronic'}:
+        seconds = max(2.0, seconds - 1.5)
+    if filter_name in {'vaporwave', 'lofi', 'cinema'}:
+        seconds = min(12.0, seconds + 1.5)
+    if any(word in title_text for word in ('ambient', 'sleep', 'rain', 'piano', 'acoustic')):
+        seconds = min(12.0, seconds + 1.0)
+    return max(0.5, min(20.0, seconds))
 
 
 async def update_stage_topic(guild, title, requester_id):
@@ -2660,7 +2739,7 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
 
                             if reason == "FINISHED":
                                 if loop_mode == 'queue':
-                                    await enqueue_track(cur, payload.player.guild.id, payload.track.uri, payload.track.title, original_requester, backup=False)
+                                    await requeue_finished_track(cur, payload.player.guild.id, payload.track.uri, payload.track.title, original_requester)
                                 elif loop_mode == 'song':
                                     await insert_queue_front(cur, "nexus_queue", payload.player.guild.id, "nexus", payload.track.uri, payload.track.title, original_requester)
         except Exception as e:
@@ -2679,9 +2758,11 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
     async with DBPoolManager() as pool:
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
-                await cur.execute("SELECT volume, loop_mode, filter_mode, transition_mode, custom_speed, custom_pitch, custom_modifiers_left, stay_in_vc FROM nexus_guild_settings WHERE guild_id = %s", (guild.id,))
+                await cur.execute("SELECT volume, loop_mode, filter_mode, transition_mode, custom_speed, custom_pitch, custom_modifiers_left, stay_in_vc, fade_seconds, fade_curve FROM nexus_guild_settings WHERE guild_id = %s", (guild.id,))
                 res = await cur.fetchone()
-                vol, loop_mode, filter_mode, trans_mode, c_speed, c_pitch, c_mod_left, stay_in_vc = res if res else (100, 'queue', 'none', 'off', 1.0, 1.0, 0, False)
+                vol, loop_mode, filter_mode, trans_mode, c_speed, c_pitch, c_mod_left, stay_in_vc, fade_seconds, fade_curve = res if res else (100, 'queue', 'none', 'off', 1.0, 1.0, 0, False, 5.0, 'linear')
+                fade_seconds = max(0.5, min(20.0, float(fade_seconds or 5.0)))
+                fade_curve = str(fade_curve or 'linear').lower()
 
                 await cur.execute("SELECT id, video_url, title, requester_id FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus' ORDER BY id ASC LIMIT 1", (guild.id,))
                 next_song = await cur.fetchone()
@@ -2720,12 +2801,6 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
 
                 song_id, url, title, requester_id = next_song
                 await cur.execute("DELETE FROM nexus_queue WHERE id = %s AND guild_id = %s AND bot_name = 'nexus'", (song_id, guild.id))
-                # FIX 1: Keep backup in sync — remove the track we are about to play
-                await cur.execute(
-                    "DELETE FROM nexus_queue_backup WHERE video_url = %s AND title = %s AND guild_id = %s AND bot_name = 'nexus' LIMIT 1",
-                    (url, title, guild.id),
-                )
-
                 try:
                     track, resolved_source = await resolve_queue_track(url, title)
                     duration = track.length / 1000
@@ -2765,18 +2840,11 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
                         await cur.execute("UPDATE nexus_guild_settings SET custom_modifiers_left = %s WHERE guild_id = %s", (c_mod_left, guild.id))
                         if c_mod_left == 0: await cur.execute("UPDATE nexus_guild_settings SET custom_speed = 1.0, custom_pitch = 1.0 WHERE guild_id = %s", (guild.id,))
 
-                    if filter_mode == 'nightcore':
-                        wav_filters.timescale.set(speed=1.25, pitch=1.3)
-                        c_speed = 1.25
-                    elif filter_mode == 'vaporwave':
-                        wav_filters.timescale.set(speed=0.8, pitch=0.8)
-                        c_speed = 0.8
-                    elif filter_mode == 'bassboost':
-                        wav_filters.equalizer.set(bands=[(0, 0.3), (1, 0.2), (2, 0.1)])
+                    c_speed = apply_filter_preset(wav_filters, filter_mode, c_speed)
 
                     await voice_client.set_filters(wav_filters)
 
-                    if trans_mode == 'fade' and start_position <= 0:
+                    if trans_mode in {'fade', 'smart'} and start_position <= 0:
                         await voice_client.set_volume(0)
                 except Exception as e:
                     logger.error(f"[{guild.id}] Player preparation failed for '{title}': {e}")
@@ -2795,8 +2863,9 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
                     await asyncio.wait_for(voice_client.play(track), timeout=LAVALINK_PLAY_TIMEOUT_SECONDS)
                     if start_position > 0:
                         await voice_client.seek(int(start_position * 1000))
-                    elif trans_mode == 'fade':
-                        schedule_named_task(f"fade_volume:{guild.id}", _fade_volume(voice_client, 0, vol))
+                    elif trans_mode in {'fade', 'smart'}:
+                        fade_duration = choose_fade_duration(trans_mode, fade_seconds, duration, filter_mode, title)
+                        schedule_named_task(f"fade_volume:{guild.id}", _fade_volume(voice_client, 0, vol, duration=fade_duration, curve=fade_curve))
                 except Exception as e:
                     logger.error(f"[{guild.id}] Playback start failed for '{title}': {e}")
                     await requeue_failed_track(cur, guild.id, channel_id, url, title, requester_id, position=start_position, reason="playback_start")
@@ -3904,6 +3973,69 @@ async def taste(interaction: discord.Interaction, member: discord.Member = None)
 
 
 
+FILTER_PRESET_CHOICES = [
+    app_commands.Choice(name="None (Standard high quality audio)", value="none"),
+    app_commands.Choice(name="Bassboost", value="bassboost"),
+    app_commands.Choice(name="Nightcore", value="nightcore"),
+    app_commands.Choice(name="Vaporwave", value="vaporwave"),
+    app_commands.Choice(name="8D Rotation", value="8d"),
+    app_commands.Choice(name="Karaoke", value="karaoke"),
+    app_commands.Choice(name="Tremolo", value="tremolo"),
+    app_commands.Choice(name="Vibrato", value="vibrato"),
+    app_commands.Choice(name="Low Pass", value="lowpass"),
+    app_commands.Choice(name="Lo-fi", value="lofi"),
+    app_commands.Choice(name="Electronic", value="electronic"),
+    app_commands.Choice(name="Party", value="party"),
+    app_commands.Choice(name="Radio", value="radio"),
+    app_commands.Choice(name="Cinema", value="cinema"),
+]
+FILTER_PRESET_VALUES = {choice.value for choice in FILTER_PRESET_CHOICES}
+
+
+def _safe_filter_call(label, callback):
+    try:
+        callback()
+        return True
+    except Exception as exc:
+        logger.debug("[%s] Audio filter preset %s skipped: %s", BOT_ENV_PREFIX.lower(), label, exc)
+        return False
+
+
+def apply_filter_preset(wav_filters, mode, current_speed=1.0):
+    mode = str(mode or 'none').lower().replace(' ', '')
+    speed = current_speed
+    if mode == 'nightcore':
+        if _safe_filter_call(mode, lambda: wav_filters.timescale.set(speed=1.25, pitch=1.3)):
+            speed = 1.25
+    elif mode == 'vaporwave':
+        if _safe_filter_call(mode, lambda: wav_filters.timescale.set(speed=0.8, pitch=0.8)):
+            speed = 0.8
+    elif mode == 'bassboost':
+        _safe_filter_call(mode, lambda: wav_filters.equalizer.set(bands=[(0, 0.32), (1, 0.24), (2, 0.12)]))
+    elif mode == '8d':
+        _safe_filter_call(mode, lambda: wav_filters.rotation.set(rotation_hz=0.18))
+    elif mode == 'karaoke':
+        _safe_filter_call(mode, lambda: wav_filters.karaoke.set(level=1.0, mono_level=1.0, filter_band=220.0, filter_width=100.0))
+    elif mode == 'tremolo':
+        _safe_filter_call(mode, lambda: wav_filters.tremolo.set(frequency=4.0, depth=0.45))
+    elif mode == 'vibrato':
+        _safe_filter_call(mode, lambda: wav_filters.vibrato.set(frequency=4.5, depth=0.35))
+    elif mode in {'lowpass', 'lofi'}:
+        _safe_filter_call(mode, lambda: wav_filters.low_pass.set(smoothing=20.0 if mode == 'lowpass' else 35.0))
+        if mode == 'lofi':
+            _safe_filter_call(mode, lambda: wav_filters.timescale.set(speed=0.94, pitch=0.96))
+            speed = 0.94
+    elif mode == 'electronic':
+        _safe_filter_call(mode, lambda: wav_filters.equalizer.set(bands=[(0, 0.12), (1, 0.10), (4, -0.05), (8, 0.08), (10, 0.14)]))
+    elif mode == 'party':
+        _safe_filter_call(mode, lambda: wav_filters.equalizer.set(bands=[(0, 0.25), (1, 0.18), (2, 0.08), (9, 0.10)]))
+    elif mode == 'radio':
+        _safe_filter_call(mode, lambda: wav_filters.equalizer.set(bands=[(0, -0.18), (1, -0.10), (4, 0.12), (5, 0.12), (10, -0.12)]))
+        _safe_filter_call(mode, lambda: wav_filters.low_pass.set(smoothing=18.0))
+    elif mode == 'cinema':
+        _safe_filter_call(mode, lambda: wav_filters.equalizer.set(bands=[(0, 0.18), (1, 0.12), (8, 0.08), (9, 0.10)]))
+    return speed
+
 # --- MODIFIERS & FILTERS ---
 @bot.tree.command(name="nexus_main_volume", description="Set the playback volume for this server from 1 to 200 percent.")
 async def volume(interaction: discord.Interaction, vol: int):
@@ -3930,14 +4062,11 @@ async def loop_cmd(interaction: discord.Interaction, mode: str):
 
 @bot.tree.command(name="nexus_main_filter", description="Apply an audio filter such as nightcore, vaporwave, or bass boost to upcoming playback.")
 @app_commands.describe(mode="Choose an audio filter to apply")
-@app_commands.choices(mode=[
-    app_commands.Choice(name="None (Standard high quality audio)", value="none"),
-    app_commands.Choice(name="Bassboost (Enhances low-end frequencies)", value="bassboost"),
-    app_commands.Choice(name="Nightcore (Speeds up and raises pitch)", value="nightcore"),
-    app_commands.Choice(name="Vaporwave (Slows down and adds reverb/low pitch)", value="vaporwave")
-])
+@app_commands.choices(mode=FILTER_PRESET_CHOICES)
 async def filter_cmd(interaction: discord.Interaction, mode: str):
     if not await is_dj(interaction): return
+    if mode not in FILTER_PRESET_VALUES:
+        return await interaction.response.send_message("Invalid filter.", ephemeral=True)
     await ensure_guild_settings(interaction.guild.id)
     async with DBPoolManager() as pool:
         async with pool.acquire() as conn:
@@ -3946,28 +4075,44 @@ async def filter_cmd(interaction: discord.Interaction, mode: str):
                 else: await cur.execute("UPDATE nexus_guild_settings SET filter_mode = %s WHERE guild_id = %s", (mode, interaction.guild.id))
     if interaction.guild.voice_client:
         wav_filters = wavelink.Filters()
-        if mode == 'nightcore': wav_filters.timescale.set(speed=1.25, pitch=1.3)
-        elif mode == 'vaporwave': wav_filters.timescale.set(speed=0.8, pitch=0.8)
-        elif mode == 'bassboost': wav_filters.equalizer.set(bands=[(0, 0.3), (1, 0.2), (2, 0.1)])
+        apply_filter_preset(wav_filters, mode)
         try: await interaction.guild.voice_client.set_filters(wav_filters)
         except Exception: pass
     await interaction.response.send_message(embed=discord.Embed(description=f"🎛️ Filter set to: **{mode}**.", color=discord.Color.blurple()), ephemeral=True)
 
-@bot.tree.command(name="nexus_main_fade", description="Enable or disable smooth fade transitions between tracks for softer playback changes.")
-@app_commands.describe(mode="Enable or disable smooth fades")
+@bot.tree.command(name="nexus_main_fade", description="Customize track fade transitions or let the bot pick smart fade timing.")
+@app_commands.describe(mode="Fade mode", seconds="Fade length in seconds, from 0.5 to 20", curve="Volume curve")
 @app_commands.choices(mode=[
-    app_commands.Choice(name="Enable 5s Fades", value="fade"),
-    app_commands.Choice(name="Disable Fades (Standard)", value="off")
+    app_commands.Choice(name="Smart Adaptive Fades", value="smart"),
+    app_commands.Choice(name="Custom Fades", value="fade"),
+    app_commands.Choice(name="Disable Fades", value="off")
+], curve=[
+    app_commands.Choice(name="Linear", value="linear"),
+    app_commands.Choice(name="Smooth", value="smooth"),
+    app_commands.Choice(name="Slow Start", value="ease_in"),
+    app_commands.Choice(name="Soft Land", value="ease_out")
 ])
-async def toggle_fade(interaction: discord.Interaction, mode: str):
+async def toggle_fade(interaction: discord.Interaction, mode: str, seconds: float = 5.0, curve: str = "linear"):
     if not await is_dj(interaction): return
+    if mode not in {'off', 'fade', 'smart'}:
+        return await interaction.response.send_message("Invalid fade mode.", ephemeral=True)
+    curve = curve if curve in {'linear', 'smooth', 'ease_in', 'ease_out'} else 'linear'
+    seconds = max(0.5, min(20.0, float(seconds or 5.0)))
     await ensure_guild_settings(interaction.guild.id)
     async with DBPoolManager() as pool:
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
-                await cur.execute("UPDATE nexus_guild_settings SET transition_mode = %s WHERE guild_id = %s", (mode, interaction.guild.id))
-    if mode == "fade": await interaction.response.send_message(embed=discord.Embed(description="🌊 Smooth **5-second Fades** have been enabled.", color=discord.Color.green()), ephemeral=True)
-    else: await interaction.response.send_message(embed=discord.Embed(description="⏹️ Smooth Fades have been disabled.", color=discord.Color.red()), ephemeral=True)
+                await cur.execute("UPDATE nexus_guild_settings SET transition_mode = %s, fade_seconds = %s, fade_curve = %s WHERE guild_id = %s", (mode, seconds, curve, interaction.guild.id))
+    if mode == "smart":
+        message = f"🌊 Smart fades enabled. I will adapt transition length from track duration, title hints, and active filters."
+        color = discord.Color.green()
+    elif mode == "fade":
+        message = f"🌊 Custom fades enabled: {seconds:g}s using {curve.replace('_', ' ')}."
+        color = discord.Color.green()
+    else:
+        message = "⏹️ Smooth fades disabled."
+        color = discord.Color.red()
+    await interaction.response.send_message(embed=discord.Embed(description=message, color=color), ephemeral=True)
 
 @bot.tree.command(name="nexus_main_modify", description="Apply temporary custom speed and pitch modifiers to the next few tracks in the queue.")
 @app_commands.describe(speed="Speed multiplier (0.5 to 2.0)", pitch="Pitch multiplier (0.5 to 2.0)", duration="How many tracks this lasts (default 1)")
@@ -4337,6 +4482,7 @@ async def playlist_sync_loop():
     if not playlists: return
 
     opts = ytdl_format_options.copy()
+    opts['noplaylist'] = False
     opts['extract_flat'] = True
     opts['playlistend'] = None  # FIX 4: Remove yt-dlp's default ~150-track pagination cap
     ydl = yt_dlp.YoutubeDL(opts)
@@ -4356,6 +4502,7 @@ async def playlist_sync_loop():
                 async with DBPoolManager() as pool:
                     async with pool.acquire() as conn:
                         async with conn.cursor() as cur:
+                            await prime_loop_queue_defaults(cur, guild_id)
                             for entry in new_tracks:
                                 t_title = entry.get('title', 'Unknown Track')
                                 t_url = entry.get('url') or entry.get('webpage_url')
@@ -4363,6 +4510,8 @@ async def playlist_sync_loop():
                                 if t_url:
                                     await enqueue_track(cur, guild_id, t_url, t_title, req_id)
                                     added_count += 1
+                            if added_count > 1:
+                                await shuffle_queue_rows(cur, guild_id, preserve_first=True)
                             await cur.execute("UPDATE nexus_active_playlists SET known_track_count = %s WHERE guild_id = %s AND bot_name = 'nexus'", (current_count, guild_id))
 
                 guild = bot.get_guild(guild_id)
@@ -4437,9 +4586,7 @@ async def aria_command_listener():
                                     if res:
                                         f_mode = res[0]
                                         wav_filters = wavelink.Filters()
-                                        if f_mode == 'nightcore': wav_filters.timescale.set(speed=1.25, pitch=1.3)
-                                        elif f_mode == 'vaporwave': wav_filters.timescale.set(speed=0.8, pitch=0.8)
-                                        elif f_mode == 'bassboost': wav_filters.equalizer.set(bands=[(0, 0.3), (1, 0.2), (2, 0.1)])
+                                        apply_filter_preset(wav_filters, f_mode)
                                         try: await vc.set_filters(wav_filters)
                                         except Exception: pass
                     executed = True
@@ -4762,9 +4909,12 @@ async def direct_order_listener():
                                 async with DBPoolManager() as pool:
                                     async with pool.acquire() as conn:
                                         async with conn.cursor() as cur:
+                                            await prime_loop_queue_defaults(cur, guild.id)
                                             for track in entries:
                                                 await enqueue_track(cur, guild.id, track.uri, track.title, bot.user.id)
                                                 added_count += 1
+                                            if added_count > 1:
+                                                await shuffle_queue_rows(cur, guild.id, preserve_first=True)
                                 if playlist_url:
                                     await set_active_playlist(guild.id, playlist_url, len(entries), bot.user.id if bot.user else None, vc_target.id)
 
