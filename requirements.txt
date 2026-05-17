@@ -2,6 +2,6 @@ discord.py
 yt-dlp
 aiomysql
 PyNaCl
-wavelink
+wavelink==3.5.2
 aiohttp
 davey

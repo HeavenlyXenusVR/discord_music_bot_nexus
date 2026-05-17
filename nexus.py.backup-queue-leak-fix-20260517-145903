@@ -593,8 +593,6 @@ AUTO_IMPORT_IDLE_SECONDS = max(45.0, float(os.getenv(f"{BOT_ENV_PREFIX}_AUTO_IMP
 RECOVERY_RETRY_BASE_DELAY = max(5.0, float(os.getenv(f"{BOT_ENV_PREFIX}_RECOVERY_RETRY_BASE_DELAY", os.getenv("RECOVERY_RETRY_BASE_DELAY", "12"))))
 RECOVERY_RETRY_MAX_DELAY = max(RECOVERY_RETRY_BASE_DELAY, float(os.getenv(f"{BOT_ENV_PREFIX}_RECOVERY_RETRY_MAX_DELAY", os.getenv("RECOVERY_RETRY_MAX_DELAY", "75"))))
 MAX_RECOVERY_RETRIES = max(3, int(os.getenv(f"{BOT_ENV_PREFIX}_MAX_RECOVERY_RETRIES", "6")))
-MAX_TRACK_FAILURE_REQUEUES = max(1, int(os.getenv(f"{BOT_ENV_PREFIX}_MAX_TRACK_FAILURE_REQUEUES", os.getenv("MAX_TRACK_FAILURE_REQUEUES", "3"))))
-TRACK_FAILURE_WINDOW_SECONDS = max(60.0, float(os.getenv(f"{BOT_ENV_PREFIX}_TRACK_FAILURE_WINDOW_SECONDS", os.getenv("TRACK_FAILURE_WINDOW_SECONDS", "900"))))
 WATCHDOG_REVIVAL_COOLDOWN = max(10.0, float(os.getenv(f"{BOT_ENV_PREFIX}_WATCHDOG_REVIVAL_COOLDOWN", "15")))
 WATCHDOG_MAX_REVIVALS = max(3, int(os.getenv(f"{BOT_ENV_PREFIX}_WATCHDOG_MAX_REVIVALS", "6")))
 AUTO_RESTORE_SNOOZE_SECONDS = max(60.0, float(os.getenv(f"{BOT_ENV_PREFIX}_AUTO_RESTORE_SNOOZE_SECONDS", "180")))
@@ -617,7 +615,6 @@ playlist_db_initialized = False
 playlist_db_lock = asyncio.Lock()
 recovery_retry_tasks = {}
 recovery_retry_counts = {}
-track_failure_counts = {}
 recovery_exhausted_until = {}
 voice_disconnect_grace_tasks = {}
 idle_voice_since = {}
@@ -738,7 +735,7 @@ def prune_runtime_state_cache():
                 break
             mapping.pop(removable, None)
 
-    for mapping in (process_queue_locks, voice_connect_locks, last_position_persist, recovery_retry_counts, track_failure_counts, recovery_exhausted_until, idle_voice_since, auto_restore_snooze_until, vote_skip_sessions, metrics_last_errors):
+    for mapping in (process_queue_locks, voice_connect_locks, last_position_persist, recovery_retry_counts, recovery_exhausted_until, idle_voice_since, auto_restore_snooze_until, vote_skip_sessions, metrics_last_errors):
         prune_mapping(mapping)
 
 
@@ -2254,32 +2251,17 @@ async def shuffle_queue_rows(cur, guild_id, *, preserve_first=True):
         head = [rows.pop(0)]
     random.shuffle(rows)
     rows = head + rows
-
-    # Queue leak fix: this function used to DELETE the live queue and then
-    # reinsert rows while autocommit was enabled. A DB hiccup between those
-    # statements could permanently drop queued tracks even though backup still
-    # had them. Keep the rebuild atomic.
-    try:
-        await cur.execute("START TRANSACTION")
-        await cur.execute("DELETE FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus'", (guild_id,))
-        for row in rows:
-            await cur.execute(
-                "INSERT INTO nexus_queue (guild_id, bot_name, video_url, title, requester_id) VALUES (%s, 'nexus', %s, %s, %s)",
-                (
-                    _row_value(row, "guild_id", _row_value(row, 1, guild_id)),
-                    _row_value(row, "video_url", _row_value(row, 3)),
-                    _row_value(row, "title", _row_value(row, 4)),
-                    _row_value(row, "requester_id", _row_value(row, 5)),
-                ),
-            )
-        await cur.execute("COMMIT")
-    except Exception:
-        try:
-            await cur.execute("ROLLBACK")
-        except Exception:
-            pass
-        logger.exception("[nexus] Queue reshuffle transaction failed; live queue was rolled back instead of leaking tracks.")
-        raise
+    await cur.execute("DELETE FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus'", (guild_id,))
+    for row in rows:
+        await cur.execute(
+            "INSERT INTO nexus_queue (guild_id, bot_name, video_url, title, requester_id) VALUES (%s, 'nexus', %s, %s, %s)",
+            (
+                _row_value(row, "guild_id", _row_value(row, 1, guild_id)),
+                _row_value(row, "video_url", _row_value(row, 3)),
+                _row_value(row, "title", _row_value(row, 4)),
+                _row_value(row, "requester_id", _row_value(row, 5)),
+            ),
+        )
     return len(rows)
 
 async def requeue_finished_track(cur, guild_id, video_url, title, requester_id):
@@ -2420,23 +2402,6 @@ def schedule_recovery_retry(guild_id, channel_id, *, start_position=0, reason="r
     return True
 
 async def requeue_failed_track(cur, guild_id, channel_id, url, title, requester_id, *, position=0, reason="recovery"):
-    # Queue backup copy fix: if the failed/current track was already stored in
-    # the backup queue, copy that exact backup row back to the front of the live
-    # queue instead of trusting possibly stale Wavelink payload metadata.
-    try:
-        await cur.execute(
-            "SELECT video_url, title, requester_id FROM nexus_queue_backup WHERE guild_id = %s AND bot_name = 'nexus' AND (video_url = %s OR title = %s) ORDER BY id ASC LIMIT 1",
-            (guild_id, url, title),
-        )
-        backup_row = await cur.fetchone()
-        if backup_row:
-            url = _row_value(backup_row, "video_url", _row_value(backup_row, 0)) or url
-            title = _row_value(backup_row, "title", _row_value(backup_row, 1)) or title
-            backup_requester = _row_value(backup_row, "requester_id", _row_value(backup_row, 2))
-            if requester_id is None and backup_requester is not None:
-                requester_id = backup_requester
-    except Exception:
-        logger.debug("[nexus] Backup row lookup skipped while requeueing failed track.", exc_info=True)
     # A voice timeout can trigger more than one queued recovery path. Keep the
     # failed track at the front once, instead of duplicating it on every overlap.
     await cur.execute(
@@ -2466,106 +2431,6 @@ async def requeue_failed_track(cur, guild_id, channel_id, url, title, requester_
     )
     await remember_recovery_state(guild_id, channel_id, position)
     schedule_recovery_retry(guild_id, channel_id, start_position=position, reason=reason)
-
-
-def _track_failure_identity(guild_id, url=None, title=None):
-    identity = str(url or title or "unknown").strip().lower()
-    return (int(guild_id), identity[:500])
-
-
-def clear_track_failure(guild_id, url=None, title=None):
-    track_failure_counts.pop(_track_failure_identity(guild_id, url, title), None)
-
-
-def mark_track_failure(guild_id, url=None, title=None):
-    now = time.time()
-    key = _track_failure_identity(guild_id, url, title)
-    count, first_seen = track_failure_counts.get(key, (0, now))
-    if now - first_seen > TRACK_FAILURE_WINDOW_SECONDS:
-        count = 0
-        first_seen = now
-    count += 1
-    track_failure_counts[key] = (count, first_seen)
-    if len(track_failure_counts) > MAX_RUNTIME_GUILD_CACHE_ENTRIES * 4:
-        stale_before = now - TRACK_FAILURE_WINDOW_SECONDS
-        for old_key, (_old_count, old_first_seen) in list(track_failure_counts.items()):
-            if old_first_seen < stale_before:
-                track_failure_counts.pop(old_key, None)
-    return count
-
-
-async def handle_track_playback_failure(payload, *, reason="track_exception"):
-    player = getattr(payload, "player", None)
-    guild = getattr(player, "guild", None)
-    if not guild:
-        return False
-
-    track = getattr(payload, "track", None) or _player_current_track(player)
-    track_data = playback_tracking.get(guild.id, {})
-    url = getattr(track, "uri", None) or track_data.get("url")
-    title = getattr(track, "title", None) or track_data.get("title") or "Recoverable Track"
-    channel_id = (
-        getattr(getattr(player, "channel", None), "id", None)
-        or track_data.get("channel_id")
-        or guild_states.get(guild.id, {}).get("voice_channel_id")
-    )
-    requester_id = track_data.get("requester_id") or (bot.user.id if bot.user else None)
-    position = current_track_position(guild.id)
-
-    if not url:
-        logger.warning("[%s] Lavalink failure had no track URL; preserving state but cannot requeue unknown track (%s).", guild.id, reason)
-        return False
-
-    attempts = mark_track_failure(guild.id, url, title)
-    async with DBPoolManager() as pool:
-        async with pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                if attempts <= MAX_TRACK_FAILURE_REQUEUES:
-                    await requeue_failed_track(cur, guild.id, channel_id, url, title, requester_id, position=position, reason=reason)
-                    logger.warning(
-                        "[%s] Lavalink %s hit '%s'; copied it back from backup/live metadata to the front of the queue (attempt %s/%s).",
-                        guild.id,
-                        reason,
-                        title,
-                        attempts,
-                        MAX_TRACK_FAILURE_REQUEUES,
-                    )
-                else:
-                    # Do not let one poison YouTube stream trap the bot forever.
-                    # Keep it in backup so it is not lost, mark active playback idle,
-                    # then let the next queued track continue.
-                    await backup_track(cur, guild.id, url, title, requester_id)
-                    await cur.execute(
-                        "UPDATE nexus_playback_state SET is_playing = FALSE, is_paused = FALSE, position_seconds = %s WHERE guild_id = %s AND bot_name = 'nexus'",
-                        (position, guild.id),
-                    )
-                    logger.error(
-                        "[%s] Lavalink %s kept failing for '%s' after %s attempts; preserved it in backup and moved on.",
-                        guild.id,
-                        reason,
-                        title,
-                        MAX_TRACK_FAILURE_REQUEUES,
-                    )
-
-    if channel_id:
-        schedule_named_task(f"lavalink_failure_process_queue:{guild.id}", process_queue(guild, channel_id, allow_recovery_restore=True))
-    return True
-
-
-@bot.event
-async def on_wavelink_track_exception(payload):
-    try:
-        await handle_track_playback_failure(payload, reason="track_exception")
-    except Exception:
-        logger.exception("[nexus] Failed to handle Wavelink track exception without leaking queue state.")
-
-
-@bot.event
-async def on_wavelink_track_stuck(payload):
-    try:
-        await handle_track_playback_failure(payload, reason="track_stuck")
-    except Exception:
-        logger.exception("[nexus] Failed to handle Wavelink stuck track without leaking queue state.")
 
 
 async def get_home_channel(guild):
@@ -2850,10 +2715,6 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
     if payload.player and str(getattr(payload, 'reason', '')).upper() != "REPLACED":
         try:
             reason = str(payload.reason).upper()
-            if reason in {"LOAD_FAILED", "CLEANUP"}:
-                handled = await handle_track_playback_failure(payload, reason=f"track_end_{reason.lower()}")
-                if handled:
-                    return
             if payload.track:
                 async with DBPoolManager() as pool:
                     async with pool.acquire() as conn:
@@ -3013,7 +2874,6 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
 
                 try:
                     await asyncio.wait_for(voice_client.play(track), timeout=LAVALINK_PLAY_TIMEOUT_SECONDS)
-                    clear_track_failure(guild.id, url, title)
                     if start_position > 0:
                         await voice_client.seek(int(start_position * 1000))
                     elif trans_mode in {'fade', 'smart'}:
@@ -4934,26 +4794,7 @@ async def resilience_loop():
                         if queue_count > 0:
                             clear_idle_restore_state(guild.id)
 
-                        if is_active:
-                            continue
-
-                        # FIX: Queue items exist but the player is dead — re-trigger playback.
-                        # Previously this branch was silently skipped, causing tracks to accumulate
-                        # in nexus_queue forever without being consumed (the "queue leak").
-                        if queue_count > 0:
-                            stuck_channel_id = (
-                                guild_states.get(guild.id, {{}}).get("voice_channel_id")
-                                or (vc.channel.id if vc and getattr(vc, "channel", None) else None)
-                            )
-                            if stuck_channel_id and guild.id not in recovering_guilds and recovery_backoff_remaining(guild.id) <= 0:
-                                logger.warning(
-                                    "[%s] Resilience loop: %s queued track(s) found with no active player; re-triggering process_queue.",
-                                    guild.id, queue_count,
-                                )
-                                schedule_named_task(
-                                    f"resilience_stuck_queue:{{guild.id}}",
-                                    process_queue(guild, stuck_channel_id, allow_recovery_restore=True),
-                                )
+                        if is_active or queue_count > 0:
                             continue
 
                         if now < auto_restore_snooze_until.get(guild.id, 0):
@@ -5455,114 +5296,10 @@ async def on_ready_intelligence():
     if not bot.get_cog("SwarmIntelligence"): await setup_intelligence(bot)
 bot.add_listener(on_ready_intelligence, 'on_ready')
 
-@tasks.loop(seconds=30.0)
-async def queue_integrity_check_loop():
-    """
-    Background check: find tracks lost from the active queue (dequeued at play-start
-    but the bot crashed before they finished) and restore the specific missing track
-    from nexus_queue_backup so playback can resume cleanly.
-    """
-    try:
-        async with DBPoolManager() as pool:
-            async with pool.acquire() as conn:
-                async with conn.cursor(aiomysql.DictCursor) as cur:
-                    await cur.execute(
-                        """
-                        SELECT ps.guild_id, ps.video_url, ps.title, ps.channel_id, ps.position_seconds
-                        FROM nexus_playback_state ps
-                        WHERE ps.bot_name = 'nexus'
-                          AND ps.video_url IS NOT NULL
-                          AND ps.video_url <> ''
-                          AND (ps.is_playing = TRUE OR ps.is_paused = TRUE OR ps.position_seconds > 0)
-                          AND NOT EXISTS (
-                              SELECT 1 FROM nexus_queue q
-                              WHERE q.guild_id = ps.guild_id
-                                AND q.bot_name = 'nexus'
-                              LIMIT 1
-                          )
-                        """
-                    )
-                    candidates = await cur.fetchall()
-
-                    for row in candidates:
-                        guild_id = int(row["guild_id"])
-                        video_url = row.get("video_url") or ""
-                        title = row.get("title") or ""
-                        db_channel_id = row.get("channel_id")
-                        position = int(row.get("position_seconds") or 0)
-
-                        guild = bot.get_guild(guild_id)
-                        if not guild:
-                            continue
-                        vc = guild.voice_client
-                        if vc and _player_is_active(vc):
-                            continue
-                        if guild_id in recovering_guilds:
-                            continue
-                        if recovery_backoff_remaining(guild_id) > 0:
-                            continue
-
-                        await cur.execute(
-                            "SELECT video_url, title, requester_id FROM nexus_queue_backup "
-                            "WHERE guild_id = %s AND bot_name = 'nexus' "
-                            "  AND (video_url = %s OR (title = %s AND title <> '')) "
-                            "ORDER BY id ASC LIMIT 1",
-                            (guild_id, video_url, title),
-                        )
-                        backup_row = await cur.fetchone()
-                        if not backup_row:
-                            continue
-
-                        restored_url = backup_row.get("video_url") or video_url
-                        restored_title = backup_row.get("title") or title
-                        restored_requester = backup_row.get("requester_id")
-
-                        logger.warning(
-                            "[%s] Queue integrity check: '%s' was lost from active queue "
-                            "(dequeued but never finished); restoring from backup at position %ss.",
-                            guild_id, restored_title, position,
-                        )
-
-                        await insert_queue_front(
-                            cur,
-                            "nexus_queue",
-                            guild_id,
-                            "nexus",
-                            restored_url,
-                            restored_title,
-                            restored_requester,
-                        )
-
-                        target_channel_id = (
-                            db_channel_id
-                            or guild_states.get(guild_id, {}).get("voice_channel_id")
-                            or (vc.channel.id if vc and getattr(vc, "channel", None) else None)
-                        )
-                        if target_channel_id:
-                            schedule_named_task(
-                                f"integrity_restore_process_queue:{guild_id}",
-                                process_queue(
-                                    guild,
-                                    target_channel_id,
-                                    start_position=position,
-                                    allow_recovery_restore=True,
-                                ),
-                            )
-    except Exception:
-        logger.exception("[nexus] Queue integrity check loop failed.")
-
-
-@queue_integrity_check_loop.before_loop
-async def before_queue_integrity_check_loop():
-    await bot.wait_until_ready()
-
-
 @bot.event
 async def on_ready_auto_heal():
     if not auto_heal_loop.is_running():
         auto_heal_loop.start()
-    if not queue_integrity_check_loop.is_running():
-        queue_integrity_check_loop.start()
 bot.add_listener(on_ready_auto_heal, 'on_ready')
 
 @bot.tree.interaction_check
