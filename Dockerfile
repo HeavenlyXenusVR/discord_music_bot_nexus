@@ -10,7 +10,7 @@ RUN mkdir -p /app/logs /app/.runtime /app/.cache/yt-dlp
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy bot files (bot.py, cookies.txt, etc.)
+# Copy bot source; secrets and runtime state stay in env files or mounted volumes.
 COPY . .
 
 # Start the bot
