@@ -369,6 +369,7 @@ ERROR_REPORT_THROTTLE_SECONDS = max(
     float(os.getenv(f"{BOT_ENV_PREFIX}_ERROR_REPORT_THROTTLE_SECONDS", os.getenv("MUSIC_BOT_ERROR_REPORT_THROTTLE_SECONDS", "300"))),
 )
 _error_report_last_sent = {}
+_bg_tasks = set()
 
 
 def _error_report_key(message, traceback_text=None):
@@ -491,7 +492,7 @@ def dispatch_runtime_error(title, error=None, *, description=None, traceback_tex
     except RuntimeError:
         loop = getattr(bot, 'loop', None)
     if loop and loop.is_running():
-        loop.create_task(
+        task = loop.create_task(
             report_runtime_error(
                 title,
                 error,
@@ -502,6 +503,8 @@ def dispatch_runtime_error(title, error=None, *, description=None, traceback_tex
                 level=level,
             )
         )
+        _bg_tasks.add(task)
+        task.add_done_callback(_bg_tasks.discard)
 
 
 class SwarmErrorWebhookHandler(logging.Handler):
@@ -1123,7 +1126,7 @@ async def _connect_lavalink_forever():
                 continue
             try:
                 logger.info(f"Connecting to Lavalink at {LAVALINK_URI}")
-                await wavelink.Pool.connect(nodes=[wavelink.Node(uri=LAVALINK_URI, password=LAVALINK_PASSWORD)], client=bot, cache_capacity=LAVALINK_TRACK_CACHE_CAPACITY)
+                await wavelink.Pool.connect(nodes=[wavelink.Node(uri=LAVALINK_URI, password=LAVALINK_PASSWORD, identifier=f"SWARM_PRIMARY_{BOT_ENV_PREFIX}")], client=bot, cache_capacity=LAVALINK_TRACK_CACHE_CAPACITY)
             except Exception as exc:
                 logger.warning(f"Waiting for Lavalink to boot or authenticate... Retrying in 5s ({exc})")
                 await asyncio.sleep(5)
@@ -1829,9 +1832,31 @@ def invalidate_position_persist(guild_id):
     last_position_persist.pop(guild_id, None)
 
 def current_track_position(guild_id, now=None):
-    data = playback_tracking.get(guild_id)
+    data = playback_tracking.get(guild_id) or playback_tracking.get(str(guild_id))
+
+    # Lavalink/Wavelink owns the exact playback clock. Prefer it so network
+    # buffering, track stalls, and reconnect lag do not make recovery resume
+    # several seconds too far ahead. DB/state math is kept as a fallback only.
+    try:
+        guild = bot.get_guild(int(guild_id))
+        vc = guild.voice_client if guild else None
+        if vc and _voice_client_connected(vc):
+            position_ms = getattr(vc, "position", None)
+            if position_ms is not None:
+                position = max(0, int(float(position_ms) / 1000))
+                try:
+                    duration = int((data or {}).get("duration") or 0)
+                    if duration > 0:
+                        position = min(position, duration)
+                except Exception:
+                    pass
+                return position
+    except Exception:
+        pass
+
     if not data:
-        return int(guild_states.get(guild_id, {}).get("position", 0))
+        state = guild_states.get(guild_id) or guild_states.get(str(guild_id)) or {}
+        return int(state.get("position", 0))
     # Critical: do not let the saved position keep advancing while paused.
     # Pause/resume sync uses this helper, so drift here causes the panel, Aria,
     # and recovery logic to resume too far into the song.
