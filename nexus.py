@@ -2740,6 +2740,125 @@ async def restore_queue_from_backup(cur, guild_id, requester_id=None):
         )
     return len(insert_data)
 
+
+async def repair_queue_backup_parity(cur, guild_id, *, reason="queue_integrity", active_player=None):
+    """Heal partial drift between live and backup queues without duplicating the active track."""
+    await cur.execute("SELECT id, video_url, title, requester_id FROM nexus_queue_backup WHERE guild_id = %s AND bot_name = 'nexus' ORDER BY id ASC", (guild_id,))
+    backup_rows = list(await cur.fetchall() or [])
+    await cur.execute("SELECT id, video_url, title, requester_id FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus' ORDER BY id ASC", (guild_id,))
+    live_rows = list(await cur.fetchall() or [])
+    if not backup_rows and not live_rows:
+        return 0, 0
+
+    await cur.execute(
+        "SELECT video_url, title, is_playing, is_paused, position_seconds FROM nexus_playback_state WHERE guild_id = %s AND bot_name = 'nexus' LIMIT 1",
+        (guild_id,),
+    )
+    playback_row = await cur.fetchone() or {}
+    active_url = str(_row_value(playback_row, "video_url", _row_value(playback_row, 0, "")) or "").strip()
+    active_title = str(_row_value(playback_row, "title", _row_value(playback_row, 1, "")) or "").strip()
+    db_active_playback = bool(
+        (active_url or active_title)
+        and (
+            bool(_row_value(playback_row, "is_playing", _row_value(playback_row, 2, False)))
+            or bool(_row_value(playback_row, "is_paused", _row_value(playback_row, 3, False)))
+            or int(_row_value(playback_row, "position_seconds", _row_value(playback_row, 4, 0)) or 0) > 0
+        )
+    )
+    active_playback = db_active_playback if active_player is None else bool(active_player and (active_url or active_title))
+
+    def _matches_active(row):
+        row_url = str(_row_value(row, "video_url", _row_value(row, 1, "")) or "").strip()
+        row_title = str(_row_value(row, "title", _row_value(row, 2, "")) or "").strip()
+        return active_playback and ((active_url and row_url == active_url) or (active_title and row_title == active_title))
+
+    def _parity_track_key(row):
+        return _track_key(
+            _row_value(row, "video_url", _row_value(row, 1, "")),
+            _row_value(row, "title", _row_value(row, 2, "")),
+        )
+
+    live_counts = {}
+    for row in live_rows:
+        key = _parity_track_key(row)
+        live_counts[key] = live_counts.get(key, 0) + 1
+
+    missing_live_rows = []
+    skipped_active = False
+    for row in backup_rows:
+        key = _parity_track_key(row)
+        if live_counts.get(key, 0) > 0:
+            live_counts[key] -= 1
+            continue
+        if not skipped_active and _matches_active(row):
+            skipped_active = True
+            continue
+        missing_live_rows.append(row)
+
+    if active_playback and not skipped_active and missing_live_rows:
+        # The active track can be stored under a resolved Lavalink URI while backup
+        # still has the original request. Keep one unexplained gap reserved for it.
+        missing_live_rows = missing_live_rows[1:]
+
+    live_restore_budget = max(0, len(backup_rows) - len(live_rows) - (1 if active_playback else 0))
+    if live_restore_budget <= 0:
+        missing_live_rows = []
+    elif len(missing_live_rows) > live_restore_budget:
+        missing_live_rows = missing_live_rows[:live_restore_budget]
+
+    restored_live = 0
+    for row in reversed(missing_live_rows):
+        await insert_queue_front(
+            cur,
+            "nexus_queue",
+            guild_id,
+            "nexus",
+            _row_value(row, "video_url", _row_value(row, 1)),
+            _row_value(row, "title", _row_value(row, 2)),
+            _row_value(row, "requester_id", _row_value(row, 3)),
+        )
+        restored_live += 1
+
+    backup_counts = {}
+    for row in backup_rows:
+        key = _parity_track_key(row)
+        backup_counts[key] = backup_counts.get(key, 0) + 1
+
+    missing_backup_rows = []
+    for row in live_rows:
+        key = _parity_track_key(row)
+        if backup_counts.get(key, 0) > 0:
+            backup_counts[key] -= 1
+            continue
+        missing_backup_rows.append(row)
+
+    backup_restore_budget = max(0, len(live_rows) - len(backup_rows))
+    if backup_restore_budget <= 0:
+        missing_backup_rows = []
+    elif len(missing_backup_rows) > backup_restore_budget:
+        missing_backup_rows = missing_backup_rows[:backup_restore_budget]
+
+    restored_backup = 0
+    for row in missing_backup_rows:
+        await cur.execute(
+            "INSERT INTO nexus_queue_backup (guild_id, bot_name, video_url, title, requester_id) VALUES (%s, 'nexus', %s, %s, %s)",
+            (
+                guild_id,
+                _row_value(row, "video_url", _row_value(row, 1)),
+                _row_value(row, "title", _row_value(row, 2)),
+                _row_value(row, "requester_id", _row_value(row, 3)),
+            ),
+        )
+        restored_backup += 1
+
+    if restored_live or restored_backup:
+        logger.warning(
+            "[%s] Queue parity repair restored %s live row(s) from backup and %s backup row(s) from live after %s.",
+            guild_id, restored_live, restored_backup, reason,
+        )
+    return restored_live, restored_backup
+
+
 async def restore_active_playback_entry(cur, guild_id, requester_id=None):
     await cur.execute(
         "SELECT video_url, title FROM nexus_playback_state "
@@ -6118,6 +6237,49 @@ async def queue_integrity_check_loop():
         async with DBPoolManager() as pool:
             async with pool.acquire() as conn:
                 async with conn.cursor(aiomysql.DictCursor) as cur:
+                    # Repair partial queue drift before the narrower empty-queue resurrection pass.
+                    await cur.execute(
+                        """
+                        SELECT guild_id FROM nexus_queue WHERE bot_name = %s
+                        UNION SELECT guild_id FROM nexus_queue_backup WHERE bot_name = %s
+                        UNION SELECT guild_id FROM nexus_playback_state WHERE bot_name = %s
+                        """,
+                        ("nexus", "nexus", "nexus"),
+                    )
+                    parity_rows = await cur.fetchall()
+                    for parity_row in parity_rows:
+                        guild_id = int(_row_value(parity_row, "guild_id", _row_value(parity_row, 0)))
+                        guild = bot.get_guild(guild_id)
+                        if not guild:
+                            continue
+                        vc = guild.voice_client
+                        player_active = bool(vc and _player_is_active(vc))
+                        restored_live, _restored_backup = await repair_queue_backup_parity(cur, guild_id, active_player=player_active)
+                        if restored_live <= 0:
+                            continue
+                        if player_active:
+                            continue
+                        if guild_id in recovering_guilds or recovery_backoff_remaining(guild_id) > 0:
+                            continue
+                        await cur.execute(
+                            "SELECT channel_id FROM nexus_playback_state WHERE guild_id = %s AND bot_name = %s LIMIT 1",
+                            (guild_id, "nexus"),
+                        )
+                        channel_row = await cur.fetchone()
+                        target_channel_id = _row_value(channel_row, "channel_id", _row_value(channel_row, 0))
+                        if not target_channel_id:
+                            await cur.execute(
+                                "SELECT COALESCE(connected_channel_id, last_channel_id) AS channel_id FROM nexus_voice_state WHERE guild_id = %s AND bot_name = %s LIMIT 1",
+                                (guild_id, "nexus"),
+                            )
+                            channel_row = await cur.fetchone()
+                            target_channel_id = _row_value(channel_row, "channel_id", _row_value(channel_row, 0))
+                        if target_channel_id:
+                            schedule_named_task(
+                                f"queue_parity_process_queue:{guild_id}",
+                                process_queue(guild, int(target_channel_id), allow_recovery_restore=True),
+                            )
+
                     await cur.execute(
                         """
                         SELECT ps.guild_id, ps.video_url, ps.title, ps.channel_id, ps.position_seconds
