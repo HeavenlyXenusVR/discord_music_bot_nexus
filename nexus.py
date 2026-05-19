@@ -17,6 +17,7 @@ from discord import app_commands
 import re
 import urllib.parse
 import hashlib
+import shutil
 from types import SimpleNamespace
 
 # --- DAVE PROTOCOL MONKEYPATCH (FIXES LAVALINK 4.2.2 E2EE ENCRYPTION) ---
@@ -599,11 +600,91 @@ WATCHDOG_REVIVAL_COOLDOWN = max(10.0, float(os.getenv(f"{BOT_ENV_PREFIX}_WATCHDO
 WATCHDOG_MAX_REVIVALS = max(3, int(os.getenv(f"{BOT_ENV_PREFIX}_WATCHDOG_MAX_REVIVALS", "6")))
 AUTO_RESTORE_SNOOZE_SECONDS = max(60.0, float(os.getenv(f"{BOT_ENV_PREFIX}_AUTO_RESTORE_SNOOZE_SECONDS", "180")))
 RECOVERY_EXHAUSTED_COOLDOWN_SECONDS = max(120.0, float(os.getenv(f"{BOT_ENV_PREFIX}_RECOVERY_EXHAUSTED_COOLDOWN_SECONDS", "600")))
-PERIODIC_RESTART_HOURS = max(1.0, float(os.getenv(f"{BOT_ENV_PREFIX}_PERIODIC_RESTART_HOURS", os.getenv("PERIODIC_RESTART_HOURS", "5"))))
+PERIODIC_RESTART_HOURS = max(0.0, float(os.getenv(f"{BOT_ENV_PREFIX}_PERIODIC_RESTART_HOURS", os.getenv("PERIODIC_RESTART_HOURS", "0"))))
+CACHE_CLEANUP_INTERVAL_HOURS = max(1.0, float(os.getenv(f"{BOT_ENV_PREFIX}_CACHE_CLEANUP_INTERVAL_HOURS", os.getenv("CACHE_CLEANUP_INTERVAL_HOURS", "10"))))
+CACHE_CLEANUP_INITIAL_SPREAD_SECONDS = max(0.0, float(os.getenv(f"{BOT_ENV_PREFIX}_CACHE_CLEANUP_INITIAL_SPREAD_SECONDS", os.getenv("CACHE_CLEANUP_INITIAL_SPREAD_SECONDS", "1800"))))
+CACHE_CLEANUP_LOCK_TTL_SECONDS = max(60.0, float(os.getenv(f"{BOT_ENV_PREFIX}_CACHE_CLEANUP_LOCK_TTL_SECONDS", os.getenv("CACHE_CLEANUP_LOCK_TTL_SECONDS", "1800"))))
+CACHE_CLEANUP_DISK_ENABLED = str(os.getenv(f"{BOT_ENV_PREFIX}_CACHE_CLEANUP_DISK_ENABLED", os.getenv("CACHE_CLEANUP_DISK_ENABLED", "true"))).strip().lower() not in {"0", "false", "off", "no"}
 
 intents = discord.Intents.default()
 intents.message_content = False
 bot = commands.Bot(command_prefix="/", intents=intents)
+
+
+def _truthy_env(value, default=True):
+    if value is None:
+        return default
+    return str(value).strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _parse_id_set(raw_value):
+    ids = set()
+    for part in str(raw_value or "").replace(";", ",").split(","):
+        value = part.strip()
+        if not value:
+            continue
+        try:
+            ids.add(int(value))
+        except ValueError:
+            logger.warning("[%s] Ignoring non-numeric private owner id: %s", BOT_ENV_PREFIX.lower(), value)
+    return ids
+
+
+MUSIC_BOT_PRIVATE_MODE = _truthy_env(os.getenv(f"{BOT_ENV_PREFIX}_PRIVATE_MODE", os.getenv("MUSIC_BOT_PRIVATE_MODE", "true")))
+PRIVATE_OWNER_USER_IDS = _parse_id_set(
+    ",".join(
+        value for value in (
+            os.getenv(f"{BOT_ENV_PREFIX}_OWNER_USER_IDS", ""),
+            os.getenv(f"{BOT_ENV_PREFIX}_OWNER_IDS", ""),
+            os.getenv("MUSIC_BOT_OWNER_IDS", ""),
+            os.getenv("DISCORD_OWNER_IDS", ""),
+        )
+        if value
+    )
+)
+_application_owner_ids_cache = set()
+_application_owner_ids_loaded = False
+
+
+async def load_private_owner_user_ids():
+    global _application_owner_ids_cache, _application_owner_ids_loaded
+    if _application_owner_ids_loaded:
+        return set(_application_owner_ids_cache)
+
+    ids = set(PRIVATE_OWNER_USER_IDS)
+    try:
+        app_info = await bot.application_info()
+        owner = getattr(app_info, "owner", None)
+        owner_id = getattr(owner, "id", None)
+        if owner_id:
+            ids.add(int(owner_id))
+        team = getattr(app_info, "team", None)
+        for member in getattr(team, "members", []) or []:
+            user = getattr(member, "user", member)
+            user_id = getattr(user, "id", None)
+            if user_id:
+                ids.add(int(user_id))
+    except Exception:
+        logger.exception("[%s] Failed to load Discord application owner ids for private mode.", BOT_ENV_PREFIX.lower())
+
+    _application_owner_ids_cache = ids
+    _application_owner_ids_loaded = True
+    return set(ids)
+
+
+async def is_private_owner_user(user):
+    if not MUSIC_BOT_PRIVATE_MODE:
+        return True
+    user_id = getattr(user, "id", None)
+    if not user_id:
+        return False
+    try:
+        normalized = int(user_id)
+    except (TypeError, ValueError):
+        return False
+    if normalized in PRIVATE_OWNER_USER_IDS:
+        return True
+    return normalized in await load_private_owner_user_ids()
 bot.start_time = time.time()
 playback_tracking = {}
 guild_states = {}
@@ -744,6 +825,148 @@ def prune_runtime_state_cache():
         prune_mapping(mapping)
 
 
+
+
+def _feature_cache_map():
+    return {
+        "requester_names": REQUESTER_NAME_CACHE,
+        "auto_dj": AUTO_DJ_ENABLED_CACHE,
+        "guild_settings": GUILD_SETTINGS_CACHE,
+        "home_channels": HOME_CHANNEL_CACHE,
+        "search_results": SEARCH_RESULT_CACHE,
+        "voice_status": VOICE_STATUS_CACHE,
+        "status_messages": STATUS_MESSAGE_CACHE,
+        "voice_state_persist": VOICE_STATE_PERSIST_CACHE,
+        "autodj_last_run": AUTODJ_LAST_RUN,
+        "autodj_fail_until": AUTODJ_FAIL_UNTIL,
+    }
+
+
+def clear_feature_runtime_caches():
+    counts = {}
+    for name, cache in _feature_cache_map().items():
+        try:
+            counts[name] = len(cache)
+            cache.clear()
+        except Exception:
+            logger.debug("[%s] Failed to clear feature cache %s.", BOT_ENV_PREFIX.lower(), name, exc_info=True)
+    try:
+        prune_runtime_state_cache()
+    except Exception:
+        logger.debug("[%s] Runtime prune skipped during cache cleanup.", BOT_ENV_PREFIX.lower(), exc_info=True)
+    return counts
+
+
+def _cache_cleanup_lock_path():
+    parent = os.path.dirname(os.path.abspath(YTDLP_CACHE_DIR)) or "/tmp"
+    try:
+        os.makedirs(parent, exist_ok=True)
+    except Exception:
+        parent = "/tmp"
+    return os.path.join(parent, ".music_fleet_cache_cleanup.lock")
+
+
+def _try_acquire_cache_cleanup_lock():
+    if not CACHE_CLEANUP_DISK_ENABLED:
+        return None
+    path = _cache_cleanup_lock_path()
+    now = time.time()
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "w", encoding="utf-8") as lock_file:
+            lock_file.write(f"{BOT_ENV_PREFIX.lower()} {now}\n")
+        return path
+    except FileExistsError:
+        try:
+            if now - os.path.getmtime(path) > CACHE_CLEANUP_LOCK_TTL_SECONDS:
+                os.unlink(path)
+                return _try_acquire_cache_cleanup_lock()
+        except FileNotFoundError:
+            return _try_acquire_cache_cleanup_lock()
+        except Exception:
+            logger.debug("[%s] Cache cleanup lock inspection failed.", BOT_ENV_PREFIX.lower(), exc_info=True)
+    except Exception:
+        logger.debug("[%s] Cache cleanup lock acquisition failed.", BOT_ENV_PREFIX.lower(), exc_info=True)
+    return None
+
+
+def _release_cache_cleanup_lock(path):
+    if not path:
+        return
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        logger.debug("[%s] Cache cleanup lock release failed.", BOT_ENV_PREFIX.lower(), exc_info=True)
+
+
+def _clear_directory_contents(path):
+    removed = 0
+    if not path:
+        return removed
+    os.makedirs(path, exist_ok=True)
+    for entry in os.scandir(path):
+        try:
+            if entry.name == ".music_fleet_cache_cleanup.lock":
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                shutil.rmtree(entry.path)
+            else:
+                os.unlink(entry.path)
+            removed += 1
+        except FileNotFoundError:
+            continue
+        except Exception:
+            logger.debug("[%s] Failed removing cache entry %s.", BOT_ENV_PREFIX.lower(), entry.path, exc_info=True)
+    return removed
+
+
+def _clear_wavelink_memory_caches():
+    cleared = 0
+    targets = []
+    try:
+        nodes = getattr(wavelink.Pool, "nodes", None)
+        if isinstance(nodes, dict):
+            targets.extend(nodes.values())
+        elif nodes:
+            targets.extend(list(nodes))
+    except Exception:
+        pass
+    targets.append(wavelink.Pool)
+
+    for target in targets:
+        for attr in ("_cache", "cache", "_cached_tracks", "_track_cache", "_playlist_cache", "_search_cache"):
+            try:
+                cache = getattr(target, attr, None)
+                if hasattr(cache, "clear"):
+                    before = len(cache) if hasattr(cache, "__len__") else 0
+                    cache.clear()
+                    cleared += before
+            except Exception:
+                logger.debug("[%s] Failed clearing Wavelink cache %s on %r.", BOT_ENV_PREFIX.lower(), attr, target, exc_info=True)
+    return cleared
+
+
+async def clear_local_cache_systems(reason="manual"):
+    feature_counts = clear_feature_runtime_caches()
+    disk_removed = 0
+    lock_path = _try_acquire_cache_cleanup_lock()
+    if lock_path:
+        try:
+            disk_removed = await asyncio.to_thread(_clear_directory_contents, YTDLP_CACHE_DIR)
+        finally:
+            _release_cache_cleanup_lock(lock_path)
+    wavelink_removed = _clear_wavelink_memory_caches()
+    logger.info(
+        "[%s] Cleared runtime caches reason=%s feature_entries=%s ytdlp_entries=%s wavelink_entries=%s",
+        BOT_ENV_PREFIX.lower(),
+        reason,
+        sum(feature_counts.values()),
+        disk_removed,
+        wavelink_removed,
+    )
+    return {"features": feature_counts, "disk_entries": disk_removed, "wavelink_entries": wavelink_removed}
 
 def schedule_named_task(name, coro, overwrite=False):
     """Prevent duplicate startup/recovery tasks across reconnecting on_ready events.
@@ -2609,6 +2832,8 @@ async def requeue_failed_track(cur, guild_id, channel_id, url, title, requester_
     # Queue backup copy fix: if the failed/current track was already stored in
     # the backup queue, copy that exact backup row back to the front of the live
     # queue instead of trusting possibly stale Wavelink payload metadata.
+    original_url = url
+    original_title = title
     try:
         await cur.execute(
             "SELECT video_url, title, requester_id FROM nexus_queue_backup WHERE guild_id = %s AND bot_name = 'nexus' AND (video_url = %s OR title = %s) ORDER BY id ASC LIMIT 1",
@@ -2623,7 +2848,9 @@ async def requeue_failed_track(cur, guild_id, channel_id, url, title, requester_
                 requester_id = backup_requester
     except Exception:
         logger.debug("[nexus] Backup row lookup skipped while requeueing failed track.", exc_info=True)
-    await delete_live_queue_copies(cur, guild_id, url, title)
+    await delete_live_queue_copies(cur, guild_id, original_url, original_title)
+    if (original_url, original_title) != (url, title):
+        await delete_live_queue_copies(cur, guild_id, url, title)
     # A voice timeout can trigger more than one queued recovery path. Keep the
     # failed track at the front once, instead of duplicating it on every overlap.
     await cur.execute(
@@ -5480,14 +5707,34 @@ async def before_queue_shuffle_maintenance_loop():
     await asyncio.sleep(30 * 60)
 
 
-@tasks.loop(hours=PERIODIC_RESTART_HOURS)
+@tasks.loop(hours=CACHE_CLEANUP_INTERVAL_HOURS)
+async def cache_cleanup_loop():
+    if not bot.is_ready():
+        return
+    await clear_local_cache_systems("scheduled_10h")
+
+
+@cache_cleanup_loop.before_loop
+async def before_cache_cleanup_loop():
+    await bot.wait_until_ready()
+    if CACHE_CLEANUP_INITIAL_SPREAD_SECONDS > 0:
+        spread_window = max(1, int(CACHE_CLEANUP_INITIAL_SPREAD_SECONDS))
+        deterministic_spread = sum(ord(ch) for ch in BOT_ENV_PREFIX) % spread_window
+        await asyncio.sleep(deterministic_spread)
+
+
+@tasks.loop(hours=max(1.0, PERIODIC_RESTART_HOURS))
 async def periodic_restart_loop():
+    if PERIODIC_RESTART_HOURS <= 0:
+        return
     await request_supervisor_restart(f"periodic_{PERIODIC_RESTART_HOURS:g}h_cycle")
+
 
 @periodic_restart_loop.before_loop
 async def before_periodic_restart_loop():
     await bot.wait_until_ready()
-    await asyncio.sleep(PERIODIC_RESTART_HOURS * 60 * 60)
+    if PERIODIC_RESTART_HOURS > 0:
+        await asyncio.sleep(PERIODIC_RESTART_HOURS * 60 * 60)
 
 @bot.event
 async def on_ready_maintenance():
@@ -5495,7 +5742,8 @@ async def on_ready_maintenance():
     if not zombie_reaper_loop.is_running(): zombie_reaper_loop.start()
     if not database_janitor_loop.is_running(): database_janitor_loop.start()
     if not queue_shuffle_maintenance_loop.is_running(): queue_shuffle_maintenance_loop.start()
-    if not periodic_restart_loop.is_running(): periodic_restart_loop.start()
+    if not cache_cleanup_loop.is_running(): cache_cleanup_loop.start()
+    if PERIODIC_RESTART_HOURS > 0 and not periodic_restart_loop.is_running(): periodic_restart_loop.start()
 bot.add_listener(on_ready_maintenance, 'on_ready')
 
 # --- ARIA DIRECT DRONE CONTROL ---
@@ -5956,6 +6204,11 @@ bot.add_listener(on_ready_auto_heal, 'on_ready')
 async def global_proximity_shield(interaction: discord.Interaction):
     admin_only = ['sethome', 'setfeedback', 'djrole', 'removedj', 'djmode', '247', 'restart']
     protected = ['play', 'stop', 'pause', 'resume', 'skip', 'join', 'leave', 'playnext', 'shuffle', 'clear', 'skipto', 'move', 'remove', 'seek', 'forward', 'rewind', 'replay']
+    owner_allowed = await is_private_owner_user(interaction.user)
+    if MUSIC_BOT_PRIVATE_MODE and not owner_allowed:
+        raise discord.app_commands.CheckFailure("This music node is private.")
+    if owner_allowed:
+        return True
     if not interaction.command: return True
     if any(interaction.command.name.endswith(s) for s in admin_only) and not interaction.user.guild_permissions.administrator:
         raise discord.app_commands.CheckFailure("You need administrator permission to use this command.")
@@ -5964,6 +6217,13 @@ async def global_proximity_shield(interaction: discord.Interaction):
     if not vc: return True
     if getattr(vc, 'channel', None) and (not interaction.user.voice or interaction.user.voice.channel != vc.channel):
         raise discord.app_commands.AppCommandError("You must be in the active voice channel to issue commands.")
+    return True
+
+
+@bot.check
+async def global_private_text_command_check(ctx):
+    if MUSIC_BOT_PRIVATE_MODE and not await is_private_owner_user(getattr(ctx, "author", None)):
+        raise commands.CheckFailure("This music node is private.")
     return True
 
 # --- BOT RUN TRIGGER ---
