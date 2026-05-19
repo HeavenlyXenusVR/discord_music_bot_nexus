@@ -2187,6 +2187,25 @@ def voice_connect_inflight_remaining(guild_id):
 def clear_voice_connect_inflight(guild_id):
     voice_connect_inflight_until.pop(guild_id, None)
 
+async def cleanup_failed_voice_session(guild, *, reason="voice_connect_error"):
+    """Force-clear a failed Discord voice handshake without touching persisted queue state."""
+    clear_voice_connect_inflight(guild.id)
+    voice_client = getattr(guild, "voice_client", None)
+    if voice_client:
+        try:
+            await asyncio.wait_for(voice_client.disconnect(force=True), timeout=10.0)
+        except TypeError:
+            try:
+                await asyncio.wait_for(voice_client.disconnect(), timeout=10.0)
+            except Exception:
+                logger.debug(f"[{guild.id}] Failed to disconnect stale voice client after {reason}.", exc_info=True)
+        except Exception:
+            logger.debug(f"[{guild.id}] Failed to disconnect stale voice client after {reason}.", exc_info=True)
+    try:
+        await asyncio.wait_for(guild.change_voice_state(channel=None), timeout=10.0)
+    except Exception:
+        logger.debug(f"[{guild.id}] Failed to clear Discord voice state after {reason}.", exc_info=True)
+
 def clear_recovery_backoff(guild_id):
     recovery_exhausted_until.pop(guild_id, None)
 
@@ -3193,6 +3212,7 @@ async def ensure_voice_connection(guild, channel_id, *, respect_recovery_backoff
             return None
         voice_client = guild.voice_client
         pending_voice_channels[guild.id] = channel_id
+        voice_operation_started = False
         try:
             if voice_client and (
                 not _voice_client_connected(voice_client)
@@ -3207,18 +3227,22 @@ async def ensure_voice_connection(guild, channel_id, *, respect_recovery_backoff
                     logger.warning(f"[{guild.id}] Voice client looks unstable and cannot be recycled by this caller; requeueing instead of playing into a stale voice session.")
                     return None
                 try:
-                    await voice_client.disconnect()
+                    await asyncio.wait_for(voice_client.disconnect(), timeout=10.0)
                 except Exception:
                     pass
                 voice_client = None
 
             if not voice_client:
                 voice_connect_inflight_until[guild.id] = time.time() + VOICE_CONNECT_TIMEOUT_SECONDS + 15.0
+                voice_operation_started = True
                 voice_client = await channel.connect(cls=wavelink.Player, timeout=VOICE_CONNECT_TIMEOUT_SECONDS)
+                voice_operation_started = False
                 clear_voice_connect_inflight(guild.id)
             elif voice_client.channel.id != channel_id:
                 voice_connect_inflight_until[guild.id] = time.time() + VOICE_CONNECT_TIMEOUT_SECONDS + 15.0
+                voice_operation_started = True
                 await voice_client.move_to(channel)
+                voice_operation_started = False
                 clear_voice_connect_inflight(guild.id)
             await ensure_self_deaf(guild, voice_client)
             if getattr(voice_client, "channel", None):
@@ -3237,13 +3261,17 @@ async def ensure_voice_connection(guild, channel_id, *, respect_recovery_backoff
             clear_voice_connect_inflight(guild.id)
             logger.error(f"[{guild.id}] Voice connect error: {e}")
             message = str(e).lower()
-            if isinstance(e, asyncio.TimeoutError) or "exceeded the timeout" in message or "timed out" in message:
+            timeout_error = isinstance(e, asyncio.TimeoutError) or "exceeded the timeout" in message or "timed out" in message
+            reason = "voice_connect_timeout" if timeout_error else "voice_connect_error"
+            if voice_operation_started:
+                await cleanup_failed_voice_session(guild, reason=reason)
+            if timeout_error:
                 timeout_backoff = VOICE_CONNECT_QUEUE_RETRY_BACKOFF_SECONDS if VOICE_CONNECT_QUEUE_RETRY_ENABLED else max(VOICE_CONNECT_TIMEOUT_BACKOFF_SECONDS, VOICE_CONNECT_TIMEOUT_SECONDS * 2.0)
                 arm_recovery_backoff(guild.id, seconds=timeout_backoff, reason="voice_connect_timeout")
-                try:
-                    await mark_voice_disconnected(guild.id, channel_id, desired_connected=True, reason="voice_connect_timeout")
-                except Exception:
-                    logger.debug(f"[{guild.id}] Failed to persist voice timeout state.", exc_info=True)
+            try:
+                await mark_voice_disconnected(guild.id, channel_id, desired_connected=True, reason=reason)
+            except Exception:
+                logger.debug(f"[{guild.id}] Failed to persist voice failure state.", exc_info=True)
             return None
 
 async def is_dj(interaction: discord.Interaction, silent=False):
