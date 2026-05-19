@@ -1134,8 +1134,8 @@ GLOBAL_DISCORD_LOGIN_LOCK_STALE_SECONDS = max(30.0, float(os.getenv(f"{BOT_ENV_P
 GLOBAL_DISCORD_LOGIN_GATE_MAX_WAIT_SECONDS = max(60.0, float(os.getenv(f"{BOT_ENV_PREFIX}_GLOBAL_DISCORD_LOGIN_GATE_MAX_WAIT_SECONDS", os.getenv("GLOBAL_DISCORD_LOGIN_GATE_MAX_WAIT_SECONDS", "900"))))
 MUSIC_BOT_RUNTIME_DIR = os.getenv(f"{BOT_ENV_PREFIX}_RUNTIME_DIR", os.getenv("MUSIC_BOT_RUNTIME_DIR", "/app/.runtime"))
 BOT_STAGGER_SLOTS = {
-    "GWS": 0, "HARMONIC": 1, "MAESTRO": 2, "MELODIC": 3, "NEXUS": 4,
-    "RHYTHM": 5, "SYMPHONY": 6, "TUNESTREAM": 7, "ALUCARD": 8, "SAPPHIRE": 9,
+    "GWS": 0, "HARMONIC": 1, "MAESTRO": 2, "MELODIC": 3, "NEXUS": 4, "RHYTHM": 5,
+    "SYMPHONY": 6, "TUNESTREAM": 7, "ALUCARD": 8, "SAPPHIRE": 9, "STRIFE": 10, "LOCKHART": 11,
 }
 
 
@@ -3204,8 +3204,8 @@ async def ensure_voice_connection(guild, channel_id, *, respect_recovery_backoff
                 )
             ):
                 if not (VOICE_FORCE_STALE_CLIENT_REJOIN or allow_stale_rejoin):
-                    logger.warning(f"[{guild.id}] Voice client looks unstable, but this caller is not allowed to force a disconnect/rejoin; leaving it alone for Aria-managed recovery.")
-                    return voice_client
+                    logger.warning(f"[{guild.id}] Voice client looks unstable and cannot be recycled by this caller; requeueing instead of playing into a stale voice session.")
+                    return None
                 try:
                     await voice_client.disconnect()
                 except Exception:
