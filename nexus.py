@@ -2517,16 +2517,27 @@ async def persist_voice_state(guild_id, channel_id=None, *, text_channel_id=None
         logger.exception("[nexus] Failed to persist voice state for guild %s", guild_id)
 
 
-async def mark_voice_disconnected(guild_id, channel_id=None, *, desired_connected=True, reason="voice_disconnect"):
+async def mark_voice_disconnected(guild_id, channel_id=None, *, desired_connected=True, reason="voice_disconnect", position=None):
     await persist_voice_state(guild_id, channel_id, desired_connected=desired_connected, connected=False, last_error=reason)
+    try:
+        if position is None and (guild_id in playback_tracking or str(guild_id) in playback_tracking):
+            position = current_track_position(guild_id)
+    except Exception:
+        position = None
     try:
         async with DBPoolManager() as pool:
             async with pool.acquire() as conn:
                 async with conn.cursor() as cur:
-                    await cur.execute(
-                        "UPDATE nexus_playback_state SET is_playing = FALSE, is_paused = FALSE WHERE guild_id = %s AND bot_name = 'nexus'",
-                        (guild_id,),
-                    )
+                    if position is None:
+                        await cur.execute(
+                            "UPDATE nexus_playback_state SET is_playing = FALSE, is_paused = FALSE WHERE guild_id = %s AND bot_name = 'nexus'",
+                            (guild_id,),
+                        )
+                    else:
+                        await cur.execute(
+                            "UPDATE nexus_playback_state SET is_playing = FALSE, is_paused = FALSE, position_seconds = %s WHERE guild_id = %s AND bot_name = 'nexus'",
+                            (normalize_position_seconds(position), guild_id),
+                        )
     except Exception:
         logger.exception("[nexus] Failed to mark playback disconnected for guild %s", guild_id)
 
@@ -3995,7 +4006,7 @@ async def derive_recovery_state_from_db(guild_id):
         return None
 
     start_position = int(playback_position or 0)
-    if not playback_is_playing and queue_count > 0:
+    if queue_count > 0 and not has_playback_state:
         start_position = 0
 
     return {
@@ -4162,13 +4173,13 @@ async def on_voice_state_update(member, before, after):
                 clear_recovery_retry(guild_id)
                 clear_voice_disconnect_grace(guild_id)
                 await remember_recovery_state(guild_id, remembered_channel_id, position)
-                await mark_voice_disconnected(guild_id, remembered_channel_id, desired_connected=True, reason="voice_disconnect_rejoin_disabled")
+                await mark_voice_disconnected(guild_id, remembered_channel_id, desired_connected=True, reason="voice_disconnect_rejoin_disabled", position=position)
                 logger.warning(f"[{guild_id}] Voice link dropped unexpectedly. Bot-side leave/rejoin recovery is disabled; preserving playback state at {position}s for Aria-managed recovery.")
                 return
             freeze_playback_for_soft_disconnect(guild_id, position)
             recovering_guilds.discard(guild_id)
             await remember_recovery_state(guild_id, remembered_channel_id, position)
-            await mark_voice_disconnected(guild_id, remembered_channel_id, desired_connected=True, reason="voice_disconnect_soft_grace")
+            await mark_voice_disconnected(guild_id, remembered_channel_id, desired_connected=True, reason="voice_disconnect_soft_grace", position=position)
             scheduled = schedule_soft_voice_recovery(guild_id, remembered_channel_id, start_position=position, reason="voice_disconnect")
             if scheduled:
                 logger.warning(f"[{guild_id}] Voice link dropped unexpectedly. Holding playback state for {int(VOICE_DISCONNECT_GRACE_SECONDS)}s before recovery from {position}s.")
@@ -5143,7 +5154,7 @@ async def filter_cmd(interaction: discord.Interaction, mode: str):
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
                 if mode != 'none': await cur.execute("UPDATE nexus_guild_settings SET filter_mode = %s, custom_modifiers_left = 0 WHERE guild_id = %s", (mode, interaction.guild.id))
-                else: await cur.execute("UPDATE nexus_guild_settings SET filter_mode = %s WHERE guild_id = %s", (mode, interaction.guild.id))
+                else: await cur.execute("UPDATE nexus_guild_settings SET filter_mode = %s, custom_speed = 1.0, custom_pitch = 1.0, custom_modifiers_left = 0 WHERE guild_id = %s", (mode, interaction.guild.id))
     if interaction.guild.voice_client:
         wav_filters = wavelink.Filters()
         apply_filter_preset(wav_filters, mode)
