@@ -586,8 +586,10 @@ LAVALINK_URI = _normalize_lavalink_uri(LAVALINK_URI)
 LAVALINK_SEARCH_TIMEOUT_SECONDS = max(8.0, float(os.getenv(f"{BOT_ENV_PREFIX}_LAVALINK_SEARCH_TIMEOUT_SECONDS", os.getenv("LAVALINK_SEARCH_TIMEOUT_SECONDS", "25"))))
 LAVALINK_PLAY_TIMEOUT_SECONDS = max(8.0, float(os.getenv(f"{BOT_ENV_PREFIX}_LAVALINK_PLAY_TIMEOUT_SECONDS", os.getenv("LAVALINK_PLAY_TIMEOUT_SECONDS", "20"))))
 PLAYLIST_SYNC_EXTRACT_TIMEOUT_SECONDS = max(30.0, float(os.getenv(f"{BOT_ENV_PREFIX}_PLAYLIST_SYNC_EXTRACT_TIMEOUT_SECONDS", os.getenv("PLAYLIST_SYNC_EXTRACT_TIMEOUT_SECONDS", "180"))))
-POSITION_UPDATER_INTERVAL = max(5.0, float(os.getenv(f"{BOT_ENV_PREFIX}_POSITION_UPDATER_INTERVAL", "10")))
-POSITION_PERSIST_INTERVAL = max(POSITION_UPDATER_INTERVAL, float(os.getenv(f"{BOT_ENV_PREFIX}_POSITION_PERSIST_INTERVAL", "15")))
+POSITION_UPDATER_INTERVAL = max(2.0, float(os.getenv(f"{BOT_ENV_PREFIX}_POSITION_UPDATER_INTERVAL", os.getenv("POSITION_UPDATER_INTERVAL", "5"))))
+POSITION_PERSIST_INTERVAL = max(POSITION_UPDATER_INTERVAL, float(os.getenv(f"{BOT_ENV_PREFIX}_POSITION_PERSIST_INTERVAL", os.getenv("POSITION_PERSIST_INTERVAL", "5"))))
+POSITION_STATE_FILE_INTERVAL = max(POSITION_PERSIST_INTERVAL, float(os.getenv(f"{BOT_ENV_PREFIX}_POSITION_STATE_FILE_INTERVAL", os.getenv("POSITION_STATE_FILE_INTERVAL", "15"))))
+PLAYTIME_MIN_DELTA_SECONDS = max(1, int(os.getenv(f"{BOT_ENV_PREFIX}_PLAYTIME_MIN_DELTA_SECONDS", os.getenv("PLAYTIME_MIN_DELTA_SECONDS", "1"))))
 PLAYLIST_SYNC_INTERVAL = max(45.0, float(os.getenv(f"{BOT_ENV_PREFIX}_PLAYLIST_SYNC_INTERVAL", "90")))
 AUTO_HEAL_INTERVAL = max(15.0, float(os.getenv(f"{BOT_ENV_PREFIX}_AUTO_HEAL_INTERVAL", "20")))
 AUTO_IMPORT_IDLE_SECONDS = max(45.0, float(os.getenv(f"{BOT_ENV_PREFIX}_AUTO_IMPORT_IDLE_SECONDS", "45")))
@@ -694,6 +696,7 @@ recovering_guilds = set()
 process_queue_locks = {}
 voice_connect_locks = {}
 last_position_persist = {}
+last_state_file_persist = {}
 playlist_db_initialized = False
 playlist_db_lock = asyncio.Lock()
 recovery_retry_tasks = {}
@@ -821,7 +824,7 @@ def prune_runtime_state_cache():
                 break
             mapping.pop(removable, None)
 
-    for mapping in (last_position_persist, recovery_retry_counts, track_failure_counts, recovery_exhausted_until, idle_voice_since, auto_restore_snooze_until, resilience_queue_retry_after, voice_connect_inflight_until, vote_skip_sessions, metrics_last_errors, STATE_FILE_WRITE_CACHE, pending_voice_channels):
+    for mapping in (last_position_persist, last_state_file_persist, recovery_retry_counts, track_failure_counts, recovery_exhausted_until, idle_voice_since, auto_restore_snooze_until, resilience_queue_retry_after, voice_connect_inflight_until, vote_skip_sessions, metrics_last_errors, STATE_FILE_WRITE_CACHE, pending_voice_channels):
         prune_mapping(mapping)
 
 
@@ -1011,10 +1014,18 @@ async def flush_runtime_state_before_restart(reason: str = "restart"):
                     for guild_id, data in list(playback_tracking.items()):
                         try:
                             position = current_track_position(guild_id)
-                            await cur.execute(
-                                "UPDATE nexus_playback_state SET position_seconds = %s, is_playing = %s, is_paused = %s WHERE guild_id = %s AND bot_name = %s",
-                                (position, not bool(data.get('paused')), bool(data.get('paused')), guild_id, BOT_ENV_PREFIX.lower()),
+                            paused = bool(data.get('paused'))
+                            await persist_playback_checkpoint(
+                                cur,
+                                guild_id,
+                                data,
+                                position,
+                                channel_id=data.get('channel_id'),
+                                playing=not paused,
+                                paused=paused,
+                                connected=True,
                             )
+                            await save_state(guild_id)
                         except Exception:
                             logger.debug("[%s] Failed to flush playback position for guild %s before %s.", BOT_ENV_PREFIX.lower(), guild_id, reason, exc_info=True)
     except Exception:
@@ -1621,9 +1632,11 @@ async def init_db():
     async with DBPoolManager() as pool:
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
-                await cur.execute("CREATE TABLE IF NOT EXISTS nexus_playback_state (guild_id BIGINT, bot_name VARCHAR(50), channel_id BIGINT, video_url TEXT, position_seconds INT DEFAULT 0, is_playing BOOLEAN DEFAULT FALSE, is_paused BOOLEAN DEFAULT FALSE, title TEXT, PRIMARY KEY (guild_id, bot_name))")
+                await cur.execute("CREATE TABLE IF NOT EXISTS nexus_playback_state (guild_id BIGINT, bot_name VARCHAR(50), channel_id BIGINT, video_url TEXT, position_seconds INT DEFAULT 0, is_playing BOOLEAN DEFAULT FALSE, is_paused BOOLEAN DEFAULT FALSE, title TEXT, last_checkpoint_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, play_session_key VARCHAR(64) DEFAULT NULL, PRIMARY KEY (guild_id, bot_name))")
                 await safe_schema_execute(cur, "ALTER TABLE nexus_playback_state ADD COLUMN title TEXT")
                 await safe_schema_execute(cur, "ALTER TABLE nexus_playback_state ADD COLUMN is_paused BOOLEAN DEFAULT FALSE")
+                await safe_schema_execute(cur, "ALTER TABLE nexus_playback_state ADD COLUMN last_checkpoint_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP")
+                await safe_schema_execute(cur, "ALTER TABLE nexus_playback_state ADD COLUMN play_session_key VARCHAR(64) DEFAULT NULL")
                 await cur.execute("CREATE TABLE IF NOT EXISTS nexus_guild_settings (guild_id BIGINT PRIMARY KEY, home_vc_id BIGINT, volume INT DEFAULT 100, loop_mode VARCHAR(10) DEFAULT 'queue', filter_mode VARCHAR(20) DEFAULT 'none', dj_role_id BIGINT DEFAULT NULL, feedback_channel_id BIGINT DEFAULT NULL, transition_mode VARCHAR(10) DEFAULT 'off', fade_seconds FLOAT DEFAULT 3.0, fade_curve VARCHAR(20) DEFAULT 'linear', custom_speed FLOAT DEFAULT 1.0, custom_pitch FLOAT DEFAULT 1.0, custom_modifiers_left INT DEFAULT 0, dj_only_mode BOOLEAN DEFAULT FALSE, stay_in_vc BOOLEAN DEFAULT FALSE)")
                 await safe_schema_execute(cur, "ALTER TABLE nexus_guild_settings MODIFY loop_mode VARCHAR(10) DEFAULT 'queue'")
                 await safe_schema_execute(cur, "ALTER TABLE nexus_guild_settings ADD COLUMN fade_seconds FLOAT DEFAULT 3.0")
@@ -1906,6 +1919,25 @@ async def record_track_play_started(cur, guild_id, video_url, title, requester_i
         )
 
 
+async def record_track_play_resumed(cur, guild_id, video_url, title, requester_id):
+    if not video_url and not title:
+        return
+    url_key = _track_key(video_url, title)
+    await cur.execute(
+        "INSERT INTO nexus_track_intelligence (guild_id, url_key, video_url, title, last_requester_id, last_played, source) "
+        "VALUES (%s, %s, %s, %s, %s, NOW(), 'playback_resume') "
+        "ON DUPLICATE KEY UPDATE video_url = VALUES(video_url), title = VALUES(title), last_requester_id = VALUES(last_requester_id), last_played = NOW(), source = 'playback_resume'",
+        (guild_id, url_key, video_url, title, requester_id),
+    )
+    if requester_id:
+        await cur.execute(
+            "INSERT INTO nexus_user_track_affinity (guild_id, user_id, url_key, video_url, title, last_requested, score) "
+            "VALUES (%s, %s, %s, %s, %s, NOW(), 0.0) "
+            "ON DUPLICATE KEY UPDATE video_url = VALUES(video_url), title = VALUES(title), last_requested = NOW()",
+            (guild_id, requester_id, url_key, video_url, title),
+        )
+
+
 async def record_track_outcome(cur, guild_id, video_url, title, requester_id, *, outcome, listen_seconds=0):
     if not video_url and not title:
         return
@@ -2123,6 +2155,62 @@ def get_voice_connect_lock(guild_id):
 def invalidate_position_persist(guild_id):
     last_position_persist.pop(guild_id, None)
 
+def normalize_position_seconds(position, duration=None):
+    try:
+        value = max(0, int(float(position or 0)))
+    except (TypeError, ValueError):
+        value = 0
+    try:
+        duration_value = int(float(duration or 0))
+        if duration_value > 0:
+            value = min(value, duration_value)
+    except (TypeError, ValueError):
+        pass
+    return value
+
+def update_runtime_position_baseline(guild_id, position, *, channel_id=None, reset_listen_baseline=True):
+    position = normalize_position_seconds(position)
+    tracked = playback_tracking.get(guild_id) or playback_tracking.get(str(guild_id))
+    if tracked is not None:
+        tracked["offset"] = position
+        tracked["start_time"] = time.time()
+        tracked["last_position_checkpoint"] = position
+        if reset_listen_baseline:
+            tracked["last_listen_position"] = position
+    existing_state = guild_states.get(guild_id) or guild_states.get(str(guild_id)) or {}
+    voice_channel_id = channel_id or existing_state.get("voice_channel_id") or (tracked or {}).get("channel_id")
+    if voice_channel_id:
+        guild_states[guild_id] = {"voice_channel_id": voice_channel_id, "position": position}
+    invalidate_position_persist(guild_id)
+    return position
+
+def consume_realtime_listen_delta(data, position, *, playing=True):
+    if not data:
+        return 0
+    position = normalize_position_seconds(position, data.get("duration"))
+    if not playing:
+        data["last_listen_position"] = position
+        return 0
+    try:
+        previous = int(data.get("last_listen_position", data.get("offset", position)) or 0)
+    except (TypeError, ValueError):
+        previous = position
+    previous = normalize_position_seconds(previous, data.get("duration"))
+    if position < previous:
+        data["last_listen_position"] = position
+        return 0
+    delta = position - previous
+    if delta < PLAYTIME_MIN_DELTA_SECONDS:
+        return 0
+    data["last_listen_position"] = position
+    data["listen_seconds_committed"] = int(data.get("listen_seconds_committed") or 0) + delta
+    return delta
+
+async def reset_runtime_position_after_seek(guild_id, position, channel_id=None):
+    update_runtime_position_baseline(guild_id, position, channel_id=channel_id, reset_listen_baseline=True)
+    await save_state(guild_id)
+    last_state_file_persist[guild_id] = time.time()
+
 def current_track_position(guild_id, now=None):
     data = playback_tracking.get(guild_id) or playback_tracking.get(str(guild_id))
 
@@ -2163,6 +2251,65 @@ def current_track_position(guild_id, now=None):
     except Exception:
         pass
     return position
+
+async def persist_playback_checkpoint(cur, guild_id, data, position, *, channel_id=None, playing=True, paused=False, connected=True):
+    if not data:
+        return 0
+    bot_n = BOT_ENV_PREFIX.lower()
+    position = normalize_position_seconds(position, data.get("duration"))
+    url = data.get("url")
+    title = data.get("title")
+    requester_id = data.get("requester_id")
+    channel_id = channel_id or data.get("channel_id") or (guild_states.get(guild_id) or {}).get("voice_channel_id")
+    play_session_key = _track_key(url, title) if (url or title) else None
+
+    await cur.execute(
+        f"REPLACE INTO {bot_n}_playback_state (guild_id, bot_name, channel_id, video_url, position_seconds, is_playing, is_paused, title, play_session_key) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        (guild_id, bot_n, channel_id, url, position, bool(playing), bool(paused), title, play_session_key),
+    )
+    await cur.execute(
+        f"""
+        INSERT INTO {bot_n}_metrics
+            (guild_id, bot_name, voice_connected, connected_channel_id, player_connected, player_playing, player_paused,
+             is_playing_db, is_paused_db, position_seconds, recovery_pending)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE
+            voice_connected = VALUES(voice_connected),
+            connected_channel_id = VALUES(connected_channel_id),
+            player_connected = VALUES(player_connected),
+            player_playing = VALUES(player_playing),
+            player_paused = VALUES(player_paused),
+            is_playing_db = VALUES(is_playing_db),
+            is_paused_db = VALUES(is_paused_db),
+            position_seconds = VALUES(position_seconds),
+            recovery_pending = VALUES(recovery_pending)
+        """,
+        (guild_id, bot_n, bool(connected), channel_id, bool(connected), bool(playing), bool(paused), bool(playing), bool(paused), position, guild_id in recovering_guilds),
+    )
+
+    listen_delta = consume_realtime_listen_delta(data, position, playing=bool(playing))
+    if listen_delta > 0 and play_session_key:
+        await cur.execute(
+            f"""
+            INSERT INTO {bot_n}_track_intelligence
+                (guild_id, url_key, video_url, title, total_listen_seconds, last_requester_id, last_played, source)
+            VALUES (%s, %s, %s, %s, %s, %s, NOW(), 'playback_checkpoint')
+            ON DUPLICATE KEY UPDATE
+                video_url = VALUES(video_url),
+                title = VALUES(title),
+                total_listen_seconds = total_listen_seconds + VALUES(total_listen_seconds),
+                last_requester_id = VALUES(last_requester_id),
+                last_played = NOW(),
+                source = 'playback_checkpoint'
+            """,
+            (guild_id, play_session_key, url, title, listen_delta, requester_id),
+        )
+
+    data["last_position_checkpoint"] = position
+    data["last_checkpoint_at"] = time.time()
+    if channel_id:
+        guild_states[guild_id] = {"voice_channel_id": channel_id, "position": position}
+    return listen_delta
 
 def clear_auto_restore_snooze(guild_id):
     auto_restore_snooze_until.pop(guild_id, None)
@@ -2242,6 +2389,8 @@ def freeze_playback_for_soft_disconnect(guild_id, position=None):
     tracked["offset"] = frozen_position
     tracked["start_time"] = time.time()
     tracked["paused"] = True
+    tracked["last_position_checkpoint"] = frozen_position
+    tracked["last_listen_position"] = frozen_position
     tracked["voice_soft_disconnected"] = True
 
 def unfreeze_playback_after_voice_return(guild_id):
@@ -2250,6 +2399,7 @@ def unfreeze_playback_after_voice_return(guild_id):
         return
     tracked["start_time"] = time.time()
     tracked["paused"] = False
+    tracked["last_listen_position"] = normalize_position_seconds(tracked.get("offset", 0), tracked.get("duration"))
     tracked.pop("voice_soft_disconnected", None)
 
 async def _run_soft_voice_recovery_after_grace(guild_id, channel_id, position, reason, delay):
@@ -2312,9 +2462,15 @@ def schedule_soft_voice_recovery(guild_id, channel_id, *, start_position=0, reas
 async def remember_recovery_state(guild_id, channel_id, position=0):
     if not channel_id:
         return
-    guild_states[guild_id] = {"voice_channel_id": channel_id, "position": max(0, int(position))}
+    position = normalize_position_seconds(position)
+    guild_states[guild_id] = {"voice_channel_id": channel_id, "position": position}
+    tracked = playback_tracking.get(guild_id) or playback_tracking.get(str(guild_id))
+    if tracked is not None:
+        tracked["last_position_checkpoint"] = position
+        tracked["last_listen_position"] = position
     invalidate_position_persist(guild_id)
     await save_state(guild_id)
+    last_state_file_persist[guild_id] = time.time()
 
 
 
@@ -2555,11 +2711,17 @@ async def sync_pause_state(guild_id, paused: bool):
                         "UPDATE nexus_playback_state SET is_paused = %s, is_playing = %s, position_seconds = %s WHERE guild_id = %s AND bot_name = 'nexus'",
                         (bool(paused), not bool(paused), position, guild_id),
                     )
-        if guild_id in playback_tracking:
-            playback_tracking[guild_id]["offset"] = position
-            playback_tracking[guild_id]["start_time"] = time.time()
-            playback_tracking[guild_id]["paused"] = bool(paused)
-        invalidate_position_persist(guild_id)
+        tracked = playback_tracking.get(guild_id) or playback_tracking.get(str(guild_id))
+        if tracked is not None:
+            tracked["paused"] = bool(paused)
+        update_runtime_position_baseline(
+            guild_id,
+            position,
+            channel_id=(tracked or {}).get("channel_id"),
+            reset_listen_baseline=True,
+        )
+        await save_state(guild_id)
+        last_state_file_persist[guild_id] = time.time()
     except Exception:
         logger.exception("[nexus] Failed to sync pause state for guild %s.", guild_id)
 
@@ -3442,9 +3604,10 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
                             original_requester = track_data.get('requester_id', bot.user.id if bot.user else None)
                             try:
                                 if reason == "FINISHED":
-                                    listen_seconds = int(track_data.get('duration') or current_track_position(payload.player.guild.id) or 0)
+                                    final_position = int(track_data.get('duration') or current_track_position(payload.player.guild.id) or 0)
                                 else:
-                                    listen_seconds = int(current_track_position(payload.player.guild.id) or 0)
+                                    final_position = int(current_track_position(payload.player.guild.id) or track_data.get('last_position_checkpoint') or 0)
+                                listen_seconds = consume_realtime_listen_delta(track_data, final_position, playing=True) if track_data else max(0, final_position)
                                 await record_track_outcome(
                                     cur,
                                     payload.player.guild.id,
@@ -3623,16 +3786,19 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
                 # FIX: Execute auto-stage updater
                 schedule_named_task(f"stage_topic:{guild.id}", update_stage_topic(guild, title, requester_id))
 
-                await cur.execute("INSERT INTO nexus_history (guild_id, video_url, title, requester_id) VALUES (%s, %s, %s, %s)", (guild.id, url, title, requester_id))
-                await record_track_play_started(cur, guild.id, url, title, requester_id)
+                if start_position <= 0:
+                    await cur.execute("INSERT INTO nexus_history (guild_id, video_url, title, requester_id) VALUES (%s, %s, %s, %s)", (guild.id, url, title, requester_id))
+                    await record_track_play_started(cur, guild.id, url, title, requester_id)
+                else:
+                    await record_track_play_resumed(cur, guild.id, url, title, requester_id)
                 try:
                     await bot.change_presence(status=discord.Status.online, activity=discord.Activity(type=discord.ActivityType.listening, name=str(title).replace("\\n", " ").strip()[:120]))
                 except (Exception,):
                     pass
-                playback_tracking[guild.id] = {'start_time': time.time(), 'offset': start_position, 'url': url, 'channel_id': channel_id, 'title': title, 'duration': duration, 'speed': c_speed, 'current_filter': filter_mode, 'requester_id': requester_id, 'transition_mode': trans_mode, 'volume': vol, 'paused': False}
+                playback_tracking[guild.id] = {'start_time': time.time(), 'offset': start_position, 'url': url, 'channel_id': channel_id, 'title': title, 'duration': duration, 'speed': c_speed, 'current_filter': filter_mode, 'requester_id': requester_id, 'transition_mode': trans_mode, 'volume': vol, 'paused': False, 'last_position_checkpoint': start_position, 'last_listen_position': start_position, 'listen_seconds_committed': 0}
 
                 bot_n = os.path.basename(__file__).replace('.py', '')
-                await cur.execute(f"REPLACE INTO {bot_n}_playback_state (guild_id, bot_name, channel_id, video_url, position_seconds, is_playing, is_paused, title) VALUES (%s, '{bot_n}', %s, %s, %s, TRUE, FALSE, %s)", (guild.id, channel_id, url, start_position, title))
+                await cur.execute(f"REPLACE INTO {bot_n}_playback_state (guild_id, bot_name, channel_id, video_url, position_seconds, is_playing, is_paused, title, play_session_key) VALUES (%s, '{bot_n}', %s, %s, %s, TRUE, FALSE, %s, %s)", (guild.id, channel_id, url, start_position, title, _track_key(url, title)))
                 # Update persistent state
                 guild_states[guild.id] = {"voice_channel_id": channel_id, "position": start_position}
                 invalidate_position_persist(guild.id)
@@ -4047,11 +4213,40 @@ async def position_updater():
                     last_persist = last_position_persist.get(guild_id, 0)
                     if now - last_persist < POSITION_PERSIST_INTERVAL:
                         continue
-                    guild = bot.get_guild(guild_id)
-                    if guild and guild.voice_client and _player_is_playing(guild.voice_client):
+                    guild = bot.get_guild(int(guild_id)) if bot else None
+                    vc = guild.voice_client if guild else None
+                    connected = bool(vc and _voice_client_connected(vc))
+                    playing = bool(vc and _player_is_playing(vc))
+                    paused = bool(vc and _player_is_paused(vc)) or bool(data.get("paused"))
+                    if connected and (playing or paused):
                         pos = current_track_position(guild_id)
-                        await cur.execute("REPLACE INTO nexus_playback_state (guild_id, bot_name, channel_id, video_url, position_seconds, is_playing, is_paused, title) VALUES (%s, 'nexus', %s, %s, %s, TRUE, FALSE, %s)", (guild_id, data['channel_id'], data['url'], pos, data['title']))
+                    else:
+                        state_position = (guild_states.get(guild_id) or guild_states.get(str(guild_id)) or {}).get("position", 0)
+                        pos = normalize_position_seconds(data.get("last_position_checkpoint", data.get("offset", state_position)), data.get("duration"))
+                        playing = False
+                        paused = bool(data.get("paused") or data.get("voice_soft_disconnected"))
+                    channel_id = (
+                        getattr(getattr(vc, "channel", None), "id", None)
+                        or data.get("channel_id")
+                        or (guild_states.get(guild_id) or guild_states.get(str(guild_id)) or {}).get("voice_channel_id")
+                    )
+                    try:
+                        await persist_playback_checkpoint(
+                            cur,
+                            guild_id,
+                            data,
+                            pos,
+                            channel_id=channel_id,
+                            playing=playing,
+                            paused=paused,
+                            connected=connected,
+                        )
                         last_position_persist[guild_id] = now
+                        if now - last_state_file_persist.get(guild_id, 0) >= POSITION_STATE_FILE_INTERVAL:
+                            await save_state(guild_id)
+                            last_state_file_persist[guild_id] = now
+                    except Exception:
+                        logger.exception("[%s] Failed to persist realtime playback checkpoint for guild %s.", BOT_ENV_PREFIX.lower(), guild_id)
 
 # --- SETTINGS COMMANDS ---
 @bot.tree.command(name="nexus_main_sethome", description="Save this bot's default voice or stage channel for join, autoplay, and recovery behavior.")
@@ -5020,9 +5215,7 @@ async def seek(interaction: discord.Interaction, seconds: int):
     if interaction.guild.id not in playback_tracking: return await interaction.response.send_message("Nothing playing.", ephemeral=True)
     if interaction.guild.voice_client:
         await interaction.guild.voice_client.seek(seconds * 1000)
-        playback_tracking[interaction.guild.id]['offset'] = seconds
-        playback_tracking[interaction.guild.id]['start_time'] = time.time()
-        invalidate_position_persist(interaction.guild.id)
+        await reset_runtime_position_after_seek(interaction.guild.id, seconds, getattr(getattr(interaction.guild.voice_client, "channel", None), "id", None))
     await interaction.response.send_message(embed=discord.Embed(description=f"Seeked to {seconds}s", color=discord.Color.green()), ephemeral=True)
 
 @bot.tree.command(name="nexus_main_forward", description="Jump forward within the current track by the number of seconds you provide.")
@@ -5033,9 +5226,7 @@ async def forward(interaction: discord.Interaction, seconds: int):
     new_pos = current + seconds
     if interaction.guild.voice_client:
         await interaction.guild.voice_client.seek(new_pos * 1000)
-        playback_tracking[interaction.guild.id]['offset'] = new_pos
-        playback_tracking[interaction.guild.id]['start_time'] = time.time()
-        invalidate_position_persist(interaction.guild.id)
+        await reset_runtime_position_after_seek(interaction.guild.id, new_pos, getattr(getattr(interaction.guild.voice_client, "channel", None), "id", None))
     await interaction.response.send_message(embed=discord.Embed(description=f"Skipped forward {seconds}s", color=discord.Color.green()), ephemeral=True)
 
 @bot.tree.command(name="nexus_main_rewind", description="Jump backward within the current track by the number of seconds you provide.")
@@ -5046,9 +5237,7 @@ async def rewind(interaction: discord.Interaction, seconds: int):
     new_pos = max(0, current - seconds)
     if interaction.guild.voice_client:
         await interaction.guild.voice_client.seek(new_pos * 1000)
-        playback_tracking[interaction.guild.id]['offset'] = new_pos
-        playback_tracking[interaction.guild.id]['start_time'] = time.time()
-        invalidate_position_persist(interaction.guild.id)
+        await reset_runtime_position_after_seek(interaction.guild.id, new_pos, getattr(getattr(interaction.guild.voice_client, "channel", None), "id", None))
     await interaction.response.send_message(embed=discord.Embed(description=f"Rewound {seconds}s", color=discord.Color.green()), ephemeral=True)
 
 @bot.tree.command(name="nexus_main_replay", description="Restart the current track from the beginning without changing the queue.")
@@ -5057,9 +5246,7 @@ async def replay(interaction: discord.Interaction):
     if interaction.guild.id not in playback_tracking: return await interaction.response.send_message("Nothing playing.", ephemeral=True)
     if interaction.guild.voice_client:
         await interaction.guild.voice_client.seek(0)
-        playback_tracking[interaction.guild.id]['offset'] = 0
-        playback_tracking[interaction.guild.id]['start_time'] = time.time()
-        invalidate_position_persist(interaction.guild.id)
+        await reset_runtime_position_after_seek(interaction.guild.id, 0, getattr(getattr(interaction.guild.voice_client, "channel", None), "id", None))
     await interaction.response.send_message(embed=discord.Embed(description="Replaying song.", color=discord.Color.green()), ephemeral=True)
 
 # --- UTILITY & INFO ---
@@ -5102,9 +5289,7 @@ async def panel(interaction: discord.Interaction):
             new_pos = max(0, current - 10)
             if i.guild.voice_client:
                 await i.guild.voice_client.seek(new_pos * 1000)
-                playback_tracking[i.guild.id]['offset'] = new_pos
-                playback_tracking[i.guild.id]['start_time'] = time.time()
-                invalidate_position_persist(i.guild.id)
+                await reset_runtime_position_after_seek(i.guild.id, new_pos, getattr(getattr(i.guild.voice_client, "channel", None), "id", None))
             await i.response.send_message("Rewound 10 seconds.", ephemeral=True)
         @discord.ui.button(label="⏩ +10s", style=discord.ButtonStyle.secondary, row=1)
         async def fw(self, i: discord.Interaction, b: discord.ui.Button):
@@ -5114,9 +5299,7 @@ async def panel(interaction: discord.Interaction):
             new_pos = current + 10
             if i.guild.voice_client:
                 await i.guild.voice_client.seek(new_pos * 1000)
-                playback_tracking[i.guild.id]['offset'] = new_pos
-                playback_tracking[i.guild.id]['start_time'] = time.time()
-                invalidate_position_persist(i.guild.id)
+                await reset_runtime_position_after_seek(i.guild.id, new_pos, getattr(getattr(i.guild.voice_client, "channel", None), "id", None))
             await i.response.send_message("Skipped forward 10 seconds.", ephemeral=True)
         @discord.ui.button(label="🔀 Shuffle", style=discord.ButtonStyle.success, row=2)
         async def shuf(self, i: discord.Interaction, b: discord.ui.Button):
@@ -5747,12 +5930,13 @@ async def resilience_loop():
                         if restored <= 0 or not target_channel_id:
                             continue
 
-                        await remember_recovery_state(guild.id, target_channel_id, 0)
+                        restore_position = normalize_position_seconds(playback_row[2] if playback_row else 0)
+                        await remember_recovery_state(guild.id, target_channel_id, restore_position)
                         clear_idle_restore_state(guild.id)
-                        scheduled = schedule_recovery_retry(guild.id, target_channel_id, start_position=0, reason="idle_restore")
+                        scheduled = schedule_recovery_retry(guild.id, target_channel_id, start_position=restore_position, reason="idle_restore")
                         if scheduled:
-                            logger.info(f"[{guild.id}] Restored {restored} backup tracks after idle/home recovery.")
-                            schedule_named_task(f"idle_restore_process_queue:{guild.id}", process_queue(guild, target_channel_id, allow_recovery_restore=True))
+                            logger.info(f"[{guild.id}] Restored {restored} backup tracks after idle/home recovery at {restore_position}s.")
+                            schedule_named_task(f"idle_restore_process_queue:{guild.id}", process_queue(guild, target_channel_id, start_position=restore_position, allow_recovery_restore=True))
                         else:
                             logger.info(f"[{guild.id}] Idle/home voice rejoin recovery is disabled; preserved {restored} backup tracks without forcing a rejoin.")
     except Exception as e:
@@ -5789,13 +5973,14 @@ async def zombie_reaper_loop():
                                     )
                                     recovery_channel_id = getattr(getattr(vc, "channel", None), "id", None) or guild_states.get(guild.id, {}).get("voice_channel_id")
                                     if has_recovery_playback and recovery_channel_id:
-                                        await remember_recovery_state(guild.id, recovery_channel_id, 0)
+                                        restore_position = normalize_position_seconds(playback_row[2] if playback_row else 0)
+                                        await remember_recovery_state(guild.id, recovery_channel_id, restore_position)
                                         restored = await restore_queue_from_backup(cur, guild.id)
                                         if restored > 0:
                                             clear_idle_restore_state(guild.id)
-                                            scheduled = schedule_recovery_retry(guild.id, recovery_channel_id, start_position=0, reason="zombie_restore")
+                                            scheduled = schedule_recovery_retry(guild.id, recovery_channel_id, start_position=restore_position, reason="zombie_restore")
                                             if scheduled:
-                                                schedule_named_task(f"zombie_restore_process_queue:{guild.id}", process_queue(guild, recovery_channel_id, allow_recovery_restore=True))
+                                                schedule_named_task(f"zombie_restore_process_queue:{guild.id}", process_queue(guild, recovery_channel_id, start_position=restore_position, allow_recovery_restore=True))
                                             else:
                                                 logger.info(f"[{guild.id}] Zombie voice rejoin recovery is disabled; preserved backup tracks without forcing a rejoin.")
                                     else:
@@ -6192,7 +6377,7 @@ class SwarmIntelligence(commands.Cog):
                                             await cur.execute(f"UPDATE {self.bot_name}_playback_state SET is_playing = FALSE WHERE guild_id = %s AND bot_name = %s", (guild.id, self.bot_name))
                                             await send_webhook_log(self.bot.user.name if self.bot.user else "Unknown Node", "⚙️ Watchdog Cooldown", f"Stall persisted in `{guild.name}`; watchdog parked to prevent revival loop.", discord.Color.orange())
                                             continue
-                                        current_pos = int((now - track_info.get('start_time', now)) * track_info.get('speed', 1.0) + track_info.get('offset', 0))
+                                        current_pos = current_track_position(guild.id)
                                         await requeue_failed_track(
                                             cur,
                                             guild.id,
