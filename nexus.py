@@ -154,22 +154,57 @@ class DBPoolManager:
     _create_lock = asyncio.Lock()
     _last_ping = 0.0
 
+    @staticmethod
+    def _pool_closed(pool):
+        return pool is None or getattr(pool, "closed", False) or getattr(pool, "_closing", False)
+
+    @classmethod
+    async def _open_pool(cls):
+        await ensure_database_exists()
+        cls._pool = await aiomysql.create_pool(
+            minsize=DB_POOL_MINSIZE,
+            maxsize=DB_POOL_MAXSIZE,
+            **DB_CONFIG,
+        )
+        cls._last_ping = time.time()
+        return cls._pool
+
+    @classmethod
+    async def _ping_pool(cls, pool):
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT 1")
+        cls._last_ping = time.time()
+
+    @classmethod
+    async def _close_pool(cls, pool):
+        try:
+            pool.close()
+            await pool.wait_closed()
+        except Exception:
+            pass
+
     async def __aenter__(self):
         pool = DBPoolManager._pool
-        if pool is None or getattr(pool, "closed", False) or getattr(pool, "_closing", False):
+        needs_ping = (
+            not DBPoolManager._pool_closed(pool)
+            and time.time() - DBPoolManager._last_ping >= DB_POOL_PING_INTERVAL_SECONDS
+        )
+        if DBPoolManager._pool_closed(pool) or needs_ping:
             async with DBPoolManager._create_lock:
                 pool = DBPoolManager._pool
-                if pool is None or getattr(pool, "closed", False) or getattr(pool, "_closing", False):
-                    await ensure_database_exists()
-                    DBPoolManager._pool = await aiomysql.create_pool(
-                        minsize=DB_POOL_MINSIZE,
-                        maxsize=DB_POOL_MAXSIZE,
-                        **DB_CONFIG,
-                    )
-                    DBPoolManager._last_ping = time.time()
-        return DBPoolManager._pool
+                if DBPoolManager._pool_closed(pool):
+                    pool = await DBPoolManager._open_pool()
+                elif time.time() - DBPoolManager._last_ping >= DB_POOL_PING_INTERVAL_SECONDS:
+                    try:
+                        await DBPoolManager._ping_pool(pool)
+                    except Exception:
+                        logger.warning("[%s] DB pool keepalive failed; reopening pool.", BOT_ENV_PREFIX.lower(), exc_info=True)
+                        await DBPoolManager._close_pool(pool)
+                        pool = await DBPoolManager._open_pool()
+        return pool
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
+    async def __aexit__(self, _exc_type, _exc_val, _exc_tb):
         return False
 
 class HTTPSessionManager:
@@ -182,7 +217,7 @@ class HTTPSessionManager:
             connector = aiohttp.TCPConnector(limit=int(os.getenv(f"{BOT_ENV_PREFIX}_HTTP_CONNECTOR_LIMIT", os.getenv("MUSIC_BOT_HTTP_CONNECTOR_LIMIT", "32"))) if "BOT_ENV_PREFIX" in globals() else 32, ttl_dns_cache=300)
             HTTPSessionManager._session = aiohttp.ClientSession(timeout=timeout, connector=connector)
         return HTTPSessionManager._session
-    async def __aexit__(self, exc_type, exc_val, exc_tb): pass
+    async def __aexit__(self, _exc_type, _exc_val, _exc_tb): pass
 
 # --- LOGGING SETUP (console + host-visible per-bot rotating file) ---
 from logging.handlers import RotatingFileHandler
@@ -1344,7 +1379,7 @@ def _parse_lavalink_endpoint():
 async def _wait_for_lavalink_tcp(timeout: float = 1.5) -> bool:
     host, port = _parse_lavalink_endpoint()
     try:
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
+        _reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
         writer.close()
         try:
             await writer.wait_closed()
@@ -1528,10 +1563,6 @@ async def set_autodj_enabled(guild_id, enabled):
     invalidate_feature_caches(guild_id)
     _cache_set(AUTO_DJ_ENABLED_CACHE, int(guild_id), bool(enabled))
 
-async def build_autodj_query(cur, guild_id, listener_ids=None):
-    recommendation = await build_smart_recommendation(cur, guild_id, listener_ids=listener_ids)
-    return recommendation["query"]
-
 
 async def maybe_enqueue_autodj(cur, guild, channel_id):
     now = time.time()
@@ -1629,7 +1660,7 @@ async def safe_schema_execute(cur, sql, params=None, *, label: str = "schema boo
         else:
             logger.warning("[%s] %s failed: %s | %s", BOT_ENV_PREFIX.lower(), label, exc, preview, exc_info=True)
         return False
-    except asyncio.TimeoutError as exc:
+    except asyncio.TimeoutError:
         logger.warning("[%s] %s timed out: %s", BOT_ENV_PREFIX.lower(), label, preview, exc_info=True)
         return False
     except Exception as exc:
@@ -1744,20 +1775,6 @@ async def save_state(guild_id):
     else:
         STATE_FILE_WRITE_CACHE.pop(cache_key, None)
 
-async def load_states():
-    states = {}
-    for file in os.listdir():
-        if file.startswith("state_") and file.endswith(".json"):
-            try:
-                gid_text = file.replace("state_", "").replace(".json", "")
-                gid = int(gid_text)
-                with open(file, encoding="utf-8") as f:
-                    states[gid] = json.load(f)
-                STATE_FILE_WRITE_CACHE[gid] = json.dumps(states[gid], ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-            except Exception:
-                pass
-    return states
-
 async def delete_state(guild_id):
     for key in (guild_id, str(guild_id)):
         guild_states.pop(key, None)
@@ -1867,22 +1884,6 @@ def _weighted_smart_pick(rows):
     upper, title, url, reason, weight = choices[-1]
     return {"title": title, "video_url": url, "reason": reason, "weight": weight}
 
-
-async def record_track_queued(cur, guild_id, video_url, title, requester_id):
-    url_key = _track_key(video_url, title)
-    await cur.execute(
-        "INSERT INTO nexus_track_intelligence (guild_id, url_key, video_url, title, queued_count, last_requester_id, last_queued, source) "
-        "VALUES (%s, %s, %s, %s, 1, %s, NOW(), 'queue') "
-        "ON DUPLICATE KEY UPDATE video_url = VALUES(video_url), title = VALUES(title), queued_count = queued_count + 1, last_requester_id = VALUES(last_requester_id), last_queued = NOW(), source = 'queue'",
-        (guild_id, url_key, video_url, title, requester_id),
-    )
-    if requester_id:
-        await cur.execute(
-            "INSERT INTO nexus_user_track_affinity (guild_id, user_id, url_key, video_url, title, queued_count, last_requested, score) "
-            "VALUES (%s, %s, %s, %s, %s, 1, NOW(), 0.15) "
-            "ON DUPLICATE KEY UPDATE video_url = VALUES(video_url), title = VALUES(title), queued_count = queued_count + 1, last_requested = NOW(), score = score + 0.15",
-            (guild_id, requester_id, url_key, video_url, title),
-        )
 
 async def bulk_record_tracks_queued(cur, guild_id, tracks):
     """Bulk-update queue intelligence for rows shaped as (video_url, title, requester_id)."""
@@ -4134,7 +4135,7 @@ async def on_wavelink_node_ready(payload: wavelink.NodeReadyEventPayload):
         logger.error(f"Auto-resume error: {e}")
 
 @bot.event
-async def on_wavelink_node_closed(node: wavelink.Node, disconnected):
+async def on_wavelink_node_closed(_node: wavelink.Node, _disconnected):
     logger.warning("⚠️ Lavalink connection lost. Reconnecting Lavalink only; bot-side voice leave/rejoin recovery stays disabled so Aria can coordinate recovery.")
     ensure_lavalink_connection_task()
     if not VOICE_DISCONNECT_REJOIN_RECOVERY:
@@ -5295,7 +5296,7 @@ async def panel(interaction: discord.Interaction):
     class AdvancedPanel(discord.ui.View):
         def __init__(self): super().__init__(timeout=None)
         @discord.ui.button(label="⏯️ Play/Pause", style=discord.ButtonStyle.primary, row=0)
-        async def pr(self, i: discord.Interaction, b: discord.ui.Button):
+        async def pr(self, i: discord.Interaction, _button: discord.ui.Button):
             if not await is_dj(i): return
             vc = i.guild.voice_client
             if vc:
@@ -5309,20 +5310,20 @@ async def panel(interaction: discord.Interaction):
                     await i.response.send_message("▶️ Playback Resumed", ephemeral=True)
             else: await i.response.send_message("Nothing is playing.", ephemeral=True)
         @discord.ui.button(label="⏹️ Stop", style=discord.ButtonStyle.danger, row=0)
-        async def st(self, i: discord.Interaction, b: discord.ui.Button):
+        async def st(self, i: discord.Interaction, _button: discord.ui.Button):
             if not await is_dj(i): return
             snooze_auto_restore(i.guild.id)
             await stop_playback(i.guild)
             await i.response.send_message("⏹️ Stopped and cleared state", ephemeral=True)
         @discord.ui.button(label="⏭️ Skip", style=discord.ButtonStyle.secondary, row=0)
-        async def sk(self, i: discord.Interaction, b: discord.ui.Button):
+        async def sk(self, i: discord.Interaction, _button: discord.ui.Button):
             if not await is_dj(i): return
             if i.guild.voice_client:
                 await i.guild.voice_client.stop()
                 await i.response.send_message("⏭️ Skipped to next track", ephemeral=True)
             else: await i.response.send_message("Nothing to skip.", ephemeral=True)
         @discord.ui.button(label="⏪ -10s", style=discord.ButtonStyle.secondary, row=1)
-        async def rw(self, i: discord.Interaction, b: discord.ui.Button):
+        async def rw(self, i: discord.Interaction, _button: discord.ui.Button):
             if not await is_dj(i): return
             if i.guild.id not in playback_tracking: return await i.response.send_message("Nothing playing.", ephemeral=True)
             current = current_track_position(i.guild.id)
@@ -5332,7 +5333,7 @@ async def panel(interaction: discord.Interaction):
                 await reset_runtime_position_after_seek(i.guild.id, new_pos, getattr(getattr(i.guild.voice_client, "channel", None), "id", None))
             await i.response.send_message("Rewound 10 seconds.", ephemeral=True)
         @discord.ui.button(label="⏩ +10s", style=discord.ButtonStyle.secondary, row=1)
-        async def fw(self, i: discord.Interaction, b: discord.ui.Button):
+        async def fw(self, i: discord.Interaction, _button: discord.ui.Button):
             if not await is_dj(i): return
             if i.guild.id not in playback_tracking: return await i.response.send_message("Nothing playing.", ephemeral=True)
             current = current_track_position(i.guild.id)
@@ -5342,7 +5343,7 @@ async def panel(interaction: discord.Interaction):
                 await reset_runtime_position_after_seek(i.guild.id, new_pos, getattr(getattr(i.guild.voice_client, "channel", None), "id", None))
             await i.response.send_message("Skipped forward 10 seconds.", ephemeral=True)
         @discord.ui.button(label="🔀 Shuffle", style=discord.ButtonStyle.success, row=2)
-        async def shuf(self, i: discord.Interaction, b: discord.ui.Button):
+        async def shuf(self, i: discord.Interaction, _button: discord.ui.Button):
             if not await is_dj(i): return
             await i.response.defer(ephemeral=True)
             async with DBPoolManager() as pool:
@@ -5353,7 +5354,7 @@ async def panel(interaction: discord.Interaction):
                         await snapshot_queue_backup(cur, i.guild.id)
             await i.followup.send("🔀 Queue successfully shuffled!")
         @discord.ui.button(label="📜 View Queue", style=discord.ButtonStyle.secondary, row=2)
-        async def vq(self, i: discord.Interaction, b: discord.ui.Button):
+        async def vq(self, i: discord.Interaction, _button: discord.ui.Button):
             await i.response.defer(ephemeral=True)
             async with DBPoolManager() as pool:
                 async with pool.acquire() as conn:
@@ -5858,7 +5859,7 @@ async def ensure_swarm_command_tables():
             return True
         except Exception as exc:
             now = time.time()
-            swarm_command_tables_retry_after = now + max(5.0, min(60.0, SWARM_BRIDGE_DB_ERROR_LOG_INTERVAL_SECONDS))
+            swarm_command_tables_retry_after = now + SWARM_COMMAND_TABLES_RECHECK_SECONDS
             if now - _last_swarm_bridge_db_error_log_at >= SWARM_BRIDGE_DB_ERROR_LOG_INTERVAL_SECONDS:
                 _last_swarm_bridge_db_error_log_at = now
                 logger.warning("Swarm command tables unavailable for nexus; bridge listeners will retry: %s", exc)
@@ -6361,7 +6362,7 @@ class SwarmIntelligence(commands.Cog):
     @tasks.loop(seconds=15)
     async def status_updater(self):
         try:
-            title, guild_name = await self._best_presence_title()
+            title, _guild_name = await self._best_presence_title()
             if title:
                 activity_type = discord.ActivityType.listening
                 activity_name = str(title).replace("\n", " ").strip()[:120]
