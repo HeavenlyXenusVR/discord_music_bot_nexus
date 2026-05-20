@@ -6,6 +6,10 @@ __pycache__/
 *.log.*
 .env
 .env.*
+cookies.txt
 *.sqlite3
 .DS_Store
+*.backup-*
+*.bak
+.aria_patch_backups/
 *.backup-smart-ai-*

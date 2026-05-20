@@ -94,6 +94,16 @@ aiohttp.ClientSession._request = patched__request
 # --- ENHANCED ROBUST WEBHOOK DISPATCHER ---
 WEBHOOK_URL = os.getenv('NEXUS_WEBHOOK_URL', '').strip()
 
+
+def _redact_secret_text(value):
+    text = str(value or "")
+    if not text:
+        return ""
+    redacted = re.sub(r"https://discord(?:app)?[.]com/api/webhooks/[0-9]+/[^ )\x27\"]+", "https://discord.com/api/webhooks/[REDACTED]", text, flags=re.I)
+    redacted = re.sub(r"https://api[.]telegram[.]org/bot[^/ )\x27\"]+", "https://api.telegram.org/bot[REDACTED]", redacted, flags=re.I)
+    redacted = re.sub(r"(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY|WEBHOOK)[A-Z0-9_]*=)([^\s]+)", r"\1[REDACTED]", redacted)
+    return redacted
+
 async def send_webhook_log(bot_name, title, description, color, retries=3, image_url=None, fields=None):
     if not WEBHOOK_URL or WEBHOOK_URL == 'PASTE_YOUR_NEW_WEBHOOK_URL_HERE':
         return
@@ -116,7 +126,7 @@ async def send_webhook_log(bot_name, title, description, color, retries=3, image
             return
         except Exception as e:
             if attempt < retries - 1: await asyncio.sleep(2 ** attempt)
-            else: logger.error(f"❌ Webhook Dispatch Failed: {e}")
+            else: logger.error(f"❌ Webhook Dispatch Failed: {_redact_secret_text(e)}")
 
 async def ensure_database_exists():
     """Create this bot's MariaDB schema before opening the normal pooled connection."""
@@ -470,7 +480,7 @@ async def send_error_webhook_log(bot_name, title, description, color=discord.Col
             if attempt < retries - 1:
                 await asyncio.sleep(2 ** attempt)
             else:
-                logger.warning("[%s] Error webhook dispatch failed: %s", BOT_ENV_PREFIX, exc, exc_info=True)
+                logger.warning("[%s] Error webhook dispatch failed: %s", BOT_ENV_PREFIX, _redact_secret_text(exc))
 
 
 async def report_runtime_error(title, error=None, *, description=None, traceback_text=None, guild_id=None, error_type="runtime", level="error"):
@@ -3311,7 +3321,7 @@ def _fade_curve_progress(progress, curve='smooth'):
     progress = max(0.0, min(1.0, float(progress)))
     curve = str(curve or 'smooth').lower()
     if curve in {'smooth', 'ease'}:
-        return progress * progress * progress * (progress * (progress * 6 - 15) + 10)
+        return progress
     if curve in {'ease_in', 'slow_start'}:
         return progress * progress * progress
     if curve in {'ease_out', 'soft_land'}:
@@ -3323,7 +3333,7 @@ async def _fade_volume(voice_client, start_volume, end_volume, duration=3.0, ste
     if not voice_client:
         return
     duration = max(0.25, min(12.0, float(duration or 3.0)))
-    steps = steps or max(4, min(24, int(duration * 4)))
+    steps = steps or max(8, min(120, int(duration * 12)))
     step_delay = duration / steps if steps > 0 else duration
     last_volume = None
     for step in range(steps + 1):
@@ -3654,6 +3664,13 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
                                             "DELETE FROM nexus_queue_backup WHERE guild_id = %s AND bot_name = 'nexus' AND video_url = %s AND title = %s LIMIT 1",
                                             (payload.player.guild.id, track_uri, track_title),
                                         )
+                                    original_url = track_data.get('original_queue_url')
+                                    original_title = track_data.get('original_queue_title')
+                                    if original_url and original_title and (original_url != track_uri or original_title != track_title):
+                                        await cur.execute(
+                                            "DELETE FROM nexus_queue_backup WHERE guild_id = %s AND bot_name = 'nexus' AND video_url = %s AND title = %s LIMIT 1",
+                                            (payload.player.guild.id, original_url, original_title),
+                                        )
         except Exception as e:
             logger.error(f"[{payload.player.guild.id}] Looping logic DB error: {e}")
         _te_channel_id = (
@@ -3721,6 +3738,7 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
                     return
 
                 song_id, url, title, requester_id = next_song
+                original_queue_url, original_queue_title = url, title
                 await cur.execute("DELETE FROM nexus_queue WHERE id = %s AND guild_id = %s AND bot_name = 'nexus'", (song_id, guild.id))
                 try:
                     track, resolved_source = await resolve_queue_track(url, title)
@@ -3763,7 +3781,7 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
 
                     c_speed = apply_filter_preset(wav_filters, filter_mode, c_speed)
 
-                    await voice_client.set_filters(wav_filters)
+                    await replace_audio_filters(voice_client, wav_filters)
 
                     if trans_mode in {'fade', 'smart'} and start_position <= 0:
                         await voice_client.set_volume(0)
@@ -3806,7 +3824,7 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
                     await bot.change_presence(status=discord.Status.online, activity=discord.Activity(type=discord.ActivityType.listening, name=str(title).replace("\\n", " ").strip()[:120]))
                 except (Exception,):
                     pass
-                playback_tracking[guild.id] = {'start_time': time.time(), 'offset': start_position, 'url': url, 'channel_id': channel_id, 'title': title, 'duration': duration, 'speed': c_speed, 'current_filter': filter_mode, 'requester_id': requester_id, 'transition_mode': trans_mode, 'volume': vol, 'paused': False, 'last_position_checkpoint': start_position, 'last_listen_position': start_position, 'listen_seconds_committed': 0}
+                playback_tracking[guild.id] = {'start_time': time.time(), 'offset': start_position, 'url': url, 'channel_id': channel_id, 'title': title, 'original_queue_url': original_queue_url, 'original_queue_title': original_queue_title, 'duration': duration, 'speed': c_speed, 'current_filter': filter_mode, 'requester_id': requester_id, 'transition_mode': trans_mode, 'volume': vol, 'paused': False, 'last_position_checkpoint': start_position, 'last_listen_position': start_position, 'listen_seconds_committed': 0}
 
                 bot_n = os.path.basename(__file__).replace('.py', '')
                 await cur.execute(f"REPLACE INTO {bot_n}_playback_state (guild_id, bot_name, channel_id, video_url, position_seconds, is_playing, is_paused, title, play_session_key) VALUES (%s, '{bot_n}', %s, %s, %s, TRUE, FALSE, %s, %s)", (guild.id, channel_id, url, start_position, title, _track_key(url, title)))
@@ -4001,12 +4019,12 @@ async def derive_recovery_state_from_db(guild_id):
 
     channel_id = playback_channel_id or voice_channel_id or home_channel_id
     has_playback_state = bool((playback_is_playing or playback_position > 0) and (playback_url or playback_title))
-    has_recoverable_state = bool(channel_id and (has_playback_state or queue_count > 0))
+    has_recoverable_state = bool(channel_id and (has_playback_state or queue_count > 0 or backup_count > 0 or playback_url or playback_title))
     if not has_recoverable_state:
         return None
 
     start_position = int(playback_position or 0)
-    if queue_count > 0 and not has_playback_state:
+    if (queue_count > 0 or backup_count > 0) and not has_playback_state:
         start_position = 0
 
     return {
@@ -4748,6 +4766,7 @@ async def bump(interaction: discord.Interaction, index: int):
                     return await interaction.response.send_message("Invalid index.", ephemeral=True)
                 await cur.execute("DELETE FROM nexus_queue WHERE id = %s AND guild_id = %s AND bot_name = 'nexus'", (row[0], interaction.guild.id))
                 await insert_queue_front(cur, "nexus_queue", interaction.guild.id, "nexus", row[1], row[2], row[3])
+                await snapshot_queue_backup(cur, interaction.guild.id)
     await interaction.response.send_message(embed=discord.Embed(description=f"⬆️ Moved **{row[2]}** to play next.", color=discord.Color.green()), ephemeral=True)
 
 @bot.tree.command(name="nexus_main_clearmine", description="Remove your own queued songs without touching other listeners' tracks")
@@ -5114,6 +5133,16 @@ def apply_filter_preset(wav_filters, mode, current_speed=1.0):
         _safe_filter_call(mode, lambda: wav_filters.equalizer.set(bands=[(0, 0.18), (1, 0.12), (8, 0.08), (9, 0.10)]))
     return speed
 
+async def replace_audio_filters(voice_client, wav_filters):
+    if not voice_client:
+        return
+    try:
+        await voice_client.set_filters(wavelink.Filters())
+        await asyncio.sleep(0.05)
+    except Exception:
+        logger.debug("[%s] Audio filter reset skipped before replacement.", BOT_ENV_PREFIX.lower(), exc_info=True)
+    await voice_client.set_filters(wav_filters)
+
 # --- MODIFIERS & FILTERS ---
 @bot.tree.command(name="nexus_main_volume", description="Set the playback volume for this server from 1 to 200 percent.")
 async def volume(interaction: discord.Interaction, vol: int):
@@ -5153,12 +5182,12 @@ async def filter_cmd(interaction: discord.Interaction, mode: str):
     async with DBPoolManager() as pool:
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
-                if mode != 'none': await cur.execute("UPDATE nexus_guild_settings SET filter_mode = %s, custom_modifiers_left = 0 WHERE guild_id = %s", (mode, interaction.guild.id))
+                if mode != 'none': await cur.execute("UPDATE nexus_guild_settings SET filter_mode = %s, custom_speed = 1.0, custom_pitch = 1.0, custom_modifiers_left = 0 WHERE guild_id = %s", (mode, interaction.guild.id))
                 else: await cur.execute("UPDATE nexus_guild_settings SET filter_mode = %s, custom_speed = 1.0, custom_pitch = 1.0, custom_modifiers_left = 0 WHERE guild_id = %s", (mode, interaction.guild.id))
     if interaction.guild.voice_client:
         wav_filters = wavelink.Filters()
         apply_filter_preset(wav_filters, mode)
-        try: await interaction.guild.voice_client.set_filters(wav_filters)
+        try: await replace_audio_filters(interaction.guild.voice_client, wav_filters)
         except Exception: pass
     await interaction.followup.send(embed=discord.Embed(description=f"🎛️ Filter set to: **{mode}**.", color=discord.Color.blurple()), ephemeral=True)
 
@@ -5215,7 +5244,7 @@ async def modify_audio(interaction: discord.Interaction, speed: float = 1.0, pit
     if interaction.guild.voice_client:
         wav_filters = wavelink.Filters()
         wav_filters.timescale.set(speed=speed, pitch=pitch)
-        try: await interaction.guild.voice_client.set_filters(wav_filters)
+        try: await replace_audio_filters(interaction.guild.voice_client, wav_filters)
         except Exception: pass
     await interaction.followup.send(embed=discord.Embed(title="🎛️ Audio Modifiers Set", description=f"**Speed:** {speed}x\n**Pitch:** {pitch}x\n*Active for the next {duration} track(s).* ", color=discord.Color.gold()), ephemeral=True)
 
@@ -5319,13 +5348,9 @@ async def panel(interaction: discord.Interaction):
             async with DBPoolManager() as pool:
                 async with pool.acquire() as conn:
                     async with conn.cursor() as cur:
-                        await cur.execute("SELECT id, video_url, title, requester_id FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus'", (i.guild.id,))
-                        q = await cur.fetchall()
-                        if not q: return await i.followup.send("Queue empty.")
-                        l = list(q); random.shuffle(l)
-                        await cur.execute("DELETE FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus'", (i.guild.id,))
-                        for row in l:
-                            await enqueue_track(cur, i.guild.id, row[1], row[2], row[3], backup=False)
+                        queue_len = await shuffle_queue_rows(cur, i.guild.id, preserve_first=False)
+                        if not queue_len: return await i.followup.send("Queue empty.")
+                        await snapshot_queue_backup(cur, i.guild.id)
             await i.followup.send("🔀 Queue successfully shuffled!")
         @discord.ui.button(label="📜 View Queue", style=discord.ButtonStyle.secondary, row=2)
         async def vq(self, i: discord.Interaction, b: discord.ui.Button):
@@ -5756,7 +5781,7 @@ async def aria_command_listener():
                                         f_mode = res[0]
                                         wav_filters = wavelink.Filters()
                                         apply_filter_preset(wav_filters, f_mode)
-                                        try: await vc.set_filters(wav_filters)
+                                        try: await replace_audio_filters(vc, wav_filters)
                                         except Exception: pass
                     executed = True
 
