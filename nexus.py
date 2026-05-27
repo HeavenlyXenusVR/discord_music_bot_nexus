@@ -810,6 +810,7 @@ queue_playback_claims = {}
 recovery_exhausted_until = {}
 voice_disconnect_grace_tasks = {}
 interrupt_resume_tasks = {}
+interrupt_resume_armed_until = {}
 idle_voice_since = {}
 auto_restore_snooze_until = {}
 resilience_queue_retry_after = {}
@@ -980,7 +981,7 @@ def prune_runtime_state_cache():
                 break
             mapping.pop(removable, None)
 
-    for mapping in (last_position_persist, player_position_report_state, player_position_stall_warning_at, last_state_file_persist, recovery_retry_counts, track_failure_counts, recovery_exhausted_until, idle_voice_since, auto_restore_snooze_until, resilience_queue_retry_after, voice_connect_inflight_until, vote_skip_sessions, metrics_last_errors, STATE_FILE_WRITE_CACHE, pending_voice_channels):
+    for mapping in (last_position_persist, player_position_report_state, player_position_stall_warning_at, last_state_file_persist, recovery_retry_counts, track_failure_counts, recovery_exhausted_until, idle_voice_since, auto_restore_snooze_until, resilience_queue_retry_after, voice_connect_inflight_until, interrupt_resume_armed_until, vote_skip_sessions, metrics_last_errors, STATE_FILE_WRITE_CACHE, pending_voice_channels):
         prune_mapping(mapping)
 
 
@@ -1334,6 +1335,14 @@ INTERRUPT_RESUME_GRACE_SECONDS = max(
     3.0,
     float(os.getenv(f"{BOT_ENV_PREFIX}_INTERRUPT_RESUME_GRACE_SECONDS", os.getenv("INTERRUPT_RESUME_GRACE_SECONDS", "10"))),
 )
+INTERRUPT_RESUME_MIN_POSITION_SECONDS = max(
+    1,
+    int(os.getenv(f"{BOT_ENV_PREFIX}_INTERRUPT_RESUME_MIN_POSITION_SECONDS", os.getenv("INTERRUPT_RESUME_MIN_POSITION_SECONDS", "5"))),
+)
+INTERRUPT_RESUME_COOLDOWN_SECONDS = max(
+    INTERRUPT_RESUME_GRACE_SECONDS,
+    float(os.getenv(f"{BOT_ENV_PREFIX}_INTERRUPT_RESUME_COOLDOWN_SECONDS", os.getenv("INTERRUPT_RESUME_COOLDOWN_SECONDS", "20"))),
+)
 PERSISTENT_VOICE_RESTORE_ON_STARTUP = os.getenv(f"{BOT_ENV_PREFIX}_PERSISTENT_VOICE_RESTORE_ON_STARTUP", os.getenv("PERSISTENT_VOICE_RESTORE_ON_STARTUP", "true")).strip().lower() not in {"0", "false", "off", "no"}
 VOICE_FORCE_STALE_CLIENT_REJOIN = os.getenv(f"{BOT_ENV_PREFIX}_VOICE_FORCE_STALE_CLIENT_REJOIN", os.getenv("VOICE_FORCE_STALE_CLIENT_REJOIN", "false")).strip().lower() not in {"0", "false", "off", "no"}
 VOICE_IDLE_REJOIN_RECOVERY = os.getenv(f"{BOT_ENV_PREFIX}_VOICE_IDLE_REJOIN_RECOVERY", os.getenv("VOICE_IDLE_REJOIN_RECOVERY", "false")).strip().lower() not in {"0", "false", "off", "no"}
@@ -1368,6 +1377,10 @@ QUEUE_SPREAD_FAMILY_GAP = max(
 QUEUE_SPREAD_HISTORY_WINDOW = max(
     QUEUE_SPREAD_FAMILY_GAP + 1,
     int(os.getenv(f"{BOT_ENV_PREFIX}_QUEUE_SPREAD_HISTORY_WINDOW", os.getenv("QUEUE_SPREAD_HISTORY_WINDOW", "8"))),
+)
+QUEUE_SPREAD_REORDER_LIMIT = max(
+    24,
+    int(os.getenv(f"{BOT_ENV_PREFIX}_QUEUE_SPREAD_REORDER_LIMIT", os.getenv("QUEUE_SPREAD_REORDER_LIMIT", "240"))),
 )
 FEEDBACK_NOTICE_TTL_SECONDS = max(
     15.0,
@@ -1426,7 +1439,7 @@ GLOBAL_DISCORD_LOGIN_GATE_MAX_WAIT_SECONDS = max(60.0, float(os.getenv(f"{BOT_EN
 MUSIC_BOT_RUNTIME_DIR = os.getenv(f"{BOT_ENV_PREFIX}_RUNTIME_DIR", os.getenv("MUSIC_BOT_RUNTIME_DIR", "/app/.runtime"))
 BOT_STAGGER_SLOTS = {
     "GWS": 0, "HARMONIC": 1, "MAESTRO": 2, "MELODIC": 3, "NEXUS": 4, "RHYTHM": 5,
-    "SYMPHONY": 6, "TUNESTREAM": 7, "ALUCARD": 8, "SAPPHIRE": 9, "STRIFE": 10, "LOCKHART": 11,
+    "SYMPHONY": 6, "TUNESTREAM": 7, "NEXUS": 8, "SAPPHIRE": 9, "STRIFE": 10, "LOCKHART": 11,
 }
 
 
@@ -1990,6 +2003,10 @@ async def init_db():
                     "UPDATE nexus_playback_state SET play_session_key = track_uid "
                     "WHERE track_uid IS NOT NULL AND track_uid <> ''"
                 )
+                await dedupe_queue_table_by_track_uid(cur, "nexus_queue", bot_name="nexus")
+                await dedupe_queue_table_by_track_uid(cur, "nexus_queue_backup", bot_name="nexus")
+                await safe_schema_execute(cur, "CREATE UNIQUE INDEX nexus_queue_track_uid_unique_idx ON nexus_queue (guild_id, bot_name, track_uid)")
+                await safe_schema_execute(cur, "CREATE UNIQUE INDEX nexus_queue_backup_track_uid_unique_idx ON nexus_queue_backup (guild_id, bot_name, track_uid)")
                 playlist_db_initialized = True
                 logger.info("Database tables verified/created for NEXUS.")
 
@@ -2078,8 +2095,22 @@ def _row_value(row, key_or_index, default=None):
     return default
 
 
+def _coerce_text(value, default="", *, limit=512):
+    if value is None:
+        return default
+    try:
+        text = value if isinstance(value, str) else str(value)
+    except Exception:
+        return default
+    if not isinstance(text, str):
+        return default
+    if limit and len(text) > limit:
+        return text[:limit]
+    return text
+
+
 def _normalize_track_uid(value):
-    text = re.sub(r"[^0-9a-fA-F]", "", str(value or "")).lower()
+    text = re.sub(r"[^0-9a-fA-F]", "", _coerce_text(value, "", limit=96)).lower()
     return text[:32] if len(text) >= 16 else ""
 
 
@@ -2117,7 +2148,7 @@ def _track_uid_label(track_uid):
 
 
 def _compact_track_title(title, limit=72):
-    text = re.sub(r"\s+", " ", str(title or "").strip())
+    text = re.sub(r"\s+", " ", _coerce_text(title, "", limit=max(limit * 4, 288)).strip())
     return text if len(text) <= limit else f"{text[:limit - 1]}…"
 
 
@@ -2131,7 +2162,7 @@ def _queue_family_key(row):
     if " - " in cleaned:
         cleaned = cleaned.split(" - ", 1)[0].strip()
     if not cleaned and title:
-        cleaned = re.sub(r"\s+", " ", str(title).lower()).strip()
+        cleaned = re.sub(r"\s+", " ", _coerce_text(title, "", limit=256).lower()).strip()
     if not cleaned:
         return _track_key(url, title)
     return hashlib.sha1(cleaned.encode("utf-8", "ignore")).hexdigest()
@@ -2154,9 +2185,9 @@ def _queue_spacing_score(candidate, recent_exact, recent_family, remaining_exact
 
 
 def _track_key(video_url, title=None):
-    raw = str(video_url or "").strip()
+    raw = _coerce_text(video_url, "", limit=2048).strip()
     if not raw and title:
-        raw = f"title:{title}"
+        raw = f"title:{_coerce_text(title, 'unknown', limit=256)}"
     try:
         parsed = urllib.parse.urlparse(raw)
         host = (parsed.netloc or "").lower().replace("www.", "")
@@ -2174,12 +2205,12 @@ def _track_key(video_url, title=None):
         pass
     normalized = re.sub(r"\s+", " ", raw.lower()).strip()
     if not normalized:
-        normalized = re.sub(r"\s+", " ", str(title or "unknown").lower()).strip()
+        normalized = re.sub(r"\s+", " ", _coerce_text(title, "unknown", limit=256).lower()).strip()
     return hashlib.sha1(normalized.encode("utf-8", "ignore")).hexdigest()
 
 
 def _clean_smart_title(title):
-    cleaned = re.sub(r"https?://\S+", " ", str(title or ""))
+    cleaned = re.sub(r"https?://\S+", " ", _coerce_text(title, "", limit=512))
     cleaned = re.sub(r"\s*\([^)]*\)|\s*\[[^\]]*\]", " ", cleaned)
     cleaned = re.sub(r"(?i)\b(official|video|audio|lyrics?|visualizer|remaster(?:ed)?|hd|hq|mv)\b", " ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" -_|")
@@ -2867,6 +2898,7 @@ def clear_recovery_retry(guild_id):
 
 def clear_interrupt_resume(guild_id):
     resume_task = interrupt_resume_tasks.pop(guild_id, None)
+    interrupt_resume_armed_until.pop(guild_id, None)
     current_task = asyncio.current_task()
     if resume_task and resume_task is not current_task and not resume_task.done():
         resume_task.cancel()
@@ -2961,12 +2993,20 @@ async def _run_targeted_interrupt_resume(guild_id, channel_id, position, reason,
         await asyncio.sleep(delay)
         if recovery_backoff_remaining(guild_id) > 0:
             return
+        if voice_connect_inflight_remaining(guild_id) > 0:
+            return
+        guild = bot.get_guild(int(guild_id))
+        if guild:
+            vc = guild.voice_client
+            if vc and _player_is_active(vc):
+                return
         state = await derive_recovery_state_from_db(guild_id)
         if not state:
             return
         state["voice_channel_id"] = int(state.get("voice_channel_id") or channel_id or 0)
         state["position"] = max(0, int(state.get("position", position) or position or 0))
-        guild = bot.get_guild(int(guild_id))
+        if state.get("position", 0) < INTERRUPT_RESUME_MIN_POSITION_SECONDS:
+            return
         if guild:
             await send_feedback_notice(
                 guild,
@@ -2990,12 +3030,23 @@ async def _run_targeted_interrupt_resume(guild_id, channel_id, position, reason,
 def schedule_targeted_interrupt_resume(guild_id, channel_id, *, start_position=0, reason="voice_interrupt"):
     if not TARGETED_TRACK_INTERRUPT_RECOVERY or not channel_id:
         return False
+    guild_id = int(guild_id)
+    position = max(0, int(start_position or 0))
+    if position < INTERRUPT_RESUME_MIN_POSITION_SECONDS:
+        return False
+    if recovery_backoff_remaining(guild_id) > 0 or voice_connect_inflight_remaining(guild_id) > 0:
+        return False
     existing = interrupt_resume_tasks.get(guild_id)
     if existing and not existing.done():
         return False
+    now = time.time()
+    armed_until = interrupt_resume_armed_until.get(guild_id, 0)
+    if armed_until > now:
+        return False
     delay = INTERRUPT_RESUME_GRACE_SECONDS + random.uniform(0.0, min(3.0, VOICE_DISCONNECT_GRACE_JITTER_SECONDS))
-    task = asyncio.create_task(_run_targeted_interrupt_resume(int(guild_id), int(channel_id), int(start_position or 0), str(reason or "voice_interrupt"), delay))
-    interrupt_resume_tasks[int(guild_id)] = task
+    task = asyncio.create_task(_run_targeted_interrupt_resume(guild_id, int(channel_id), position, str(reason or "voice_interrupt"), delay))
+    interrupt_resume_tasks[guild_id] = task
+    interrupt_resume_armed_until[guild_id] = now + INTERRUPT_RESUME_COOLDOWN_SECONDS
     return True
 
 def _track_feedback_fields(track_uid=None, position=None):
@@ -3298,11 +3349,23 @@ async def sync_pause_state(guild_id, paused: bool):
     except Exception:
         logger.exception("[nexus] Failed to sync pause state for guild %s.", guild_id)
 
-async def insert_queue_front(cur, table_name, guild_id, bot_name, video_url, title, requester_id, track_uid=None, max_attempts=5):
+async def insert_queue_front(cur, table_name, guild_id, bot_name, video_url, title, requester_id, track_uid=None, max_attempts=5, dedupe_identity=False):
     if not re.fullmatch(r"[A-Za-z0-9_]+", table_name):
         raise ValueError(f"Unsafe table name: {table_name}")
 
     track_uid = _ensure_track_uid(track_uid)
+    existing = await find_existing_queue_row(
+        cur,
+        table_name,
+        guild_id,
+        bot_name,
+        track_uid=track_uid,
+        video_url=video_url,
+        title=title,
+        match_identity=dedupe_identity,
+    )
+    if existing:
+        return int(_row_value(existing, "id", _row_value(existing, 0, 0)) or 0)
     for attempt in range(max_attempts):
         await cur.execute(f"SELECT COALESCE(MIN(id), 0) AS min_id FROM {table_name}")
         min_row = await cur.fetchone()
@@ -3315,31 +3378,70 @@ async def insert_queue_front(cur, table_name, guild_id, bot_name, video_url, tit
             return new_id
         except aiomysql.IntegrityError as e:
             if e.args and e.args[0] == 1062 and attempt < max_attempts - 1:
+                existing = await find_existing_queue_row(
+                    cur,
+                    table_name,
+                    guild_id,
+                    bot_name,
+                    track_uid=track_uid,
+                    video_url=video_url,
+                    title=title,
+                    match_identity=dedupe_identity,
+                )
+                if existing:
+                    return int(_row_value(existing, "id", _row_value(existing, 0, 0)) or 0)
+                track_uid = _ensure_track_uid()
                 await asyncio.sleep(0.05 * (attempt + 1))
                 continue
             raise
 
 async def snapshot_queue_backup(cur, guild_id):
+    removed_live_dupes = await dedupe_queue_table_by_track_uid(cur, "nexus_queue", guild_id=guild_id, bot_name="nexus")
+    if removed_live_dupes > 0:
+        logger.warning("[%s] Removed %s duplicate live queue row(s) before rebuilding backup snapshot.", guild_id, removed_live_dupes)
     await cur.execute("SELECT video_url, title, requester_id, track_uid FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus' ORDER BY id ASC", (guild_id,))
-    rows = await cur.fetchall()
-    if not rows:
-        return 0
-    await cur.execute("DELETE FROM nexus_queue_backup WHERE guild_id = %s AND bot_name = 'nexus'", (guild_id,))
+    rows = list(await cur.fetchall() or [])
     insert_data = []
+    seen_track_uids = set()
+    skipped_duplicates = 0
     for row in rows:
+        normalized_uid = _ensure_track_uid(_row_track_uid(row, 3))
+        if normalized_uid in seen_track_uids:
+            skipped_duplicates += 1
+            continue
+        seen_track_uids.add(normalized_uid)
         insert_data.append((
             guild_id,
             'nexus',
             _row_value(row, "video_url", _row_value(row, 0)),
             _row_value(row, "title", _row_value(row, 1)),
             _row_value(row, "requester_id", _row_value(row, 2)),
-            _ensure_track_uid(_row_track_uid(row, 3)),
+            normalized_uid,
         ))
-    if insert_data:
-        await cur.executemany(
-            "INSERT INTO nexus_queue_backup (guild_id, bot_name, video_url, title, requester_id, track_uid) VALUES (%s, %s, %s, %s, %s, %s)",
-            insert_data,
-        )
+    try:
+        await cur.execute("START TRANSACTION")
+        await cur.execute("DELETE FROM nexus_queue_backup WHERE guild_id = %s AND bot_name = 'nexus'", (guild_id,))
+        if insert_data:
+            await cur.executemany(
+                """
+                INSERT INTO nexus_queue_backup (guild_id, bot_name, video_url, title, requester_id, track_uid)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    video_url = VALUES(video_url),
+                    title = VALUES(title),
+                    requester_id = VALUES(requester_id)
+                """,
+                insert_data,
+            )
+        await cur.execute("COMMIT")
+    except Exception:
+        try:
+            await cur.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    if skipped_duplicates > 0:
+        logger.warning("[%s] Skipped %s duplicate live queue row(s) while rebuilding backup snapshot.", guild_id, skipped_duplicates)
     return len(insert_data)
 
 async def backup_track(cur, guild_id, video_url, title, requester_id, track_uid=None):
@@ -3351,11 +3453,16 @@ async def backup_track(cur, guild_id, video_url, title, requester_id, track_uid=
     existing = await cur.fetchone()
     if existing and int(_scalar_from_row(existing, 0) or 0) > 0:
         return 0
-    await cur.execute(
-        "INSERT INTO nexus_queue_backup (guild_id, bot_name, video_url, title, requester_id, track_uid) VALUES (%s, 'nexus', %s, %s, %s, %s)",
-        (guild_id, video_url, title, requester_id, track_uid),
-    )
-    return track_uid
+    try:
+        await cur.execute(
+            "INSERT INTO nexus_queue_backup (guild_id, bot_name, video_url, title, requester_id, track_uid) VALUES (%s, 'nexus', %s, %s, %s, %s)",
+            (guild_id, video_url, title, requester_id, track_uid),
+        )
+        return track_uid
+    except aiomysql.IntegrityError as e:
+        if e.args and e.args[0] == 1062:
+            return 0
+        raise
 
 
 async def delete_backup_track(cur, guild_id, *, track_uid=None, video_url=None, title=None):
@@ -3377,10 +3484,19 @@ async def delete_backup_track(cur, guild_id, *, track_uid=None, video_url=None, 
 
 async def enqueue_track(cur, guild_id, video_url, title, requester_id, *, backup=True, track_uid=None):
     track_uid = _ensure_track_uid(track_uid)
-    await cur.execute(
-        "INSERT INTO nexus_queue (guild_id, bot_name, video_url, title, requester_id, track_uid) VALUES (%s, 'nexus', %s, %s, %s, %s)",
-        (guild_id, video_url, title, requester_id, track_uid),
-    )
+    for attempt in range(5):
+        try:
+            await cur.execute(
+                "INSERT INTO nexus_queue (guild_id, bot_name, video_url, title, requester_id, track_uid) VALUES (%s, 'nexus', %s, %s, %s, %s)",
+                (guild_id, video_url, title, requester_id, track_uid),
+            )
+            break
+        except aiomysql.IntegrityError as e:
+            if e.args and e.args[0] == 1062 and attempt < 4:
+                track_uid = _ensure_track_uid()
+                await asyncio.sleep(0.01 * (attempt + 1))
+                continue
+            raise
     if backup:
         try:
             await bulk_record_tracks_queued(cur, guild_id, [(video_url, title, requester_id)])
@@ -3400,8 +3516,12 @@ def _queue_source_identity(row):
     title = _row_value(row, "title", _row_value(row, 4, _row_value(row, 1, "")))
     return _track_key(url, title)
 
-def _spread_duplicate_tracks(rows, previous_row=None):
+def _spread_duplicate_tracks(rows, previous_row=None, *, reorder_limit=None):
     remaining = list(rows)
+    tail = []
+    if reorder_limit and len(remaining) > reorder_limit:
+        tail = remaining[reorder_limit:]
+        remaining = remaining[:reorder_limit]
     arranged = []
     recent_exact = deque(maxlen=QUEUE_SPREAD_HISTORY_WINDOW)
     recent_family = deque(maxlen=QUEUE_SPREAD_HISTORY_WINDOW)
@@ -3425,7 +3545,7 @@ def _spread_duplicate_tracks(rows, previous_row=None):
         remaining_exact[source_identity] = max(0, int(remaining_exact.get(source_identity, 0)) - 1)
         if remaining_exact.get(source_identity, 0) <= 0:
             remaining_exact.pop(source_identity, None)
-    return arranged
+    return arranged + tail
 
 def claim_live_queue_track(guild_id, video_url, title, track_uid=None):
     """Mark the dequeued row as in-flight so parity repair will not resurrect it too early."""
@@ -3455,6 +3575,86 @@ def current_live_queue_claim_key(guild_id):
         queue_playback_claims.pop(key, None)
         return ""
     return track_key
+
+
+async def dedupe_queue_table_by_track_uid(cur, table_name, *, guild_id=None, bot_name=None):
+    if not re.fullmatch(r"[A-Za-z0-9_]+", table_name):
+        raise ValueError(f"Unsafe table name: {table_name}")
+
+    where = ["track_uid IS NOT NULL", "track_uid <> ''"]
+    params = []
+    if guild_id is not None:
+        where.append("guild_id = %s")
+        params.append(int(guild_id))
+    if bot_name is not None:
+        where.append("bot_name = %s")
+        params.append(str(bot_name))
+
+    await cur.execute(
+        f"SELECT id, guild_id, bot_name, track_uid FROM {table_name} WHERE {' AND '.join(where)} ORDER BY guild_id ASC, bot_name ASC, track_uid ASC, id ASC",
+        tuple(params),
+    )
+    rows = list(await cur.fetchall() or [])
+    if not rows:
+        return 0
+
+    seen = set()
+    duplicate_ids = []
+    for row in rows:
+        normalized_uid = _normalize_track_uid(_row_track_uid(row, 3))
+        row_id = _row_value(row, "id", _row_value(row, 0))
+        row_guild_id = int(_row_value(row, "guild_id", _row_value(row, 1, 0)) or 0)
+        row_bot_name = str(_row_value(row, "bot_name", _row_value(row, 2, "")) or "")
+        if not normalized_uid or row_id is None:
+            continue
+        dedupe_key = (row_guild_id, row_bot_name, normalized_uid)
+        if dedupe_key in seen:
+            duplicate_ids.append(int(row_id))
+            continue
+        seen.add(dedupe_key)
+
+    deleted = 0
+    for row_id in duplicate_ids:
+        await cur.execute(f"DELETE FROM {table_name} WHERE id = %s", (row_id,))
+        deleted += max(0, int(getattr(cur, "rowcount", 0) or 0))
+    return deleted
+
+
+async def find_existing_queue_row(cur, table_name, guild_id, bot_name, *, track_uid=None, video_url=None, title=None, match_identity=False):
+    if not re.fullmatch(r"[A-Za-z0-9_]+", table_name):
+        raise ValueError(f"Unsafe table name: {table_name}")
+
+    normalized_uid = _normalize_track_uid(track_uid)
+    if normalized_uid:
+        await cur.execute(
+            f"SELECT id, video_url, title, track_uid FROM {table_name} WHERE guild_id = %s AND bot_name = %s AND track_uid = %s ORDER BY id ASC LIMIT 1",
+            (guild_id, bot_name, normalized_uid),
+        )
+        row = await cur.fetchone()
+        if row:
+            return row
+
+    if not match_identity:
+        return None
+
+    target_identity = _track_instance_identity(normalized_uid, video_url, title)
+    if not target_identity:
+        return None
+
+    await cur.execute(
+        f"SELECT id, video_url, title, track_uid FROM {table_name} WHERE guild_id = %s AND bot_name = %s ORDER BY id ASC",
+        (guild_id, bot_name),
+    )
+    rows = list(await cur.fetchall() or [])
+    for row in rows:
+        row_identity = _track_instance_identity(
+            _row_track_uid(row, 3),
+            _row_value(row, "video_url", _row_value(row, 1, "")),
+            _row_value(row, "title", _row_value(row, 2, "")),
+        )
+        if row_identity == target_identity:
+            return row
+    return None
 
 
 async def delete_live_queue_copies(cur, guild_id, video_url, title, track_uid=None):
@@ -3501,7 +3701,8 @@ async def shuffle_queue_rows(cur, guild_id, *, preserve_first=True):
     if preserve_first:
         head = [rows.pop(0)]
     random.shuffle(rows)
-    rows = head + _spread_duplicate_tracks(rows, head[-1] if head else None)
+    reorder_limit = max(1, QUEUE_SPREAD_REORDER_LIMIT - len(head))
+    rows = head + _spread_duplicate_tracks(rows, head[-1] if head else None, reorder_limit=reorder_limit)
 
     # Queue leak fix: this function used to DELETE the live queue and then
     # reinsert rows while autocommit was enabled. A DB hiccup between those
@@ -3540,11 +3741,13 @@ async def requeue_finished_track(cur, guild_id, video_url, title, requester_id, 
     await enqueue_track(cur, guild_id, video_url, title, requester_id, backup=False, track_uid=track_uid)
     return await shuffle_queue_rows(cur, guild_id, preserve_first=True)
 
-async def prime_loop_queue_defaults(cur, guild_id):
+async def prime_loop_queue_defaults(cur, guild_id, *, shuffle_if_needed=True):
     await cur.execute(
         "INSERT INTO nexus_guild_settings (guild_id, loop_mode) VALUES (%s, 'queue') ON DUPLICATE KEY UPDATE loop_mode = 'queue'",
         (guild_id,),
     )
+    if not shuffle_if_needed:
+        return 0
     return await shuffle_queue_rows(cur, guild_id, preserve_first=True)
 
 async def restore_queue_from_backup(cur, guild_id, requester_id=None):
@@ -3554,6 +3757,9 @@ async def restore_queue_from_backup(cur, guild_id, requester_id=None):
     if queue_count:
         return 0
 
+    removed_backup_dupes = await dedupe_queue_table_by_track_uid(cur, "nexus_queue_backup", guild_id=guild_id, bot_name="nexus")
+    if removed_backup_dupes > 0:
+        logger.warning("[%s] Removed %s duplicate backup queue row(s) before restoring live queue.", guild_id, removed_backup_dupes)
     await cur.execute("SELECT video_url, title, requester_id, track_uid FROM nexus_queue_backup WHERE guild_id = %s AND bot_name = 'nexus' ORDER BY id ASC", (guild_id,))
     rows = list(await cur.fetchall() or [])
     if not rows:
@@ -3583,6 +3789,16 @@ async def repair_queue_backup_parity(cur, guild_id, *, reason="queue_integrity",
     durable copy.  When a backup row is missing from live, remove one stale live
     row if needed, then copy the exact backup row back into live.
     """
+    removed_live_dupes = await dedupe_queue_table_by_track_uid(cur, "nexus_queue", guild_id=guild_id, bot_name="nexus")
+    removed_backup_dupes = await dedupe_queue_table_by_track_uid(cur, "nexus_queue_backup", guild_id=guild_id, bot_name="nexus")
+    if removed_live_dupes or removed_backup_dupes:
+        logger.warning(
+            "[%s] Removed duplicate queue rows before parity repair (live=%s, backup=%s) after %s.",
+            guild_id,
+            removed_live_dupes,
+            removed_backup_dupes,
+            reason,
+        )
     await cur.execute("SELECT id, video_url, title, requester_id, track_uid FROM nexus_queue_backup WHERE guild_id = %s AND bot_name = 'nexus' ORDER BY id ASC", (guild_id,))
     backup_rows = list(await cur.fetchall() or [])
     await cur.execute("SELECT id, video_url, title, requester_id, track_uid FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus' ORDER BY id ASC", (guild_id,))
@@ -3701,6 +3917,7 @@ async def repair_queue_backup_parity(cur, guild_id, *, reason="queue_integrity",
             _row_value(row, "title", _row_value(row, 2)),
             _row_value(row, "requester_id", _row_value(row, 3)),
             _ensure_track_uid(_row_track_uid(row, 4)),
+            dedupe_identity=True,
         )
         restored_live += 1
 
@@ -3796,6 +4013,7 @@ async def restore_active_playback_entry(cur, guild_id, requester_id=None):
         title or "Resumed Track",
         requester_id if requester_id is not None else (bot.user.id if bot.user else None),
         track_uid,
+        dedupe_identity=True,
     )
     return 1
 
@@ -4030,8 +4248,74 @@ def _current_player_track_key(player):
     return _track_key(getattr(track, "uri", None) or getattr(track, "url", None), _track_title_from_obj(track))
 
 
-async def apply_resume_seek(voice_client, guild_id, start_position):
-    """Seek restored playback and keep checkpoints honest if Lavalink never confirms it."""
+def _track_uid_from_obj(track):
+    if not track:
+        return ""
+    extras = getattr(track, "extras", None)
+    try:
+        if extras:
+            if hasattr(extras, "track_uid"):
+                normalized = _normalize_track_uid(getattr(extras, "track_uid", None))
+                if normalized:
+                    return normalized
+            normalized = _normalize_track_uid(dict(extras).get("track_uid"))
+            if normalized:
+                return normalized
+    except Exception:
+        pass
+    for attr in ("track_uid", "play_session_key"):
+        try:
+            normalized = _normalize_track_uid(getattr(track, attr, None))
+            if normalized:
+                return normalized
+        except Exception:
+            continue
+    return ""
+
+
+def _current_player_track_identity(player):
+    track = _player_current_track(player)
+    if not track:
+        return ""
+    return _track_instance_identity(
+        _track_uid_from_obj(track),
+        getattr(track, "uri", None) or getattr(track, "url", None),
+        _track_title_from_obj(track),
+    )
+
+
+def _apply_track_runtime_extras(track, *, track_uid=None, requester_id=None, queue_url=None, queue_title=None, resume_position=0):
+    if not track:
+        return
+    extras = {}
+    try:
+        current_extras = getattr(track, "extras", None)
+        if current_extras:
+            extras.update(dict(current_extras))
+    except Exception:
+        pass
+    normalized_uid = _ensure_track_uid(track_uid) if track_uid else ""
+    if normalized_uid:
+        extras["track_uid"] = normalized_uid
+        extras["play_session_key"] = normalized_uid
+    if requester_id is not None:
+        try:
+            extras["requester_id"] = int(requester_id)
+        except Exception:
+            extras["requester_id"] = requester_id
+    if queue_url:
+        extras["queue_url"] = queue_url
+    if queue_title:
+        extras["queue_title"] = queue_title
+    extras["resume_position_seconds"] = max(0, int(resume_position or 0))
+    try:
+        track.extras = extras
+    except Exception:
+        logger.debug("[%s] Failed to attach runtime extras to playable.", BOT_ENV_PREFIX.lower(), exc_info=True)
+
+
+async def apply_resume_seek(voice_client, guild_id, start_position, *, track_uid=None, video_url=None, title=None):
+    """Verify or repair restored playback position for the exact expected track instance."""
     start_position = normalize_position_seconds(start_position)
     if start_position <= 0:
         return 0
@@ -4040,18 +4324,28 @@ async def apply_resume_seek(voice_client, guild_id, start_position):
     verify_window = max(float(RESUME_SEEK_VERIFY_GRACE_SECONDS), retry_delay + 0.5)
     max_attempts = max(2, min(4, int(verify_window / max(retry_delay, 0.5)) + 1))
     last_reported = None
+    expected_identity = _track_instance_identity(track_uid, video_url, title)
 
     for attempt in range(1, max_attempts + 1):
-        await voice_client.seek(target_ms)
         try:
-            await asyncio.sleep(retry_delay)
+            await asyncio.sleep(max(0.75, retry_delay if attempt == 1 else retry_delay))
         except Exception:
             pass
+        current_identity = _current_player_track_identity(voice_client)
+        if expected_identity and current_identity and current_identity != expected_identity:
+            logger.warning(
+                "[%s] Resume verification is waiting for the expected track instance %s, but the player currently reports %s.",
+                guild_id,
+                expected_identity,
+                current_identity,
+            )
+            continue
         reported = _player_reported_position_seconds(voice_client)
         if reported is not None:
             last_reported = normalize_position_seconds(reported)
             if last_reported + RESUME_SEEK_VERIFY_GRACE_SECONDS >= start_position:
-                return start_position
+                return max(start_position, last_reported)
+        await voice_client.seek(target_ms)
         if attempt == 1 and max_attempts > 1:
             logger.warning(
                 "[%s] Resume seek verification saw player at %s after asking for %ss; retrying seek.",
@@ -4060,18 +4354,12 @@ async def apply_resume_seek(voice_client, guild_id, start_position):
                 start_position,
             )
 
-    fallback_position = start_position
     if last_reported is not None and last_reported > start_position:
-        fallback_position = last_reported
-    logger.warning(
-        "[%s] Resume seek could not verify %ss after %s attempt(s); player reported %s. Keeping %ss as the resume baseline so long tracks do not restart from the beginning.",
-        guild_id,
-        start_position,
-        max_attempts,
-        "unknown" if last_reported is None else f"{last_reported}s",
-        fallback_position,
+        return normalize_position_seconds(last_reported)
+    raise RuntimeError(
+        f"Resume verification failed for track {_track_uid_label(track_uid)} at {start_position}s; player reported "
+        f"{'unknown' if last_reported is None else f'{last_reported}s'}."
     )
-    return normalize_position_seconds(fallback_position)
 
 async def requeue_verified_playback_failure(guild, channel_id, url, title, requester_id, position, *, reason="track_exception", track_uid=None):
     attempts = mark_track_failure(guild.id, url, title)
@@ -4812,6 +5100,15 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
                     clear_live_queue_claim(guild.id, original_queue_url, original_queue_title, track_uid)
                     return
 
+                _apply_track_runtime_extras(
+                    track,
+                    track_uid=track_uid,
+                    requester_id=requester_id,
+                    queue_url=original_queue_url,
+                    queue_title=original_queue_title,
+                    resume_position=start_position,
+                )
+
                 voice_client = await ensure_voice_connection(guild, channel_id, respect_recovery_backoff=False, allow_stale_rejoin=allow_recovery_restore)
                 if not voice_client:
                     logger.warning(f"[{guild.id}] Voice connection unavailable. Requeueing '{title}' for recovery.")
@@ -4850,7 +5147,11 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
                     return
 
                 try:
-                    await asyncio.wait_for(voice_client.play(track), timeout=LAVALINK_PLAY_TIMEOUT_SECONDS)
+                    play_start_ms = int(max(0, start_position) * 1000)
+                    await asyncio.wait_for(
+                        voice_client.play(track, start=play_start_ms if play_start_ms > 0 else 0),
+                        timeout=LAVALINK_PLAY_TIMEOUT_SECONDS,
+                    )
                     # Do not clear Lavalink failure counters here. play() only means Lavalink accepted the track;
                     # the stream can still fail seconds later. Clear only after a clean FINISHED event.
                     # Seed runtime tracking immediately after Lavalink accepts play(), before resume seek verification.
@@ -4860,7 +5161,14 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
                     guild_states[guild.id] = {"voice_channel_id": channel_id, "position": start_position, "track_uid": track_uid, "url": url, "title": title}
                     invalidate_position_persist(guild.id)
                     if start_position > 0:
-                        start_position = await apply_resume_seek(voice_client, guild.id, start_position)
+                        start_position = await apply_resume_seek(
+                            voice_client,
+                            guild.id,
+                            start_position,
+                            track_uid=track_uid,
+                            video_url=url,
+                            title=title,
+                        )
                     elif trans_mode in {'fade', 'smart'}:
                         fade_duration = choose_fade_duration(trans_mode, fade_seconds, duration, filter_mode, title)
                         schedule_named_task(f"fade_volume:{guild.id}", _fade_volume(voice_client, 0, vol, duration=fade_duration, curve=fade_curve), overwrite=True)
@@ -6903,7 +7211,7 @@ async def playlist_sync_loop():
                 async with DBPoolManager() as pool:
                     async with pool.acquire() as conn:
                         async with conn.cursor() as cur:
-                            await prime_loop_queue_defaults(cur, guild_id)
+                            await prime_loop_queue_defaults(cur, guild_id, shuffle_if_needed=False)
                             await cur.execute("SELECT track_key, track_uid, video_url, title, requester_id FROM nexus_active_playlist_tracks WHERE guild_id = %s AND bot_name = 'nexus' ORDER BY position_idx ASC", (guild_id,))
                             previous_rows_raw = await cur.fetchall() or []
                             previous_rows = []
@@ -7829,7 +8137,7 @@ async def queue_integrity_check_loop():
                     # live queue is now completely empty.
                     await cur.execute(
                         """
-                        SELECT ps.guild_id, ps.video_url, ps.title, ps.channel_id, ps.position_seconds
+                        SELECT ps.guild_id, ps.video_url, ps.title, ps.channel_id, ps.position_seconds, ps.track_uid
                         FROM nexus_playback_state ps
                         WHERE ps.bot_name = 'nexus'
                           AND ps.video_url IS NOT NULL
@@ -7851,6 +8159,7 @@ async def queue_integrity_check_loop():
                         title = row.get("title") or ""
                         db_channel_id = row.get("channel_id")
                         position = int(row.get("position_seconds") or 0)
+                        playback_track_uid = _normalize_track_uid(row.get("track_uid"))
 
                         guild = bot.get_guild(guild_id)
                         if not guild:
@@ -7881,7 +8190,7 @@ async def queue_integrity_check_loop():
                             restored_url = video_url
                             restored_title = title or video_url
                             restored_requester = bot.user.id if bot.user else None
-                            restored_track_uid = _new_track_uid()
+                            restored_track_uid = playback_track_uid or _new_track_uid()
                             logger.warning(
                                 "[%s] Queue integrity check: '%s' was missing from live queue and "
                                 "no backup row matched resolved URI/title; restoring from playback state fallback at position %ss.",
@@ -7907,6 +8216,7 @@ async def queue_integrity_check_loop():
                             restored_title,
                             restored_requester,
                             restored_track_uid,
+                            dedupe_identity=True,
                         )
 
                         # Resolve the voice channel: prefer DB record, fall back to in-memory state
