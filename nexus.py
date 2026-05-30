@@ -1992,6 +1992,7 @@ async def init_db():
                 await safe_schema_execute(cur, "ALTER TABLE nexus_voice_state ADD COLUMN last_error TEXT NULL")
                 await safe_schema_execute(cur, "CREATE INDEX nexus_voice_state_rejoin_idx ON nexus_voice_state (bot_name, desired_connected, last_seen_at)")
                 await safe_schema_execute(cur, "CREATE INDEX nexus_metrics_status_idx ON nexus_metrics (bot_name, updated_at)")
+                await safe_schema_execute(cur, "ALTER TABLE nexus_metrics ADD COLUMN duration_seconds INT DEFAULT 0")
                 await cur.execute("CREATE TABLE IF NOT EXISTS nexus_active_playlists (guild_id BIGINT, bot_name VARCHAR(50), playlist_url TEXT, known_track_count INT DEFAULT 0, requester_id BIGINT, channel_id BIGINT DEFAULT NULL, PRIMARY KEY (guild_id, bot_name))")
                 await cur.execute("CREATE TABLE IF NOT EXISTS nexus_active_playlist_tracks (guild_id BIGINT, bot_name VARCHAR(50), playlist_url TEXT, position_idx INT DEFAULT 0, track_key CHAR(40), track_uid CHAR(32) DEFAULT NULL, video_url TEXT, title TEXT, requester_id BIGINT DEFAULT NULL, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)")
                 await safe_schema_execute(cur, "ALTER TABLE nexus_active_playlists ADD COLUMN channel_id BIGINT DEFAULT NULL")
@@ -3251,6 +3252,7 @@ async def collect_and_persist_metrics(guild=None):
                         player_playing = bool(vc and _player_is_playing(vc))
                         player_paused = bool(vc and _player_is_paused(vc))
                         live_position = current_track_position(g.id) if (player_playing or player_paused or g.id in playback_tracking) else 0
+                        live_duration = int(playback_tracking.get(g.id, {}).get('duration', 0)) if g.id in playback_tracking else 0
                         await cur.execute(
                             """
                             SELECT
@@ -3278,9 +3280,9 @@ async def collect_and_persist_metrics(guild=None):
                             """
                             REPLACE INTO nexus_metrics
                                 (guild_id, bot_name, voice_connected, connected_channel_id, player_connected, player_playing, player_paused,
-                                 queue_count, backup_queue_count, is_playing_db, is_paused_db, position_seconds, recovery_pending,
+                                 queue_count, backup_queue_count, is_playing_db, is_paused_db, position_seconds, duration_seconds, recovery_pending,
                                  heartbeat_age_seconds, lavalink_ready, last_error)
-                            VALUES (%s, 'nexus', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0, %s, %s)
+                            VALUES (%s, 'nexus', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0, %s, %s)
                             """,
                             (
                                 g.id,
@@ -3294,6 +3296,7 @@ async def collect_and_persist_metrics(guild=None):
                                 bool(metrics_row.get("is_playing")) if voice_connected else False,
                                 bool(metrics_row.get("is_paused")) if voice_connected else False,
                                 int(live_position or metrics_row.get("position_seconds") or 0),
+                                live_duration,
                                 g.id in recovering_guilds or str(g.id) in guild_states,
                                 bool(lavalink_ready),
                                 metrics_last_errors.get(g.id),
@@ -7395,7 +7398,37 @@ async def playlist_sync_loop():
                                 if added_count > 1:
                                     await shuffle_queue_rows(cur, guild_id, preserve_first=True)
 
-                            if added_rows or purged_live or purged_backup:
+                            # Trim loop-mode duplicate copies of playlist tracks from live queue.
+                            # loop_mode='queue' re-appends played tracks with new UIDs; over time
+                            # the queue grows to N*loops. We keep at most 1 copy per track_key
+                            # that appears in the current playlist, leaving non-playlist tracks alone.
+                            trim_count = 0
+                            if current_rows:
+                                current_playlist_keys = {row[3] for row in current_rows}
+                                await cur.execute(
+                                    "SELECT id, video_url, title FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus' ORDER BY id ASC",
+                                    (guild_id,)
+                                )
+                                all_queue_rows = await cur.fetchall() or []
+                                seen_by_key = {}
+                                trim_ids = []
+                                for qrow in all_queue_rows:
+                                    qid = _row_value(qrow, 'id', _row_value(qrow, 0))
+                                    qurl = _row_value(qrow, 'video_url', _row_value(qrow, 1))
+                                    qtitle = _row_value(qrow, 'title', _row_value(qrow, 2))
+                                    qkey = _track_key(qurl, qtitle)
+                                    if qkey in current_playlist_keys:
+                                        if qkey in seen_by_key:
+                                            trim_ids.append(qid)
+                                        else:
+                                            seen_by_key[qkey] = qid
+                                for trim_id in trim_ids:
+                                    await cur.execute("DELETE FROM nexus_queue WHERE id = %s AND guild_id = %s AND bot_name = 'nexus'", (trim_id, guild_id))
+                                trim_count = len(trim_ids)
+                                if trim_count > 0:
+                                    logger.info("[nexus] Playlist sync trimmed %s excess loop-mode queue copies for guild %s.", trim_count, guild_id)
+
+                            if added_rows or purged_live or purged_backup or trim_count:
                                 await snapshot_queue_backup(cur, guild_id)
 
                             await cur.execute("DELETE FROM nexus_active_playlist_tracks WHERE guild_id = %s AND bot_name = 'nexus'", (guild_id,))
@@ -7405,7 +7438,7 @@ async def playlist_sync_loop():
                             )
                             await cur.execute("UPDATE nexus_active_playlists SET known_track_count = %s WHERE guild_id = %s AND bot_name = 'nexus'", (current_count, guild_id))
 
-                if added_count or purged_live or purged_backup:
+                if added_count or purged_live or purged_backup or trim_count:
                     guild = bot.get_guild(int(guild_id))
                     if guild:
                         vc = guild.voice_client
@@ -7416,16 +7449,16 @@ async def playlist_sync_loop():
                         await send_feedback_notice(
                             guild,
                             "📡 Playlist Synced",
-                            f"Added **{added_count}** new playlist track(s), removed **{purged_live}** stale live queue row(s), and cleaned **{purged_backup}** backup row(s).",
+                            f"Added **{added_count}** new, removed **{purged_live}** stale live row(s), cleaned **{purged_backup}** backup row(s), trimmed **{trim_count}** loop duplicate(s).",
                             discord.Color.green(),
-                            dedupe_key=f"playlist_sync:{added_count}:{purged_live}:{purged_backup}",
+                            dedupe_key=f"playlist_sync:{added_count}:{purged_live}:{purged_backup}:{trim_count}",
                         )
-                        playlist_sync_loop._sync_active = False
-                        await send_webhook_log(bot.user.name if bot.user else "Unknown Node", "📡 Playlist Sync", f"Guild {guild.name}: +{added_count} playlist track(s), -{purged_live} live row(s), -{purged_backup} backup row(s).", discord.Color.green())
+                        await send_webhook_log(bot.user.name if bot.user else "Unknown Node", "📡 Playlist Sync", f"Guild {guild.name}: +{added_count} playlist track(s), -{purged_live} live row(s), -{purged_backup} backup row(s), -{trim_count} loop duplicates.", discord.Color.green())
             except Exception as e:
                 logger.error("[%s] Playlist sync loop failed for guild %s: %s", BOT_ENV_PREFIX.lower(), guild_id, e, exc_info=True)
     except Exception as tx_error:
         logger.exception("[%s] Playlist sync task failed before guild processing.", BOT_ENV_PREFIX.lower())
+    finally:
         playlist_sync_loop._sync_active = False
 
 @bot.event
