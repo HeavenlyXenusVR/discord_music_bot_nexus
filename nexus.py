@@ -4989,6 +4989,7 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
                         original_requester = track_data.get('requester_id', bot.user.id if bot.user else None)
                         track_uri = getattr(track, 'uri', None) or track_data.get('url')
                         track_title = getattr(track, 'title', None) or track_data.get('title')
+                        resolved_track_uid = track_data.get("track_uid") or _track_uid_from_obj(track)
 
                         try:
                             if reason == "FINISHED":
@@ -5011,12 +5012,12 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
                         if reason == "FINISHED":
                             clear_track_failure(guild.id, track_uri, track_title)
                             if loop_mode == 'queue':
-                                await requeue_finished_track(cur, guild.id, track_uri, track_title, original_requester, track_data.get("track_uid"))
+                                await requeue_finished_track(cur, guild.id, track_uri, track_title, original_requester, resolved_track_uid)
                             elif loop_mode == 'song':
-                                await insert_queue_front(cur, "nexus_queue", guild.id, "nexus", track_uri, track_title, original_requester, track_data.get("track_uid"))
+                                await insert_queue_front(cur, "nexus_queue", guild.id, "nexus", track_uri, track_title, original_requester, resolved_track_uid)
                             else:
                                 if track_uri and track_title:
-                                    await delete_backup_track(cur, guild.id, track_uid=track_data.get("track_uid"), video_url=track_uri, title=track_title)
+                                    await delete_backup_track(cur, guild.id, track_uid=resolved_track_uid, video_url=track_uri, title=track_title)
                                 original_url = track_data.get('original_queue_url')
                                 original_title = track_data.get('original_queue_title')
                                 if original_url and original_title and (original_url != track_uri or original_title != track_title):
@@ -5391,6 +5392,9 @@ async def restore_guild_state(guild_id, state, *, override_backoff=False):
         # Fallback to configured home channel if no saved voice channel
         if not channel:
             try:
+                async with DBPoolManager() as pool:
+                    async with pool.acquire() as conn:
+                        async with conn.cursor() as cur:
                             await cur.execute(
                                 "SELECT home_vc_id FROM nexus_bot_home_channels WHERE guild_id = %s AND bot_name = 'nexus' LIMIT 1",
                                 (target_guild_id,),
