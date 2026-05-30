@@ -1400,7 +1400,7 @@ QUEUE_PARITY_REPAIR_MAX_ROWS = max(
 )
 QUEUE_SPREAD_EXACT_GAP = max(
     1,
-    int(os.getenv(f"{BOT_ENV_PREFIX}_QUEUE_SPREAD_EXACT_GAP", os.getenv("QUEUE_SPREAD_EXACT_GAP", "2"))),
+    int(os.getenv(f"{BOT_ENV_PREFIX}_QUEUE_SPREAD_EXACT_GAP", os.getenv("QUEUE_SPREAD_EXACT_GAP", "4"))),
 )
 QUEUE_SPREAD_FAMILY_GAP = max(
     QUEUE_SPREAD_EXACT_GAP,
@@ -2068,6 +2068,8 @@ async def init_db():
                 )
                 await dedupe_queue_table_by_track_uid(cur, "nexus_queue", bot_name="nexus")
                 await dedupe_queue_table_by_track_uid(cur, "nexus_queue_backup", bot_name="nexus")
+                await dedupe_queue_table_by_track_key(cur, "nexus_queue", bot_name="nexus")
+                await dedupe_queue_table_by_track_key(cur, "nexus_queue_backup", bot_name="nexus")
                 await safe_schema_execute(cur, "CREATE UNIQUE INDEX nexus_queue_track_uid_unique_idx ON nexus_queue (guild_id, bot_name, track_uid)")
                 await safe_schema_execute(cur, "CREATE UNIQUE INDEX nexus_queue_backup_track_uid_unique_idx ON nexus_queue_backup (guild_id, bot_name, track_uid)")
                 playlist_db_initialized = True
@@ -3697,6 +3699,53 @@ async def dedupe_queue_table_by_track_uid(cur, table_name, *, guild_id=None, bot
     return deleted
 
 
+
+async def dedupe_queue_table_by_track_key(cur, table_name, *, guild_id=None, bot_name=None):
+    """Remove duplicate rows sharing the same URL/title hash, keeping the lowest id (oldest entry)."""
+    if not re.fullmatch(r"[A-Za-z0-9_]+", table_name):
+        raise ValueError(f"Unsafe table name: {table_name}")
+
+    where = []
+    params = []
+    if guild_id is not None:
+        where.append("guild_id = %s")
+        params.append(int(guild_id))
+    if bot_name is not None:
+        where.append("bot_name = %s")
+        params.append(str(bot_name))
+
+    where_clause = f"WHERE {' AND '.join(where)}" if where else ""
+    await cur.execute(
+        f"SELECT id, guild_id, bot_name, video_url, title FROM {table_name} {where_clause} ORDER BY guild_id ASC, bot_name ASC, id ASC",
+        tuple(params),
+    )
+    rows = list(await cur.fetchall() or [])
+    if not rows:
+        return 0
+
+    seen = set()
+    duplicate_ids = []
+    for row in rows:
+        row_id = _row_value(row, "id", _row_value(row, 0))
+        row_guild_id = int(_row_value(row, "guild_id", _row_value(row, 1, 0)) or 0)
+        row_bot_name = str(_row_value(row, "bot_name", _row_value(row, 2, "")) or "")
+        url = str(_row_value(row, "video_url", _row_value(row, 3, "")) or "")
+        title = str(_row_value(row, "title", _row_value(row, 4, "")) or "")
+        if row_id is None:
+            continue
+        dedup_key = (row_guild_id, row_bot_name, _track_key(url, title))
+        if dedup_key in seen:
+            duplicate_ids.append(int(row_id))
+            continue
+        seen.add(dedup_key)
+
+    deleted = 0
+    for row_id in duplicate_ids:
+        await cur.execute(f"DELETE FROM {table_name} WHERE id = %s", (row_id,))
+        deleted += max(0, int(getattr(cur, "rowcount", 0) or 0))
+    return deleted
+
+
 async def find_existing_queue_row(cur, table_name, guild_id, bot_name, *, track_uid=None, video_url=None, title=None, match_identity=False):
     if not re.fullmatch(r"[A-Za-z0-9_]+", table_name):
         raise ValueError(f"Unsafe table name: {table_name}")
@@ -3856,6 +3905,9 @@ async def restore_queue_from_backup(cur, guild_id, requester_id=None):
     removed_backup_dupes = await dedupe_queue_table_by_track_uid(cur, "nexus_queue_backup", guild_id=guild_id, bot_name="nexus")
     if removed_backup_dupes > 0:
         logger.warning("[%s] Removed %s duplicate backup queue row(s) before restoring live queue.", guild_id, removed_backup_dupes)
+    removed_content_dupes = await dedupe_queue_table_by_track_key(cur, "nexus_queue_backup", guild_id=guild_id, bot_name="nexus")
+    if removed_content_dupes > 0:
+        logger.warning("[%s] Removed %s content-duplicate backup row(s) before restoring live queue.", guild_id, removed_content_dupes)
     await cur.execute("SELECT video_url, title, requester_id, track_uid FROM nexus_queue_backup WHERE guild_id = %s AND bot_name = 'nexus' ORDER BY id ASC", (guild_id,))
     rows = list(await cur.fetchall() or [])
     if not rows:
@@ -7641,7 +7693,13 @@ async def playlist_sync_loop():
                                 if trim_count > 0:
                                     logger.info("[nexus] Playlist sync trimmed %s excess loop-mode queue copies for guild %s.", trim_count, guild_id)
 
-                            if added_rows or purged_live or purged_backup or trim_count:
+                            # Also purge content-duplicate entries from the backup queue that survived
+                            # UID-based dedup (same song re-added with a different track_uid over time).
+                            backup_content_trim = await dedupe_queue_table_by_track_key(cur, "nexus_queue_backup", guild_id=guild_id, bot_name="nexus")
+                            if backup_content_trim > 0:
+                                logger.info("[nexus] Playlist sync removed %s content-duplicate backup row(s) for guild %s.", backup_content_trim, guild_id)
+
+                            if added_rows or purged_live or purged_backup or trim_count or backup_content_trim:
                                 await snapshot_queue_backup(cur, guild_id)
 
                             await cur.execute("DELETE FROM nexus_active_playlist_tracks WHERE guild_id = %s AND bot_name = 'nexus'", (guild_id,))
@@ -7651,7 +7709,7 @@ async def playlist_sync_loop():
                             )
                             await cur.execute("UPDATE nexus_active_playlists SET known_track_count = %s WHERE guild_id = %s AND bot_name = 'nexus'", (current_count, guild_id))
 
-                if added_count or purged_live or purged_backup or trim_count:
+                if added_count or purged_live or purged_backup or trim_count or backup_content_trim:
                     guild = bot.get_guild(int(guild_id))
                     if guild:
                         vc = guild.voice_client
