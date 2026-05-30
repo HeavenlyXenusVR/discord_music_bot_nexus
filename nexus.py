@@ -8014,20 +8014,23 @@ async def direct_order_listener():
 
             for finalize_attempt in range(DIRECT_ORDER_DB_RETRY_ATTEMPTS):
                 try:
+                    async with DBPoolManager() as _fin_pool:
+                        async with _fin_pool.acquire() as _fin_conn:
+                            async with _fin_conn.cursor() as _fin_cur:
                                 try:
-                                    await cur.execute("START TRANSACTION")
+                                    await _fin_cur.execute("START TRANSACTION")
                                     if executed or attempts + 1 >= DIRECT_ORDER_MAX_ATTEMPTS or not guild:
-                                        await cur.execute("DELETE FROM nexus_swarm_direct_orders WHERE id = %s", (oid,))
+                                        await _fin_cur.execute("DELETE FROM nexus_swarm_direct_orders WHERE id = %s", (oid,))
                                     else:
-                                        await cur.execute("UPDATE nexus_swarm_direct_orders SET attempts = COALESCE(attempts, 0) + 1, last_error = %s, claimed_at = DATE_SUB(NOW(), INTERVAL %s SECOND), claim_token = NULL WHERE id = %s", (f"unexecuted:{cmd}", DIRECT_ORDER_RETRY_BACKDATE_SECONDS, oid))
-                                    await cur.execute("COMMIT")
+                                        await _fin_cur.execute("UPDATE nexus_swarm_direct_orders SET attempts = COALESCE(attempts, 0) + 1, last_error = %s, claimed_at = DATE_SUB(NOW(), INTERVAL %s SECOND), claim_token = NULL WHERE id = %s", (f"unexecuted:{cmd}", DIRECT_ORDER_RETRY_BACKDATE_SECONDS, oid))
+                                    await _fin_cur.execute("COMMIT")
                                 except Exception as tx_error:
                                     try:
-                                        await cur.execute("ROLLBACK")
-                                    except Exception as tx_error:
+                                        await _fin_cur.execute("ROLLBACK")
+                                    except Exception:
                                         pass
                                     raise
-                                break
+                    break
                 except Exception as exc:
                     if _is_retryable_mysql_error(exc) and finalize_attempt + 1 < DIRECT_ORDER_DB_RETRY_ATTEMPTS:
                         logger.warning(
