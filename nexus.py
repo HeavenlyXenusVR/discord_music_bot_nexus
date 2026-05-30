@@ -4494,10 +4494,35 @@ async def apply_resume_seek(voice_client, guild_id, start_position, *, track_uid
 
     if last_reported is not None and last_reported > start_position:
         return normalize_position_seconds(last_reported)
+
+    # Detect a Lavalink deep-seek failure: player is stuck near zero despite a seek
+    # target that was far into the track. This happens with long YouTube streams where
+    # the DASH segment URL doesn't honour the start-time offset. Rather than returning
+    # max(target, 3s) = target and lying to the position tracker (which then fires a
+    # false track_stuck), return the ACTUAL player position so everything downstream
+    # knows the track is playing from near the beginning.
+    SEEK_FAIL_NEAR_ZERO_THRESHOLD = 15   # seconds — Lavalink reporting ≤ this counts as "stuck at start"
+    SEEK_FAIL_MIN_DEEP_TARGET = 60       # seconds — only flag when we were aiming this far in
+    if (
+        last_reported is not None
+        and last_reported <= SEEK_FAIL_NEAR_ZERO_THRESHOLD
+        and start_position >= SEEK_FAIL_MIN_DEEP_TARGET
+    ):
+        logger.warning(
+            "[%s] Deep seek to %ss failed for '%s'; Lavalink is at %ss. "
+            "YouTube stream likely cannot seek to that offset. Reporting actual position.",
+            guild_id,
+            start_position,
+            title or video_url or _track_uid_label(track_uid) or "track",
+            last_reported,
+        )
+        return last_reported
+
     final_pos = max(start_position, last_reported if last_reported is not None else 0)
     if not final_pos:
         logger.warning('[%s] Resume verify failed for %s at %ss; player=%s.', guild_id, _track_uid_label(track_uid), start_position, 'unknown' if last_reported is None else str(last_reported)+'s')
     return final_pos
+
 
 async def requeue_verified_playback_failure(guild, channel_id, url, title, requester_id, position, *, reason="track_exception", track_uid=None):
     attempts = mark_track_failure(guild.id, track_uid if track_uid else url, title)
@@ -4589,6 +4614,34 @@ async def verify_track_stuck_before_requeue(guild_id, channel_id, url, title, re
             return False
 
         verified_position = later_reported_position if later_reported_position is not None else observed_position
+
+        # Detect a seek-induced stuck: Lavalink is near position 0 while the runtime
+        # checkpoint was far into the track. This is NOT a broken/unplayable track — it
+        # means Lavalink silently ignored the deep seek offset (common with long YouTube
+        # streams). Don't burn a failure retry counter; just requeue at position 0 so the
+        # track plays from the beginning instead of looping through the same stuck state.
+        SEEK_INDUCED_STUCK_MAX_PLAYER = 15    # Lavalink reporting ≤ this seconds
+        SEEK_INDUCED_STUCK_MIN_CHECKPOINT = 60  # runtime was at least this far in
+        is_seek_induced = (
+            later_reported_position is not None
+            and later_reported_position <= SEEK_INDUCED_STUCK_MAX_PLAYER
+            and observed_position >= SEEK_INDUCED_STUCK_MIN_CHECKPOINT
+        )
+        if is_seek_induced:
+            logger.warning(
+                "[%s] Lavalink track_stuck for '%s' is seek-induced (player=%ss, checkpoint=%ss); "
+                "requeuing at position 0 without counting as a failure.",
+                guild_id, title, later_reported_position, observed_position,
+            )
+            # Requeue at 0 directly — skip mark_track_failure so the track isn't penalised.
+            async with DBPoolManager() as pool:
+                async with pool.acquire() as conn:
+                    async with conn.cursor() as cur:
+                        await requeue_failed_track(cur, guild_id, channel_id, url, title, requester_id, position=0, reason="track_stuck_seek_induced", track_uid=track_uid)
+            if channel_id:
+                schedule_named_task(f"lavalink_failure_process_queue:{guild_id}", process_queue(guild, channel_id, start_position=0, allow_recovery_restore=True))
+            return True
+
         logger.warning(
             "[%s] Lavalink track_stuck for '%s' did not recover after %.0fs; restoring exactly one live queue copy.",
             guild_id,
