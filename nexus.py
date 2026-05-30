@@ -714,8 +714,8 @@ PLAYLIST_SYNC_INTERVAL = max(30.0, float(os.getenv(f"{BOT_ENV_PREFIX}_PLAYLIST_S
 AUTO_HEAL_INTERVAL = max(15.0, float(os.getenv(f"{BOT_ENV_PREFIX}_AUTO_HEAL_INTERVAL", "20")))
 AUTO_IMPORT_IDLE_SECONDS = max(45.0, float(os.getenv(f"{BOT_ENV_PREFIX}_AUTO_IMPORT_IDLE_SECONDS", "45")))
 RECOVERY_RETRY_BASE_DELAY = max(2.0, float(os.getenv(f"{BOT_ENV_PREFIX}_RECOVERY_RETRY_BASE_DELAY", os.getenv("RECOVERY_RETRY_BASE_DELAY", "3"))))
-RECOVERY_RETRY_MAX_DELAY = max(RECOVERY_RETRY_BASE_DELAY, float(os.getenv(f"{BOT_ENV_PREFIX}_RECOVERY_RETRY_MAX_DELAY", os.getenv("RECOVERY_RETRY_MAX_DELAY", "20"))))
-MAX_RECOVERY_RETRIES = max(3, int(os.getenv(f"{BOT_ENV_PREFIX}_MAX_RECOVERY_RETRIES", "6")))
+RECOVERY_RETRY_MAX_DELAY = max(RECOVERY_RETRY_BASE_DELAY, float(os.getenv(f"{BOT_ENV_PREFIX}_RECOVERY_RETRY_MAX_DELAY", os.getenv("RECOVERY_RETRY_MAX_DELAY", "10"))))
+MAX_RECOVERY_RETRIES = max(3, int(os.getenv(f"{BOT_ENV_PREFIX}_MAX_RECOVERY_RETRIES", "4")))
 MAX_TRACK_FAILURE_REQUEUES = max(1, int(os.getenv(f"{BOT_ENV_PREFIX}_MAX_TRACK_FAILURE_REQUEUES", os.getenv("MAX_TRACK_FAILURE_REQUEUES", "3"))))
 TRACK_FAILURE_WINDOW_SECONDS = max(60.0, float(os.getenv(f"{BOT_ENV_PREFIX}_TRACK_FAILURE_WINDOW_SECONDS", os.getenv("TRACK_FAILURE_WINDOW_SECONDS", "900"))))
 TRACK_REQUEUE_DEDUP_SECONDS = max(15.0, float(os.getenv(f"{BOT_ENV_PREFIX}_TRACK_REQUEUE_DEDUP_SECONDS", os.getenv("TRACK_REQUEUE_DEDUP_SECONDS", "120"))))
@@ -726,7 +726,7 @@ TRACK_STUCK_SKIP_WHEN_POSITION_UNKNOWN = str(os.getenv(f"{BOT_ENV_PREFIX}_TRACK_
 WATCHDOG_REVIVAL_COOLDOWN = max(10.0, float(os.getenv(f"{BOT_ENV_PREFIX}_WATCHDOG_REVIVAL_COOLDOWN", "15")))
 WATCHDOG_MAX_REVIVALS = max(3, int(os.getenv(f"{BOT_ENV_PREFIX}_WATCHDOG_MAX_REVIVALS", "6")))
 AUTO_RESTORE_SNOOZE_SECONDS = max(15.0, float(os.getenv(f"{BOT_ENV_PREFIX}_AUTO_RESTORE_SNOOZE_SECONDS", "45")))
-RECOVERY_EXHAUSTED_COOLDOWN_SECONDS = max(30.0, float(os.getenv(f"{BOT_ENV_PREFIX}_RECOVERY_EXHAUSTED_COOLDOWN_SECONDS", "90")))
+RECOVERY_EXHAUSTED_COOLDOWN_SECONDS = max(10.0, float(os.getenv(f"{BOT_ENV_PREFIX}_RECOVERY_EXHAUSTED_COOLDOWN_SECONDS", "20")))
 PERIODIC_RESTART_HOURS = max(0.0, float(os.getenv(f"{BOT_ENV_PREFIX}_PERIODIC_RESTART_HOURS", os.getenv("PERIODIC_RESTART_HOURS", "5"))))
 PERIODIC_RESTART_JITTER_SECONDS = max(0.0, float(os.getenv(f"{BOT_ENV_PREFIX}_PERIODIC_RESTART_JITTER_SECONDS", os.getenv("PERIODIC_RESTART_JITTER_SECONDS", "900"))))
 CACHE_CLEANUP_INTERVAL_HOURS = max(1.0, float(os.getenv(f"{BOT_ENV_PREFIX}_CACHE_CLEANUP_INTERVAL_HOURS", os.getenv("CACHE_CLEANUP_INTERVAL_HOURS", "10"))))
@@ -1198,6 +1198,9 @@ def schedule_named_task(name, coro, overwrite=False):
 async def flush_runtime_state_before_restart(reason: str = "restart"):
     """Persist the freshest playback position before the intentional supervisor restart path."""
     try:
+        async with DBPoolManager() as pool:
+            async with pool.acquire() as conn:
+                async with conn.cursor() as cur:
                     for guild_id, data in list(playback_tracking.items()):
                         try:
                             position = current_track_position(guild_id)
@@ -1308,10 +1311,10 @@ vote_skip_sessions = {}
 metrics_last_errors = {}
 METRICS_HEARTBEAT_INTERVAL = max(5, int(os.getenv(f"{BOT_ENV_PREFIX}_METRICS_HEARTBEAT_INTERVAL", os.getenv("METRICS_HEARTBEAT_INTERVAL", "15"))))
 VOICE_REJOIN_DELAY_SECONDS = max(1, int(os.getenv(f"{BOT_ENV_PREFIX}_VOICE_REJOIN_DELAY_SECONDS", os.getenv("VOICE_REJOIN_DELAY_SECONDS", "2"))))
-VOICE_CONNECT_TIMEOUT_SECONDS = max(15.0, float(os.getenv(f"{BOT_ENV_PREFIX}_VOICE_CONNECT_TIMEOUT_SECONDS", os.getenv("VOICE_CONNECT_TIMEOUT_SECONDS", "45"))))
+VOICE_CONNECT_TIMEOUT_SECONDS = max(5.0, float(os.getenv(f"{BOT_ENV_PREFIX}_VOICE_CONNECT_TIMEOUT_SECONDS", os.getenv("VOICE_CONNECT_TIMEOUT_SECONDS", "10"))))
 VOICE_CONNECT_TIMEOUT_MAX_SECONDS = max(
-    30.0,
-    float(os.getenv(f"{BOT_ENV_PREFIX}_VOICE_CONNECT_TIMEOUT_MAX_SECONDS", os.getenv("VOICE_CONNECT_TIMEOUT_MAX_SECONDS", "90"))),
+    15.0,
+    float(os.getenv(f"{BOT_ENV_PREFIX}_VOICE_CONNECT_TIMEOUT_MAX_SECONDS", os.getenv("VOICE_CONNECT_TIMEOUT_MAX_SECONDS", "30"))),
 )
 if VOICE_CONNECT_TIMEOUT_SECONDS > VOICE_CONNECT_TIMEOUT_MAX_SECONDS:
     logger.warning(
@@ -1322,25 +1325,25 @@ if VOICE_CONNECT_TIMEOUT_SECONDS > VOICE_CONNECT_TIMEOUT_MAX_SECONDS:
     )
     VOICE_CONNECT_TIMEOUT_SECONDS = VOICE_CONNECT_TIMEOUT_MAX_SECONDS
 VOICE_CONNECT_TIMEOUT_BACKOFF_SECONDS = max(
-    8.0,
-    float(os.getenv(f"{BOT_ENV_PREFIX}_VOICE_CONNECT_TIMEOUT_BACKOFF_SECONDS", os.getenv("VOICE_CONNECT_TIMEOUT_BACKOFF_SECONDS", "15"))),
+    2.0,
+    float(os.getenv(f"{BOT_ENV_PREFIX}_VOICE_CONNECT_TIMEOUT_BACKOFF_SECONDS", os.getenv("VOICE_CONNECT_TIMEOUT_BACKOFF_SECONDS", "5"))),
 )
 VOICE_CONNECT_QUEUE_RETRY_ENABLED = os.getenv(
     f"{BOT_ENV_PREFIX}_VOICE_CONNECT_QUEUE_RETRY_ENABLED",
     os.getenv("VOICE_CONNECT_QUEUE_RETRY_ENABLED", "true"),
 ).strip().lower() not in {"0", "false", "off", "no"}
 VOICE_CONNECT_QUEUE_RETRY_BACKOFF_SECONDS = max(
-    8.0,
+    3.0,
     float(os.getenv(
         f"{BOT_ENV_PREFIX}_VOICE_CONNECT_QUEUE_RETRY_BACKOFF_SECONDS",
-        os.getenv("VOICE_CONNECT_QUEUE_RETRY_BACKOFF_SECONDS", "15"),
+        os.getenv("VOICE_CONNECT_QUEUE_RETRY_BACKOFF_SECONDS", "5"),
     )),
 )
 VOICE_CONNECT_AUTOMATIC_RECOVERY_SNOOZE_SECONDS = max(
     VOICE_CONNECT_QUEUE_RETRY_BACKOFF_SECONDS,
     float(os.getenv(
         f"{BOT_ENV_PREFIX}_VOICE_CONNECT_AUTOMATIC_RECOVERY_SNOOZE_SECONDS",
-        os.getenv("VOICE_CONNECT_AUTOMATIC_RECOVERY_SNOOZE_SECONDS", "25"),
+        os.getenv("VOICE_CONNECT_AUTOMATIC_RECOVERY_SNOOZE_SECONDS", "10"),
     )),
 )
 RESILIENCE_STUCK_QUEUE_RETRY_SECONDS = max(
@@ -4160,6 +4163,8 @@ def schedule_recovery_retry(guild_id, channel_id, *, start_position=0, reason="r
     queue_voice_retry = VOICE_CONNECT_QUEUE_RETRY_ENABLED and any(token in reason_text for token in (
         "voice_connect",
         "voice_connect_timeout",
+        "restore_voice",
+        "restore_exception",
     ))
     if voice_rejoin_reason and not VOICE_DISCONNECT_REJOIN_RECOVERY and not queue_voice_retry:
         logger.info(f"[{guild_id}] Skipping {reason} recovery retry because bot-side voice rejoin recovery is disabled; manual/direct recovery remains available.")
@@ -5490,7 +5495,7 @@ async def restore_guild_state(guild_id, state, *, override_backoff=False):
                     db_title = _row_value(pos_row, "title", _row_value(pos_row, 2)) if pos_row else None
                     db_track_uid = _normalize_track_uid(_row_track_uid(pos_row, 3)) if pos_row else None
 
-        resume_position = max(0, int(db_position if db_position is not None else merged_state.get("position", 0)))
+        resume_position = max(0, int(db_position if db_position else merged_state.get("position", 0)))
         resume_track_uid = db_track_uid or merged_state.get("track_uid")
         resume_url = db_url or merged_state.get("url")
         resume_title = db_title or merged_state.get("title")
