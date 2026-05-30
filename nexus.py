@@ -5226,7 +5226,7 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
                     # Seed runtime tracking immediately after Lavalink accepts play(), before resume seek verification.
                     # This protects long-track resume points if Discord voice drops or the checkpoint loop runs
                     # during the seek/verification window. The final block below overwrites this provisional state.
-                    playback_tracking[guild.id] = {'start_time': time.time(), 'offset': start_position, 'url': url, 'channel_id': channel_id, 'title': title, 'track_uid': track_uid, 'original_queue_url': original_queue_url, 'original_queue_title': original_queue_title, 'duration': duration, 'speed': c_speed, 'current_filter': filter_mode, 'requester_id': requester_id, 'transition_mode': trans_mode, 'volume': vol, 'paused': False, 'last_position_checkpoint': start_position, 'last_listen_position': start_position, 'listen_seconds_committed': 0}
+                    playback_tracking[guild.id] = {'start_time': time.monotonic(), 'offset': start_position, 'url': url, 'channel_id': channel_id, 'title': title, 'track_uid': track_uid, 'original_queue_url': original_queue_url, 'original_queue_title': original_queue_title, 'duration': duration, 'speed': c_speed, 'current_filter': filter_mode, 'requester_id': requester_id, 'transition_mode': trans_mode, 'volume': vol, 'paused': False, 'last_position_checkpoint': start_position, 'last_listen_position': start_position, 'listen_seconds_committed': 0}
                     guild_states[guild.id] = {"voice_channel_id": channel_id, "position": start_position, "track_uid": track_uid, "url": url, "title": title}
                     invalidate_position_persist(guild.id)
                     if start_position > 0:
@@ -5261,7 +5261,7 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
                     await bot.change_presence(status=discord.Status.online, activity=discord.Activity(type=discord.ActivityType.listening, name=str(title).replace("\\n", " ").strip()[:120]))
                 except Exception as tx_error:
                     pass
-                playback_tracking[guild.id] = {'start_time': time.time(), 'offset': start_position, 'url': url, 'channel_id': channel_id, 'title': title, 'track_uid': track_uid, 'original_queue_url': original_queue_url, 'original_queue_title': original_queue_title, 'duration': duration, 'speed': c_speed, 'current_filter': filter_mode, 'requester_id': requester_id, 'transition_mode': trans_mode, 'volume': vol, 'paused': False, 'last_position_checkpoint': start_position, 'last_listen_position': start_position, 'listen_seconds_committed': 0}
+                playback_tracking[guild.id] = {'start_time': time.monotonic(), 'offset': start_position, 'url': url, 'channel_id': channel_id, 'title': title, 'track_uid': track_uid, 'original_queue_url': original_queue_url, 'original_queue_title': original_queue_title, 'duration': duration, 'speed': c_speed, 'current_filter': filter_mode, 'requester_id': requester_id, 'transition_mode': trans_mode, 'volume': vol, 'paused': False, 'last_position_checkpoint': start_position, 'last_listen_position': start_position, 'listen_seconds_committed': 0}
                 clear_live_queue_claim(guild.id, original_queue_url, original_queue_title, track_uid)
 
                 bot_n = os.path.basename(__file__).replace('.py', '')
@@ -8121,9 +8121,12 @@ class SwarmIntelligence(commands.Cog):
     @tasks.loop(seconds=30)
     async def heartbeat(self):
         try:
+            async with DBPoolManager() as pool:
+                async with pool.acquire() as conn:
+                    async with conn.cursor() as cur:
                         await cur.execute("INSERT INTO swarm_health (bot_name, status, last_pulse) VALUES (%s, 'HEALTHY', NOW()) ON DUPLICATE KEY UPDATE status=VALUES(status), last_pulse=NOW()", (self.bot_name,))
         except Exception as tx_error:
-            logger.exception("[nexus] Heartbeat update failed.")
+            logger.exception("[%s] Heartbeat update failed.", self.bot_name)
 
     @tasks.loop(seconds=15)
     async def watchdog(self):
