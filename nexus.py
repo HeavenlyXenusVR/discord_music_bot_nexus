@@ -3785,7 +3785,26 @@ async def shuffle_queue_rows(cur, guild_id, *, preserve_first=True):
     return len(rows)
 
 async def requeue_finished_track(cur, guild_id, video_url, title, requester_id, track_uid=None):
-    await enqueue_track(cur, guild_id, video_url, title, requester_id, backup=False, track_uid=track_uid)
+    original_uid = _normalize_track_uid(track_uid)
+    actual_uid = await enqueue_track(cur, guild_id, video_url, title, requester_id, backup=False, track_uid=track_uid)
+    # If the insert had to regenerate a new UID (duplicate-key collision), the backup
+    # still holds the old UID. Sync it now so parity repair never sees a phantom gap.
+    if original_uid and actual_uid and actual_uid != original_uid:
+        try:
+            await cur.execute(
+                "UPDATE nexus_queue_backup SET track_uid = %s "
+                "WHERE guild_id = %s AND bot_name = 'nexus' AND track_uid = %s",
+                (actual_uid, guild_id, original_uid),
+            )
+        except Exception:
+            # actual_uid is already in backup — stale original_uid entry is now a duplicate; remove it
+            try:
+                await cur.execute(
+                    "DELETE FROM nexus_queue_backup WHERE guild_id = %s AND bot_name = 'nexus' AND track_uid = %s LIMIT 1",
+                    (guild_id, original_uid),
+                )
+            except Exception:
+                pass
     return True
 
 async def prime_loop_queue_defaults(cur, guild_id, *, shuffle_if_needed=True):
@@ -3926,6 +3945,51 @@ async def repair_queue_backup_parity(cur, guild_id, *, reason="queue_integrity",
     if len(missing_live_rows) > QUEUE_PARITY_REPAIR_MAX_ROWS:
         logger.warning("[%s] Queue parity repair capped missing live rows from %s to %s after %s.", guild_id, len(missing_live_rows), QUEUE_PARITY_REPAIR_MAX_ROWS, reason)
         missing_live_rows = missing_live_rows[:QUEUE_PARITY_REPAIR_MAX_ROWS]
+
+    # Secondary pass: filter out "missing" backup rows that are actually in live
+    # under a different UID (UID drift from loop_mode requeue). When loop_mode='queue'
+    # re-inserts a finished track and a duplicate-key forces a new UID, the backup
+    # keeps the old UID. Treating it as "missing" would restore a duplicate.
+    # Instead, sync the backup UID to the live UID and skip the restoration.
+    if missing_live_rows:
+        live_by_track_key = {}
+        for row in live_rows:
+            key = _track_key(
+                _row_value(row, "video_url", _row_value(row, 1, "")),
+                _row_value(row, "title", _row_value(row, 2, "")),
+            )
+            if key not in live_by_track_key:
+                live_by_track_key[key] = _ensure_track_uid(_row_track_uid(row, 4))
+        uid_sync_pairs = []
+        genuine_missing = []
+        for row in missing_live_rows:
+            bk_url = _row_value(row, "video_url", _row_value(row, 1, ""))
+            bk_title = _row_value(row, "title", _row_value(row, 2, ""))
+            bk_uid = _ensure_track_uid(_row_track_uid(row, 4))
+            live_uid = live_by_track_key.get(_track_key(bk_url, bk_title))
+            if live_uid and live_uid != bk_uid:
+                uid_sync_pairs.append((bk_uid, live_uid))
+            else:
+                genuine_missing.append(row)
+        if uid_sync_pairs:
+            logger.debug("[%s] Queue parity: syncing %s backup UID(s) that drifted from live requeue UIDs after %s.", guild_id, len(uid_sync_pairs), reason)
+            for old_uid, new_uid in uid_sync_pairs:
+                try:
+                    await cur.execute(
+                        "UPDATE nexus_queue_backup SET track_uid = %s "
+                        "WHERE guild_id = %s AND bot_name = 'nexus' AND track_uid = %s",
+                        (new_uid, guild_id, old_uid),
+                    )
+                except Exception:
+                    # new_uid already exists in backup — stale old_uid is a true duplicate; remove it
+                    try:
+                        await cur.execute(
+                            "DELETE FROM nexus_queue_backup WHERE guild_id = %s AND bot_name = 'nexus' AND track_uid = %s LIMIT 1",
+                            (guild_id, old_uid),
+                        )
+                    except Exception:
+                        pass
+        missing_live_rows = genuine_missing
 
     if missing_live_rows and not queue_parity_repair_allowed(guild_id, backup_rows, live_rows, reason=reason):
         return 0, 0
@@ -8266,6 +8330,23 @@ async def queue_integrity_check_loop():
                         player_active = bool(vc and _player_is_active(vc))
                         if not player_active and should_defer_automatic_queue_recovery(guild_id):
                             continue
+                        # Fast-path: skip the expensive per-row parity scan when queue health is nominal.
+                        # "nominal" means live == backup (perfect parity) or live is exactly 1 less than
+                        # backup while the player is actively playing (one track dequeued for playback).
+                        # Only escalate to full repair when there is a genuine count discrepancy.
+                        await cur.execute(
+                            "SELECT "
+                            "(SELECT COUNT(*) FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus') AS live_cnt, "
+                            "(SELECT COUNT(*) FROM nexus_queue_backup WHERE guild_id = %s AND bot_name = 'nexus') AS backup_cnt",
+                            (guild_id, guild_id),
+                        )
+                        cnt_row = await cur.fetchone() or {}
+                        live_cnt = int(cnt_row.get("live_cnt") or 0)
+                        backup_cnt = int(cnt_row.get("backup_cnt") or 0)
+                        if live_cnt == backup_cnt:
+                            continue  # perfect parity — nothing to repair
+                        if player_active and backup_cnt > 0 and backup_cnt - live_cnt == 1:
+                            continue  # one track dequeued for active playback — expected
                         restored_live, _restored_backup = await repair_queue_backup_parity(cur, guild_id, active_player=player_active)
                         if restored_live <= 0:
                             continue
