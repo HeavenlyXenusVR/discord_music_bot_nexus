@@ -1751,7 +1751,7 @@ async def _connect_lavalink_forever():
                 continue
             try:
                 logger.info(f"Connecting to Lavalink at {LAVALINK_URI}")
-                node = wavelink.Node(uri=LAVALINK_URI, password=LAVALINK_PASSWORD, identifier=f"SWARM_PRIMARY_{BOT_ENV_PREFIX}")
+                node = wavelink.Node(uri=LAVALINK_URI, password=LAVALINK_PASSWORD, identifier=f"SWARM_PRIMARY_{BOT_ENV_PREFIX}", resume_timeout=300)
                 saved_session = _read_saved_lavalink_session_id()
                 if saved_session:
                     # Pre-populate session ID so Wavelink sends Session-Id header,
