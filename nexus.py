@@ -4510,12 +4510,19 @@ async def apply_resume_seek(voice_client, guild_id, start_position, *, track_uid
     ):
         logger.warning(
             "[%s] Deep seek to %ss failed for '%s'; Lavalink is at %ss. "
-            "YouTube stream likely cannot seek to that offset. Reporting actual position.",
+            "YouTube stream likely cannot seek to that offset. Resetting to 0 and reporting actual position.",
             guild_id,
             start_position,
             title or video_url or _track_uid_label(track_uid) or "track",
             last_reported,
         )
+        # Explicitly reset Lavalink to position 0 so it stops being stuck at the
+        # near-zero offset from the failed seek rather than continuing to report ~3s
+        # while the runtime clock races ahead and falsely triggers track_stuck.
+        try:
+            await voice_client.seek(0)
+        except Exception as tx_error:
+            logger.debug("[%s] seek(0) reset after failed deep seek could not complete.", guild_id, exc_info=True)
         return last_reported
 
     final_pos = max(start_position, last_reported if last_reported is not None else 0)
@@ -4621,7 +4628,7 @@ async def verify_track_stuck_before_requeue(guild_id, channel_id, url, title, re
         # streams). Don't burn a failure retry counter; just requeue at position 0 so the
         # track plays from the beginning instead of looping through the same stuck state.
         SEEK_INDUCED_STUCK_MAX_PLAYER = 15    # Lavalink reporting ≤ this seconds
-        SEEK_INDUCED_STUCK_MIN_CHECKPOINT = 60  # runtime was at least this far in
+        SEEK_INDUCED_STUCK_MIN_CHECKPOINT = 30  # runtime was at least this far in
         is_seek_induced = (
             later_reported_position is not None
             and later_reported_position <= SEEK_INDUCED_STUCK_MAX_PLAYER
