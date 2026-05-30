@@ -1716,6 +1716,28 @@ def _has_connected_lavalink_node() -> bool:
             continue
     return False
 
+_LAVALINK_SESSION_FILE = os.path.join(
+    os.getenv("RUNTIME_DIR", "/app/.runtime"),
+    f"lavalink_session_{BOT_ENV_PREFIX.lower()}.txt",
+)
+
+def _read_saved_lavalink_session_id():
+    try:
+        if os.path.exists(_LAVALINK_SESSION_FILE):
+            sid = open(_LAVALINK_SESSION_FILE).read().strip()
+            return sid if len(sid) > 4 else None
+    except Exception:
+        pass
+    return None
+
+def _save_lavalink_session_id(session_id):
+    try:
+        os.makedirs(os.path.dirname(_LAVALINK_SESSION_FILE), exist_ok=True)
+        with open(_LAVALINK_SESSION_FILE, "w") as f:
+            f.write(session_id or "")
+    except Exception as e:
+        logger.debug("[%s] Could not save Lavalink session ID: %s", BOT_ENV_PREFIX.lower(), e)
+
 async def _connect_lavalink_forever():
     await bot.wait_until_ready()
     async with lavalink_connect_lock:
@@ -1729,7 +1751,14 @@ async def _connect_lavalink_forever():
                 continue
             try:
                 logger.info(f"Connecting to Lavalink at {LAVALINK_URI}")
-                await wavelink.Pool.connect(nodes=[wavelink.Node(uri=LAVALINK_URI, password=LAVALINK_PASSWORD, identifier=f"SWARM_PRIMARY_{BOT_ENV_PREFIX}")], client=bot, cache_capacity=LAVALINK_TRACK_CACHE_CAPACITY)
+                node = wavelink.Node(uri=LAVALINK_URI, password=LAVALINK_PASSWORD, identifier=f"SWARM_PRIMARY_{BOT_ENV_PREFIX}")
+                saved_session = _read_saved_lavalink_session_id()
+                if saved_session:
+                    # Pre-populate session ID so Wavelink sends Session-Id header,
+                    # allowing Lavalink to resume the frozen player without stopping audio.
+                    node._session_id = saved_session
+                    logger.info("[%s] Pre-loading saved Lavalink session %s… for potential native resume.", BOT_ENV_PREFIX.lower(), saved_session[:8])
+                await wavelink.Pool.connect(nodes=[node], client=bot, cache_capacity=LAVALINK_TRACK_CACHE_CAPACITY)
             except Exception as exc:
                 logger.warning(f"Waiting for Lavalink to boot or authenticate... Retrying in 5s ({exc})")
                 await asyncio.sleep(5)
@@ -5729,6 +5758,63 @@ async def setup_hook():
 @bot.event
 async def on_wavelink_node_ready(payload: wavelink.NodeReadyEventPayload):
     logger.info(f"🔥 Lavalink Bridge Officially Connected and Locked! (Node: {payload.node.identifier})")
+
+    # Persist the session ID so the next restart can resume without audio interruption.
+    if payload.node.session_id:
+        _save_lavalink_session_id(payload.node.session_id)
+
+    if getattr(payload, "resumed", False):
+        logger.info(
+            "✅ Lavalink session RESUMED (session=%s) — audio kept playing through restart. "
+            "Skipping orphan restore; rebuilding runtime state from active Lavalink players.",
+            payload.node.session_id,
+        )
+        # Rebuild playback_tracking for every guild the Lavalink player reports as active
+        # so position_updater and position tracking stay correct without needing a seek.
+        try:
+            lava_players = await payload.node._fetch_players()
+            for lp in lava_players or []:
+                gid = int(lp.get("guildId", 0))
+                state_data = lp.get("state", {})
+                track_info = (lp.get("track") or {})
+                info = track_info.get("info", {})
+                position_ms = state_data.get("position", 0)
+                position_s = max(0, int(position_ms / 1000))
+                url = info.get("uri", "")
+                title = info.get("title", "")
+                duration_s = max(0, int(info.get("length", 0) / 1000))
+                guild = bot.get_guild(gid)
+                if guild and gid not in playback_tracking and (url or title):
+                    playback_tracking[gid] = {
+                        "start_time": __import__("time").monotonic() - position_s,
+                        "offset": position_s,
+                        "url": url,
+                        "channel_id": guild_states.get(gid, {}).get("voice_channel_id"),
+                        "title": title,
+                        "track_uid": _ensure_track_uid(None),
+                        "duration": duration_s,
+                        "speed": 1.0,
+                        "current_filter": "none",
+                        "requester_id": None,
+                        "transition_mode": "off",
+                        "volume": lp.get("volume", 100),
+                        "paused": bool(lp.get("paused", False)),
+                        "last_position_checkpoint": position_s,
+                        "last_listen_position": position_s,
+                        "listen_seconds_committed": 0,
+                    }
+                    guild_states[gid] = {
+                        "voice_channel_id": guild_states.get(gid, {}).get("voice_channel_id"),
+                        "position": position_s,
+                        "url": url,
+                        "title": title,
+                    }
+                    invalidate_position_persist(gid)
+                    logger.info("[%s] Rebuilt runtime state from resumed Lavalink player at %ss for '%s'.", gid, position_s, title)
+        except Exception as _e:
+            logger.warning("Failed to rebuild playback state from resumed Lavalink players: %s", _e)
+        return
+
     if aria_recovery_authority_blocks_self_heal("orphaned_playback_auto_resume"):
         logger.info("Orphaned playback auto-resume deferred because Aria owns recovery decisions.")
         return
