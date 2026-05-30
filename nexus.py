@@ -2914,7 +2914,7 @@ def clear_recovery_backoff(guild_id):
     recovery_exhausted_until.pop(guild_id, None)
 
 def arm_recovery_backoff(guild_id, *, seconds=RECOVERY_EXHAUSTED_COOLDOWN_SECONDS, reason="recovery_exhausted"):
-    cooldown = max(30.0, float(seconds))
+    cooldown = max(5.0, float(seconds))
     recovery_exhausted_until[guild_id] = time.time() + cooldown
     # Keep playback state around during network/Discord voice lag so recovery
     # can resume the same track instead of treating the guild as fully stopped.
