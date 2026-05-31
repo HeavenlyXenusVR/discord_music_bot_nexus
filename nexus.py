@@ -4547,6 +4547,14 @@ async def apply_resume_seek(voice_client, guild_id, start_position, *, track_uid
     last_reported = None
     expected_identity = _track_instance_identity(track_uid, video_url, title)
 
+    # Issue an explicit seek immediately — the start= parameter to play() is unreliable
+    # for deep positions on YouTube streams. This mirrors what the manual /seek command does.
+    try:
+        await asyncio.sleep(0.5)  # brief pause for Lavalink to accept the new player
+        await voice_client.seek(target_ms)
+    except Exception:
+        pass
+
     for attempt in range(1, max_attempts + 1):
         if expected_identity and guild_id in playback_tracking and float(playback_tracking[guild_id].get("last_user_seek_at", 0.0)) > (time.monotonic() - 5.0): return start_position
         try:
@@ -4567,7 +4575,7 @@ async def apply_resume_seek(voice_client, guild_id, start_position, *, track_uid
             last_reported = normalize_position_seconds(reported)
             if last_reported + RESUME_SEEK_VERIFY_GRACE_SECONDS >= start_position:
                 return max(start_position, last_reported)
-        if attempt > 1: await voice_client.seek(target_ms)
+        await voice_client.seek(target_ms)  # re-seek on every verification attempt
         if attempt == 1 and max_attempts > 1:
             logger.warning(
                 "[%s] Resume seek verification saw player at %s after asking for %ss; retrying seek.",
