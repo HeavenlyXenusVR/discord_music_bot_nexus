@@ -3278,6 +3278,7 @@ async def collect_and_persist_metrics(guild=None):
         async with DBPoolManager() as pool:
             async with pool.acquire() as conn:
                 async with conn.cursor(aiomysql.DictCursor) as cur:
+                    metrics_rows = []
                     for g in guilds:
                         if not g:
                             continue
@@ -3311,7 +3312,25 @@ async def collect_and_persist_metrics(guild=None):
                                 "UPDATE nexus_playback_state SET channel_id = COALESCE(%s, channel_id), is_playing = %s, is_paused = %s, position_seconds = %s WHERE guild_id = %s AND bot_name = 'nexus'",
                                 (channel_id, player_playing, player_paused, int(live_position or metrics_row.get("position_seconds") or 0), g.id),
                             )
-                        await cur.execute(
+                        metrics_rows.append((
+                            g.id,
+                            voice_connected,
+                            channel_id,
+                            voice_connected,
+                            player_playing,
+                            player_paused,
+                            int(metrics_row.get("queue_total") or 0),
+                            int(metrics_row.get("backup_total") or 0),
+                            bool(metrics_row.get("is_playing")) if voice_connected else False,
+                            bool(metrics_row.get("is_paused")) if voice_connected else False,
+                            int(live_position or metrics_row.get("position_seconds") or 0),
+                            live_duration,
+                            g.id in recovering_guilds or str(g.id) in guild_states,
+                            bool(lavalink_ready),
+                            metrics_last_errors.get(g.id),
+                        ))
+                    if metrics_rows:
+                        await cur.executemany(
                             """
                             REPLACE INTO nexus_metrics
                                 (guild_id, bot_name, voice_connected, connected_channel_id, player_connected, player_playing, player_paused,
@@ -3319,23 +3338,7 @@ async def collect_and_persist_metrics(guild=None):
                                  heartbeat_age_seconds, lavalink_ready, last_error)
                             VALUES (%s, 'nexus', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0, %s, %s)
                             """,
-                            (
-                                g.id,
-                                voice_connected,
-                                channel_id,
-                                voice_connected,
-                                player_playing,
-                                player_paused,
-                                int(metrics_row.get("queue_total") or 0),
-                                int(metrics_row.get("backup_total") or 0),
-                                bool(metrics_row.get("is_playing")) if voice_connected else False,
-                                bool(metrics_row.get("is_paused")) if voice_connected else False,
-                                int(live_position or metrics_row.get("position_seconds") or 0),
-                                live_duration,
-                                g.id in recovering_guilds or str(g.id) in guild_states,
-                                bool(lavalink_ready),
-                                metrics_last_errors.get(g.id),
-                            ),
+                            metrics_rows,
                         )
     except Exception as exc:
         logger.exception("[nexus] Metrics collection failed: %s", exc)
@@ -5179,6 +5182,23 @@ def _should_auto_disconnect(guild, stay_in_vc=False):
     if stay_in_vc: return False
     return not _has_human_listeners(guild.voice_client)
 
+async def _record_track_outcome_parallel(pool, guild_id, track_uri, track_title, original_requester, outcome, listen_seconds):
+    """Run record_track_outcome on its own connection so it can be gathered with the loop_mode SELECT."""
+    try:
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await record_track_outcome(
+                    cur,
+                    guild_id,
+                    track_uri,
+                    track_title,
+                    original_requester,
+                    outcome=outcome,
+                    listen_seconds=listen_seconds,
+                )
+    except Exception:
+        logger.debug("[%s] Track intelligence outcome write skipped (parallel).", guild_id, exc_info=True)
+
 @bot.event
 async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
     player = getattr(payload, "player", None)
@@ -5201,35 +5221,29 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
                 return
 
         if track:
+            # Collect all in-memory data before touching the DB.
+            track_data = playback_tracking.get(guild.id, {})
+            original_requester = track_data.get('requester_id', bot.user.id if bot.user else None)
+            track_uri = getattr(track, 'uri', None) or track_data.get('url')
+            track_title = getattr(track, 'title', None) or track_data.get('title')
+            resolved_track_uid = track_data.get("track_uid") or _track_uid_from_obj(track)
+            if reason == "FINISHED":
+                final_position = int(track_data.get('duration') or current_track_position(guild.id) or 0)
+            else:
+                final_position = int(current_track_position(guild.id) or track_data.get('last_position_checkpoint') or 0)
+            listen_seconds = consume_realtime_listen_delta(track_data, final_position, playing=True) if track_data else max(0, final_position)
+            outcome = "finished" if reason == "FINISHED" else "skipped"
+
             async with DBPoolManager() as pool:
+                # SELECT loop_mode and record_track_outcome write are independent —
+                # run them in parallel on separate pool connections.
                 async with pool.acquire() as conn:
                     async with conn.cursor() as cur:
-                        await cur.execute("SELECT loop_mode FROM nexus_guild_settings WHERE guild_id = %s", (guild.id,))
+                        loop_mode_coro = cur.execute("SELECT loop_mode FROM nexus_guild_settings WHERE guild_id = %s", (guild.id,))
+                        outcome_coro = _record_track_outcome_parallel(pool, guild.id, track_uri, track_title, original_requester, outcome, listen_seconds)
+                        await asyncio.gather(loop_mode_coro, outcome_coro)
                         mode_row = await cur.fetchone()
                         loop_mode = mode_row[0] if mode_row and mode_row[0] else 'queue'
-                        track_data = playback_tracking.get(guild.id, {})
-                        original_requester = track_data.get('requester_id', bot.user.id if bot.user else None)
-                        track_uri = getattr(track, 'uri', None) or track_data.get('url')
-                        track_title = getattr(track, 'title', None) or track_data.get('title')
-                        resolved_track_uid = track_data.get("track_uid") or _track_uid_from_obj(track)
-
-                        try:
-                            if reason == "FINISHED":
-                                final_position = int(track_data.get('duration') or current_track_position(guild.id) or 0)
-                            else:
-                                final_position = int(current_track_position(guild.id) or track_data.get('last_position_checkpoint') or 0)
-                            listen_seconds = consume_realtime_listen_delta(track_data, final_position, playing=True) if track_data else max(0, final_position)
-                            await record_track_outcome(
-                                cur,
-                                guild.id,
-                                track_uri,
-                                track_title,
-                                original_requester,
-                                outcome="finished" if reason == "FINISHED" else "skipped",
-                                listen_seconds=listen_seconds,
-                            )
-                        except Exception as tx_error:
-                            logger.debug("[%s] Track intelligence outcome write skipped.", guild.id, exc_info=True)
 
                         if reason == "FINISHED":
                             clear_track_failure(guild.id, track_uri, track_title)
@@ -5703,40 +5717,61 @@ async def restore_guild_state(guild_id, state, *, override_backoff=False):
         if not handoff:
             recovering_guilds.discard(target_guild_id)
 
+async def _drsd_fetch_playback(pool, guild_id):
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT channel_id, position_seconds, is_playing, video_url, title, track_uid "
+                "FROM nexus_playback_state WHERE guild_id = %s AND bot_name = 'nexus' LIMIT 1",
+                (guild_id,),
+            )
+            return await cur.fetchone()
+
+async def _drsd_fetch_home(pool, guild_id):
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT home_vc_id FROM nexus_bot_home_channels WHERE guild_id = %s AND bot_name = 'nexus' LIMIT 1",
+                (guild_id,),
+            )
+            return await cur.fetchone()
+
+async def _drsd_fetch_voice(pool, guild_id):
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT COALESCE(connected_channel_id, last_channel_id) FROM nexus_voice_state WHERE guild_id = %s AND bot_name = 'nexus' AND desired_connected = TRUE LIMIT 1",
+                (guild_id,),
+            )
+            return await cur.fetchone()
+
+async def _drsd_fetch_queue_count(pool, guild_id):
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT COUNT(*) FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus'",
+                (guild_id,),
+            )
+            return await cur.fetchone()
+
+async def _drsd_fetch_backup_count(pool, guild_id):
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT COUNT(*) FROM nexus_queue_backup WHERE guild_id = %s AND bot_name = 'nexus'",
+                (guild_id,),
+            )
+            return await cur.fetchone()
+
 async def derive_recovery_state_from_db(guild_id):
     async with DBPoolManager() as pool:
-        async with pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    "SELECT channel_id, position_seconds, is_playing, video_url, title, track_uid "
-                    "FROM nexus_playback_state WHERE guild_id = %s AND bot_name = 'nexus' LIMIT 1",
-                    (guild_id,),
-                )
-                playback = await cur.fetchone()
-
-                await cur.execute(
-                    "SELECT home_vc_id FROM nexus_bot_home_channels WHERE guild_id = %s AND bot_name = 'nexus' LIMIT 1",
-                    (guild_id,),
-                )
-                home_row = await cur.fetchone()
-
-                await cur.execute(
-                    "SELECT COALESCE(connected_channel_id, last_channel_id) FROM nexus_voice_state WHERE guild_id = %s AND bot_name = 'nexus' AND desired_connected = TRUE LIMIT 1",
-                    (guild_id,),
-                )
-                voice_row = await cur.fetchone()
-
-                await cur.execute(
-                    "SELECT COUNT(*) FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus'",
-                    (guild_id,),
-                )
-                queue_row = await cur.fetchone()
-
-                await cur.execute(
-                    "SELECT COUNT(*) FROM nexus_queue_backup WHERE guild_id = %s AND bot_name = 'nexus'",
-                    (guild_id,),
-                )
-                backup_row = await cur.fetchone()
+        playback, home_row, voice_row, queue_row, backup_row = await asyncio.gather(
+            _drsd_fetch_playback(pool, guild_id),
+            _drsd_fetch_home(pool, guild_id),
+            _drsd_fetch_voice(pool, guild_id),
+            _drsd_fetch_queue_count(pool, guild_id),
+            _drsd_fetch_backup_count(pool, guild_id),
+        )
 
     playback_channel_id = playback[0] if playback and playback[0] else None
     playback_position = playback[1] if playback and playback[1] is not None else 0
