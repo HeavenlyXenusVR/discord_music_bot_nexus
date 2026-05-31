@@ -818,6 +818,9 @@ playback_tracking = {}
 guild_states = {}
 STATE_FILE_WRITE_CACHE = {}
 auto_heal_initialized = False
+# Prefetch cache: resolve next track's Lavalink URL while current track plays,
+# eliminating the gap between tracks. Keyed by guild_id.
+_nexus_prefetch_cache: dict = {}  # guild_id -> {url, title, track, expires_at}
 recovering_guilds = set()
 process_queue_locks = {}
 voice_connect_locks = {}
@@ -5294,6 +5297,19 @@ async def on_wavelink_websocket_closed(payload: wavelink.WebsocketClosedEventPay
         )
 
 
+async def _prefetch_next_track_bg(guild_id: int, url: str, title: str) -> None:
+    """Resolve the next track's Lavalink URL in the background while the current track plays."""
+    try:
+        track, _ = await resolve_queue_track(url, title)
+        _nexus_prefetch_cache[guild_id] = {
+            'url': url, 'title': title, 'track': track,
+            'expires_at': time.monotonic() + 300,
+        }
+        logger.debug("[nexus] Prefetched next track for guild %s: %s", guild_id, title)
+    except Exception:
+        _nexus_prefetch_cache.pop(guild_id, None)
+
+
 async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_recovery_restore=False):
     async with DBPoolManager() as pool:
         async with pool.acquire() as conn:
@@ -5357,7 +5373,15 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
                 claim_live_queue_track(guild.id, url, title, track_uid)
                 await cur.execute("DELETE FROM nexus_queue WHERE id = %s AND guild_id = %s AND bot_name = 'nexus'", (song_id, guild.id))
                 try:
-                    track, resolved_source = await resolve_queue_track(url, title)
+                    # Use prefetch cache if available for this guild+url (eliminates Lavalink round-trip gap)
+                    _cached = _nexus_prefetch_cache.get(guild.id)
+                    if _cached and _cached.get('url') == url and _cached.get('expires_at', 0) > time.monotonic():
+                        track = _cached['track']
+                        resolved_source = url
+                        _nexus_prefetch_cache.pop(guild.id, None)
+                        logger.debug("[nexus] Prefetch cache hit for guild %s: %s", guild.id, title)
+                    else:
+                        track, resolved_source = await resolve_queue_track(url, title)
                     duration = track.length / 1000
                     uploader = track.author
                     if resolved_source != url:
@@ -5463,6 +5487,19 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
 
                 # FIX: Execute auto-stage updater
                 schedule_named_task(f"stage_topic:{guild.id}", update_stage_topic(guild, title, requester_id))
+
+                # Prefetch the next track's Lavalink URL in the background so the
+                # gap between tracks is eliminated on the next on_wavelink_track_end.
+                try:
+                    await cur.execute(
+                        "SELECT video_url, title FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus' ORDER BY id ASC LIMIT 1",
+                        (guild.id,),
+                    )
+                    _next_row = await cur.fetchone()
+                    if _next_row and _next_row[0]:
+                        asyncio.create_task(_prefetch_next_track_bg(guild.id, _next_row[0], _next_row[1] or ""))
+                except Exception:
+                    pass
 
                 if start_position <= 0:
                     await cur.execute("INSERT INTO nexus_history (guild_id, video_url, title, requester_id) VALUES (%s, %s, %s, %s)", (guild.id, url, title, requester_id))
