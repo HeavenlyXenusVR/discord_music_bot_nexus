@@ -6962,15 +6962,15 @@ def apply_filter_preset(wav_filters, mode, current_speed=1.0):
     elif mode == 'bassboost':
         _safe_filter_call(mode, lambda: wav_filters.equalizer.set(bands=[(0, 0.32), (1, 0.24), (2, 0.12)]))
     elif mode == '8d':
-        _safe_filter_call(mode, lambda: setattr(wav_filters.rotation, "speed", 0.18))
+        _safe_filter_call(mode, lambda: wav_filters.rotation.set(rotation_hz=0.18))
     elif mode == 'karaoke':
-        _safe_filter_call(mode, lambda: [setattr(wav_filters.karaoke, k, v) for k, v in [("level", 1.0), ("mono_level", 1.0), ("filter_band", 220.0), ("filter_width", 100.0)]])
+        _safe_filter_call(mode, lambda: wav_filters.karaoke.set(level=1.0, mono_level=1.0, filter_band=220.0, filter_width=100.0))
     elif mode == 'tremolo':
-        _safe_filter_call(mode, lambda: [setattr(wav_filters.tremolo, "frequency", 4.0), setattr(wav_filters.tremolo, "depth", 0.45)])
+        _safe_filter_call(mode, lambda: wav_filters.tremolo.set(frequency=4.0, depth=0.45))
     elif mode == 'vibrato':
-        _safe_filter_call(mode, lambda: [setattr(wav_filters.vibrato, "frequency", 4.5), setattr(wav_filters.vibrato, "depth", 0.35)])
+        _safe_filter_call(mode, lambda: wav_filters.vibrato.set(frequency=4.5, depth=0.35))
     elif mode in {'lowpass', 'lofi'}:
-        _safe_filter_call(mode, lambda: setattr(wav_filters.low_pass, "smoothing", 20.0 if mode == "lowpass" else 35.0))
+        _safe_filter_call(mode, lambda: wav_filters.low_pass.set(smoothing=20.0 if mode == "lowpass" else 35.0))
         if mode == 'lofi':
             _safe_filter_call(mode, lambda: wav_filters.timescale.set(speed=0.94, pitch=0.96))
             speed = 0.94
@@ -7076,12 +7076,20 @@ async def filter_cmd(interaction: discord.Interaction, mode: str):
             async with conn.cursor() as cur:
                 if mode != 'none': await cur.execute("UPDATE nexus_guild_settings SET filter_mode = %s, custom_speed = 1.0, custom_pitch = 1.0, custom_modifiers_left = 0 WHERE guild_id = %s", (mode, interaction.guild.id))
                 else: await cur.execute("UPDATE nexus_guild_settings SET filter_mode = %s, custom_speed = 1.0, custom_pitch = 1.0, custom_modifiers_left = 0 WHERE guild_id = %s", (mode, interaction.guild.id))
+    new_speed = 1.0
     if interaction.guild.voice_client:
         wav_filters = wavelink.Filters()
-        apply_filter_preset(wav_filters, mode)
-        try: await replace_audio_filters(interaction.guild.voice_client, wav_filters)
-        except Exception as tx_error: pass
-    await interaction.followup.send(embed=discord.Embed(description=f"🎛️ Filter set to: **{mode}**.", color=discord.Color.blurple()), ephemeral=True)
+        new_speed = apply_filter_preset(wav_filters, mode)
+        try:
+            await replace_audio_filters(interaction.guild.voice_client, wav_filters)
+        except Exception as tx_error:
+            pass
+    # Update in-memory speed so the progress tracker stays accurate during playback
+    if interaction.guild.id in playback_tracking:
+        playback_tracking[interaction.guild.id]['speed'] = new_speed
+        playback_tracking[interaction.guild.id]['current_filter'] = mode
+    label = next((c.name for c in FILTER_PRESET_CHOICES if c.value == mode), mode)
+    await interaction.followup.send(embed=discord.Embed(description=f"🎛️ Filter set to: **{label}**.", color=discord.Color.blurple()), ephemeral=True)
 
 @bot.tree.command(name="nexus_main_fade", description="Customize track fade transitions or let the bot pick smart fade timing.")
 @app_commands.describe(mode="Fade mode", seconds="Fade length in seconds, from 0.5 to 20", curve="Volume curve")
