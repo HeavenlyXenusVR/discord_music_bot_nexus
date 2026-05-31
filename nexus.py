@@ -1989,6 +1989,7 @@ async def init_db():
     async with DBPoolManager() as pool:
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
+                await cur.execute("SET sql_notes=0")
                 await cur.execute("CREATE TABLE IF NOT EXISTS nexus_playback_state (guild_id BIGINT, bot_name VARCHAR(50), channel_id BIGINT, video_url TEXT, position_seconds INT DEFAULT 0, is_playing BOOLEAN DEFAULT FALSE, is_paused BOOLEAN DEFAULT FALSE, title TEXT, last_checkpoint_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, play_session_key VARCHAR(64) DEFAULT NULL, track_uid CHAR(32) DEFAULT NULL, PRIMARY KEY (guild_id, bot_name))")
                 await safe_schema_execute(cur, "ALTER TABLE nexus_playback_state ADD COLUMN title TEXT")
                 await safe_schema_execute(cur, "ALTER TABLE nexus_playback_state ADD COLUMN is_paused BOOLEAN DEFAULT FALSE")
