@@ -6496,6 +6496,7 @@ async def skipto(interaction: discord.Interaction, index: int):
     if not await is_dj(interaction): return
     if index < 1:
         return await interaction.response.send_message("Invalid index.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
     async with DBPoolManager() as pool:
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
@@ -6526,7 +6527,7 @@ async def skipto(interaction: discord.Interaction, index: int):
                         logger.exception("[nexus] skipto transaction failed; live/backup queues rolled back instead of drifting.")
                         raise
     if interaction.guild.voice_client: await interaction.guild.voice_client.stop()
-    await interaction.response.send_message(embed=discord.Embed(description=f"Skipped to #{index}", color=discord.Color.green()), ephemeral=True)
+    await interaction.followup.send(embed=discord.Embed(description=f"Skipped to #{index}", color=discord.Color.green()), ephemeral=True)
 
 @bot.tree.command(name="nexus_main_move", description="Move a queued track from one queue slot to another without rebuilding the entire session manually.")
 async def move(interaction: discord.Interaction, frm: int, to: int):
@@ -6590,6 +6591,7 @@ async def bump(interaction: discord.Interaction, index: int):
 
 @bot.tree.command(name="nexus_main_clearmine", description="Remove your own queued songs without touching other listeners' tracks")
 async def clearmine(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
     async with DBPoolManager() as pool:
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
@@ -6600,7 +6602,7 @@ async def clearmine(interaction: discord.Interaction):
                     await cur.execute("DELETE FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus' AND requester_id = %s", (interaction.guild.id, interaction.user.id))
                     # FIX 10: Mirror deletion in the backup queue
                     await cur.execute("DELETE FROM nexus_queue_backup WHERE guild_id = %s AND bot_name = 'nexus' AND requester_id = %s", (interaction.guild.id, interaction.user.id))
-    await interaction.response.send_message(embed=discord.Embed(description=f"🧹 Removed **{removed}** of your queued track(s).", color=discord.Color.green()), ephemeral=True)
+    await interaction.followup.send(embed=discord.Embed(description=f"🧹 Removed **{removed}** of your queued track(s).", color=discord.Color.green()), ephemeral=True)
 
 @bot.tree.command(name="nexus_main_voteskip", description="Start or join a vote skip when no DJ is around to skip directly")
 async def voteskip(interaction: discord.Interaction):
@@ -7760,9 +7762,12 @@ async def aria_command_listener():
             attempts = int(row.get('attempts', 0) or 0)
 
             if cmd == 'RESTART':
-                await cur.execute("DELETE FROM nexus_swarm_overrides WHERE guild_id = %s AND bot_name = %s", (guild_id, 'nexus'))
+                async with DBPoolManager() as _restart_pool:
+                    async with _restart_pool.acquire() as _restart_conn:
+                        async with _restart_conn.cursor() as _restart_cur:
+                            await _restart_cur.execute("DELETE FROM nexus_swarm_overrides WHERE guild_id = %s AND bot_name = %s", (guild_id, 'nexus'))
                 await request_supervisor_restart("aria_override")
-                continue  # Bot is restarting; skip remaining processing for this row
+                continue
 
             guild = bot.get_guild(guild_id)
             vc = guild.voice_client if guild else None
@@ -7803,11 +7808,13 @@ async def aria_command_listener():
                     logger.info("[nexus] Ignored Aria override %s for guild %s because the player state did not match.", cmd, guild_id)
             else:
                 logger.warning("[nexus] Received Aria override %s for unknown guild %s.", cmd, guild_id)
-
-                if executed or attempts + 1 >= DIRECT_ORDER_MAX_ATTEMPTS or not guild:
-                    await cur.execute("DELETE FROM nexus_swarm_overrides WHERE guild_id = %s AND bot_name = %s", (guild_id, 'nexus'))
-                else:
-                    await cur.execute("UPDATE nexus_swarm_overrides SET attempts = COALESCE(attempts, 0) + 1, last_error = %s WHERE guild_id = %s AND bot_name = %s", (f"state_mismatch:{cmd}", guild_id, 'nexus'))
+            async with DBPoolManager() as _cleanup_pool:
+                async with _cleanup_pool.acquire() as _cleanup_conn:
+                    async with _cleanup_conn.cursor() as _cleanup_cur:
+                        if executed or attempts + 1 >= DIRECT_ORDER_MAX_ATTEMPTS or not guild:
+                            await _cleanup_cur.execute("DELETE FROM nexus_swarm_overrides WHERE guild_id = %s AND bot_name = %s", (guild_id, 'nexus'))
+                        else:
+                            await _cleanup_cur.execute("UPDATE nexus_swarm_overrides SET attempts = COALESCE(attempts, 0) + 1, last_error = %s WHERE guild_id = %s AND bot_name = %s", (f"state_mismatch:{cmd}", guild_id, 'nexus'))
     except Exception as tx_error:
         logger.exception("Aria override listener failed for nexus.")
 
@@ -8390,7 +8397,9 @@ class SwarmIntelligence(commands.Cog):
                 if title:
                     return str(title).replace("\n", " ").strip(), guild.name
                 try:
-                            async with conn.cursor(aiomysql.DictCursor) as cur:
+                    async with DBPoolManager() as _pool:
+                        async with _pool.acquire() as _conn:
+                            async with _conn.cursor(aiomysql.DictCursor) as cur:
                                 await cur.execute(
                                     f"SELECT title, is_playing, is_paused FROM {self.bot_name}_playback_state WHERE guild_id = %s AND bot_name = %s AND (is_playing = TRUE OR is_paused = TRUE) ORDER BY is_playing DESC LIMIT 1",
                                     (guild.id, self.bot_name),
