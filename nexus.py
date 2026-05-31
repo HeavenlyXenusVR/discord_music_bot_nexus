@@ -6926,6 +6926,17 @@ FILTER_PRESET_CHOICES = [
     app_commands.Choice(name="Party", value="party"),
     app_commands.Choice(name="Radio", value="radio"),
     app_commands.Choice(name="Cinema", value="cinema"),
+    app_commands.Choice(name="Soft", value="soft"),
+    app_commands.Choice(name="Pop", value="pop"),
+    app_commands.Choice(name="Rock", value="rock"),
+    app_commands.Choice(name="Classical", value="classical"),
+    app_commands.Choice(name="Ear Rape", value="earrape"),
+    app_commands.Choice(name="Double Time (2x)", value="doubletime"),
+    app_commands.Choice(name="Slow Mo (0.5x)", value="slowmo"),
+    app_commands.Choice(name="Pitch Up", value="pitch_up"),
+    app_commands.Choice(name="Pitch Down", value="pitch_down"),
+    app_commands.Choice(name="Deep", value="deep"),
+    app_commands.Choice(name="Anime", value="anime"),
 ]
 FILTER_PRESET_VALUES = {choice.value for choice in FILTER_PRESET_CHOICES}
 
@@ -6972,6 +6983,47 @@ def apply_filter_preset(wav_filters, mode, current_speed=1.0):
         _safe_filter_call(mode, lambda: wav_filters.low_pass.set(smoothing=18.0))
     elif mode == 'cinema':
         _safe_filter_call(mode, lambda: wav_filters.equalizer.set(bands=[(0, 0.18), (1, 0.12), (8, 0.08), (9, 0.10)]))
+    elif mode == 'soft':
+        _safe_filter_call(mode, lambda: wav_filters.low_pass.set(smoothing=25.0))
+    elif mode == 'pop':
+        _safe_filter_call(mode, lambda: wav_filters.equalizer.set(bands=[
+            (0, -0.1), (1, 0.1), (2, 0.2), (3, 0.25), (4, 0.2),
+            (5, 0.1), (6, 0.0), (7, -0.05), (8, -0.1), (9, -0.1),
+            (10, -0.05), (11, 0.0), (12, 0.1), (13, 0.2), (14, 0.1)
+        ]))
+    elif mode == 'rock':
+        _safe_filter_call(mode, lambda: wav_filters.equalizer.set(bands=[
+            (0, 0.3), (1, 0.25), (2, 0.1), (3, -0.1), (4, -0.15),
+            (5, -0.1), (6, 0.0), (7, 0.1), (8, 0.3), (9, 0.35),
+            (10, 0.3), (11, 0.2), (12, 0.1), (13, 0.05), (14, 0.0)
+        ]))
+    elif mode == 'classical':
+        _safe_filter_call(mode, lambda: wav_filters.equalizer.set(bands=[
+            (0, 0.1), (1, 0.1), (2, 0.05), (3, 0.0), (4, -0.05),
+            (5, -0.05), (6, -0.05), (7, -0.05), (8, -0.05), (9, -0.05),
+            (10, 0.0), (11, 0.05), (12, 0.1), (13, 0.15), (14, 0.2)
+        ]))
+    elif mode == 'earrape':
+        _safe_filter_call(mode, lambda: wav_filters.distortion.set(
+            sin_offset=0.0, sin_scale=1.0, cos_offset=0.0, cos_scale=1.0,
+            tan_offset=0.0, tan_scale=1.0, r_offset=0.0, r_scale=1.0, k_rate=100.0
+        ))
+    elif mode == 'doubletime':
+        if _safe_filter_call(mode, lambda: wav_filters.timescale.set(speed=2.0, pitch=1.0)):
+            speed = 2.0
+    elif mode == 'slowmo':
+        if _safe_filter_call(mode, lambda: wav_filters.timescale.set(speed=0.5, pitch=1.0)):
+            speed = 0.5
+    elif mode == 'pitch_up':
+        _safe_filter_call(mode, lambda: wav_filters.timescale.set(speed=1.0, pitch=1.3))
+    elif mode == 'pitch_down':
+        _safe_filter_call(mode, lambda: wav_filters.timescale.set(speed=1.0, pitch=0.7))
+    elif mode == 'deep':
+        _safe_filter_call(mode, lambda: wav_filters.equalizer.set(bands=[(0, 0.5), (1, 0.4), (2, 0.3)]))
+        _safe_filter_call(mode, lambda: wav_filters.timescale.set(speed=1.0, pitch=0.8))
+    elif mode == 'anime':
+        if _safe_filter_call(mode, lambda: wav_filters.timescale.set(speed=1.4, pitch=1.5)):
+            speed = 1.4
     return speed
 
 async def replace_audio_filters(voice_client, wav_filters):
