@@ -3388,8 +3388,11 @@ async def restore_persistent_voice_states():
                 state = await derive_recovery_state_from_db(guild.id)
                 stay_in_vc = False
                 try:
-                                await cur.execute("SELECT stay_in_vc FROM nexus_guild_settings WHERE guild_id = %s", (guild.id,))
-                                stay_row = await cur.fetchone()
+                    async with DBPoolManager() as _pool:
+                        async with _pool.acquire() as _conn:
+                            async with _conn.cursor() as _cur:
+                                await _cur.execute("SELECT stay_in_vc FROM nexus_guild_settings WHERE guild_id = %s", (guild.id,))
+                                stay_row = await _cur.fetchone()
                                 stay_in_vc = bool(stay_row[0]) if stay_row else False
                 except Exception as tx_error:
                     logger.debug("[nexus] Failed checking 24/7 state for persistent voice restore.", exc_info=True)
@@ -3403,7 +3406,13 @@ async def restore_persistent_voice_states():
                     if state:
                         schedule_named_task(f"persistent_voice_restore_process_queue:{guild.id}", process_queue(guild, channel_id, start_position=state.get("position", 0), allow_recovery_restore=True))
                 else:
-                                await cur.execute("UPDATE nexus_voice_state SET reconnect_attempts = reconnect_attempts + 1, last_error = %s WHERE guild_id = %s AND bot_name = 'nexus'", ("rejoin_failed", guild.id))
+                    try:
+                        async with DBPoolManager() as _pool:
+                            async with _pool.acquire() as _conn:
+                                async with _conn.cursor() as _cur:
+                                    await _cur.execute("UPDATE nexus_voice_state SET reconnect_attempts = reconnect_attempts + 1, last_error = %s WHERE guild_id = %s AND bot_name = 'nexus'", ("rejoin_failed", guild.id))
+                    except Exception as tx_error:
+                        logger.debug("[nexus] Failed to increment reconnect_attempts for guild %s.", guild.id, exc_info=True)
             except Exception as row_exc:
                 logger.warning("[nexus] Persistent voice row recovery failed: %s", row_exc)
     except Exception as exc:
