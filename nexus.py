@@ -411,16 +411,6 @@ def _wavelink_event_reason(reason) -> str:
     return text
 
 
-def _mysql_error_code(exc):
-    args = getattr(exc, "args", ()) or ()
-    if args:
-        try:
-            return int(args[0])
-        except (TypeError, ValueError):
-            return None
-    return None
-
-
 def _is_retryable_mysql_error(exc):
     return _mysql_error_code(exc) in {1205, 1213, 2006, 2013}
 
