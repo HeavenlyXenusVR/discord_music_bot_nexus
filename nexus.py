@@ -7732,137 +7732,151 @@ async def playlist_sync_loop():
                 if not current_rows:
                     continue
 
-                async with DBPoolManager() as pool:
-                    async with pool.acquire() as conn:
-                        async with conn.cursor() as cur:
-                            await prime_loop_queue_defaults(cur, guild_id, shuffle_if_needed=False)
-                            await cur.execute("SELECT track_key, track_uid, video_url, title, requester_id FROM nexus_active_playlist_tracks WHERE guild_id = %s AND bot_name = 'nexus' ORDER BY position_idx ASC", (guild_id,))
-                            previous_rows_raw = await cur.fetchall() or []
-                            previous_rows = []
-                            for prev in previous_rows_raw:
-                                p_key = _row_value(prev, 'track_key', _row_value(prev, 0))
-                                p_uid = _row_track_uid(prev, 1)
-                                p_url = _row_value(prev, 'video_url', _row_value(prev, 2))
-                                p_title = _row_value(prev, 'title', _row_value(prev, 3))
-                                p_req = _row_value(prev, 'requester_id', _row_value(prev, 4))
-                                if not p_key:
-                                    p_key = _track_key(p_url, p_title)
-                                previous_rows.append((p_url, p_title, p_req, p_key, p_uid or _new_track_uid()))
+                _psync_delays = [0.05, 0.1]
+                for _psync_attempt in range(3):
+                    try:
+                        async with DBPoolManager() as pool:
+                            async with pool.acquire() as conn:
+                                async with conn.cursor() as cur:
+                                    await prime_loop_queue_defaults(cur, guild_id, shuffle_if_needed=False)
+                                    await cur.execute("SELECT track_key, track_uid, video_url, title, requester_id FROM nexus_active_playlist_tracks WHERE guild_id = %s AND bot_name = 'nexus' ORDER BY position_idx ASC", (guild_id,))
+                                    previous_rows_raw = await cur.fetchall() or []
+                                    previous_rows = []
+                                    for prev in previous_rows_raw:
+                                        p_key = _row_value(prev, 'track_key', _row_value(prev, 0))
+                                        p_uid = _row_track_uid(prev, 1)
+                                        p_url = _row_value(prev, 'video_url', _row_value(prev, 2))
+                                        p_title = _row_value(prev, 'title', _row_value(prev, 3))
+                                        p_req = _row_value(prev, 'requester_id', _row_value(prev, 4))
+                                        if not p_key:
+                                            p_key = _track_key(p_url, p_title)
+                                        previous_rows.append((p_url, p_title, p_req, p_key, p_uid or _new_track_uid()))
 
-                            added_rows = []
-                            removed_counts = {}
-                            if previous_rows:
-                                previous_counts = {}
-                                for _p_url, _p_title, _p_req, p_key, _p_uid in previous_rows:
-                                    previous_counts[p_key] = previous_counts.get(p_key, 0) + 1
-                                current_counts = {}
-                                for _c_url, _c_title, _c_req, c_key, _c_uid in current_rows:
-                                    current_counts[c_key] = current_counts.get(c_key, 0) + 1
-                                for p_key, p_count in previous_counts.items():
-                                    missing = p_count - current_counts.get(p_key, 0)
-                                    if missing > 0:
-                                        removed_counts[p_key] = missing
-                                remaining_previous = previous_counts.copy()
-                                for row in current_rows:
-                                    if not _decrement_count(remaining_previous, row[3]):
-                                        added_rows.append(row)
-                            else:
-                                # First run after this patch: seed the identity snapshot.
-                                # If the old count says the playlist grew, queue only the tail delta.
-                                if current_count > known_count > 0:
-                                    added_rows = current_rows[known_count:]
+                                    added_rows = []
+                                    removed_counts = {}
+                                    if previous_rows:
+                                        previous_counts = {}
+                                        for _p_url, _p_title, _p_req, p_key, _p_uid in previous_rows:
+                                            previous_counts[p_key] = previous_counts.get(p_key, 0) + 1
+                                        current_counts = {}
+                                        for _c_url, _c_title, _c_req, c_key, _c_uid in current_rows:
+                                            current_counts[c_key] = current_counts.get(c_key, 0) + 1
+                                        for p_key, p_count in previous_counts.items():
+                                            missing = p_count - current_counts.get(p_key, 0)
+                                            if missing > 0:
+                                                removed_counts[p_key] = missing
+                                        remaining_previous = previous_counts.copy()
+                                        for row in current_rows:
+                                            if not _decrement_count(remaining_previous, row[3]):
+                                                added_rows.append(row)
+                                    else:
+                                        # First run after this patch: seed the identity snapshot.
+                                        # If the old count says the playlist grew, queue only the tail delta.
+                                        if current_count > known_count > 0:
+                                            added_rows = current_rows[known_count:]
 
-                            purged_live = 0
-                            purged_backup = 0
-                            if removed_counts:
-                                await cur.execute("SELECT id, video_url, title, track_uid FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus' ORDER BY id ASC", (guild_id,))
-                                live_rows = await cur.fetchall() or []
-                                live_delete_ids = []
-                                live_budget = removed_counts.copy()
-                                for live in live_rows:
-                                    live_id = _row_value(live, 'id', _row_value(live, 0))
-                                    live_url = _row_value(live, 'video_url', _row_value(live, 1))
-                                    live_title = _row_value(live, 'title', _row_value(live, 2))
-                                    live_key = _track_key(live_url, live_title)
-                                    if _decrement_count(live_budget, live_key):
-                                        live_delete_ids.append(live_id)
-                                for live_id in live_delete_ids:
-                                    await cur.execute("DELETE FROM nexus_queue WHERE id = %s AND guild_id = %s AND bot_name = 'nexus'", (live_id, guild_id))
-                                    purged_live += 1
+                                    purged_live = 0
+                                    purged_backup = 0
+                                    if removed_counts:
+                                        await cur.execute("SELECT id, video_url, title, track_uid FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus' ORDER BY id ASC", (guild_id,))
+                                        live_rows = await cur.fetchall() or []
+                                        live_delete_ids = []
+                                        live_budget = removed_counts.copy()
+                                        for live in live_rows:
+                                            live_id = _row_value(live, 'id', _row_value(live, 0))
+                                            live_url = _row_value(live, 'video_url', _row_value(live, 1))
+                                            live_title = _row_value(live, 'title', _row_value(live, 2))
+                                            live_key = _track_key(live_url, live_title)
+                                            if _decrement_count(live_budget, live_key):
+                                                live_delete_ids.append(live_id)
+                                        for live_id in live_delete_ids:
+                                            await cur.execute("DELETE FROM nexus_queue WHERE id = %s AND guild_id = %s AND bot_name = 'nexus'", (live_id, guild_id))
+                                            purged_live += 1
 
-                                await cur.execute("SELECT id, video_url, title, track_uid FROM nexus_queue_backup WHERE guild_id = %s AND bot_name = 'nexus' ORDER BY id ASC", (guild_id,))
-                                backup_rows = await cur.fetchall() or []
-                                backup_delete_ids = []
-                                backup_budget = removed_counts.copy()
-                                for backup in backup_rows:
-                                    backup_id = _row_value(backup, 'id', _row_value(backup, 0))
-                                    backup_url = _row_value(backup, 'video_url', _row_value(backup, 1))
-                                    backup_title = _row_value(backup, 'title', _row_value(backup, 2))
-                                    backup_key = _track_key(backup_url, backup_title)
-                                    if _decrement_count(backup_budget, backup_key):
-                                        backup_delete_ids.append(backup_id)
-                                for backup_id in backup_delete_ids:
-                                    await cur.execute("DELETE FROM nexus_queue_backup WHERE id = %s AND guild_id = %s AND bot_name = 'nexus'", (backup_id, guild_id))
-                                    purged_backup += 1
+                                        await cur.execute("SELECT id, video_url, title, track_uid FROM nexus_queue_backup WHERE guild_id = %s AND bot_name = 'nexus' ORDER BY id ASC", (guild_id,))
+                                        backup_rows = await cur.fetchall() or []
+                                        backup_delete_ids = []
+                                        backup_budget = removed_counts.copy()
+                                        for backup in backup_rows:
+                                            backup_id = _row_value(backup, 'id', _row_value(backup, 0))
+                                            backup_url = _row_value(backup, 'video_url', _row_value(backup, 1))
+                                            backup_title = _row_value(backup, 'title', _row_value(backup, 2))
+                                            backup_key = _track_key(backup_url, backup_title)
+                                            if _decrement_count(backup_budget, backup_key):
+                                                backup_delete_ids.append(backup_id)
+                                        for backup_id in backup_delete_ids:
+                                            await cur.execute("DELETE FROM nexus_queue_backup WHERE id = %s AND guild_id = %s AND bot_name = 'nexus'", (backup_id, guild_id))
+                                            purged_backup += 1
 
-                            added_count = len(added_rows)
-                            if added_rows:
-                                await cur.executemany(
-                                    "INSERT INTO nexus_queue (guild_id, bot_name, video_url, title, requester_id, track_uid) VALUES (%s, %s, %s, %s, %s, %s)",
-                                    [(guild_id, 'nexus', t_url, t_title, t_req, track_uid) for t_url, t_title, t_req, _key, track_uid in added_rows],
-                                )
-                                try:
-                                    await bulk_record_tracks_queued(cur, guild_id, [(u, t, r) for u, t, r, _k, _uid in added_rows])
-                                except Exception as tx_error:
-                                    logger.debug("[nexus] Bulk playlist-sync intelligence write skipped.", exc_info=True)
-                                if added_count > 1:
-                                    await shuffle_queue_rows(cur, guild_id, preserve_first=True)
+                                    added_count = len(added_rows)
+                                    if added_rows:
+                                        await cur.executemany(
+                                            "INSERT INTO nexus_queue (guild_id, bot_name, video_url, title, requester_id, track_uid) VALUES (%s, %s, %s, %s, %s, %s)",
+                                            [(guild_id, 'nexus', t_url, t_title, t_req, track_uid) for t_url, t_title, t_req, _key, track_uid in added_rows],
+                                        )
+                                        try:
+                                            await bulk_record_tracks_queued(cur, guild_id, [(u, t, r) for u, t, r, _k, _uid in added_rows])
+                                        except Exception as tx_error:
+                                            logger.debug("[nexus] Bulk playlist-sync intelligence write skipped.", exc_info=True)
+                                        if added_count > 1:
+                                            await shuffle_queue_rows(cur, guild_id, preserve_first=True)
 
-                            # Trim loop-mode duplicate copies of playlist tracks from live queue.
-                            # loop_mode='queue' re-appends played tracks with new UIDs; over time
-                            # the queue grows to N*loops. We keep at most 1 copy per track_key
-                            # that appears in the current playlist, leaving non-playlist tracks alone.
-                            trim_count = 0
-                            if current_rows:
-                                current_playlist_keys = {row[3] for row in current_rows}
-                                await cur.execute(
-                                    "SELECT id, video_url, title FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus' ORDER BY id ASC",
-                                    (guild_id,)
-                                )
-                                all_queue_rows = await cur.fetchall() or []
-                                seen_by_key = {}
-                                trim_ids = []
-                                for qrow in all_queue_rows:
-                                    qid = _row_value(qrow, 'id', _row_value(qrow, 0))
-                                    qurl = _row_value(qrow, 'video_url', _row_value(qrow, 1))
-                                    qtitle = _row_value(qrow, 'title', _row_value(qrow, 2))
-                                    qkey = _track_key(qurl, qtitle)
-                                    if qkey in current_playlist_keys:
-                                        if qkey in seen_by_key:
-                                            trim_ids.append(qid)
-                                        else:
-                                            seen_by_key[qkey] = qid
-                                for trim_id in trim_ids:
-                                    await cur.execute("DELETE FROM nexus_queue WHERE id = %s AND guild_id = %s AND bot_name = 'nexus'", (trim_id, guild_id))
-                                trim_count = len(trim_ids)
-                                if trim_count > 0:
-                                    logger.info("[nexus] Playlist sync trimmed %s excess loop-mode queue copies for guild %s.", trim_count, guild_id)
+                                    # Trim loop-mode duplicate copies of playlist tracks from live queue.
+                                    # loop_mode='queue' re-appends played tracks with new UIDs; over time
+                                    # the queue grows to N*loops. We keep at most 1 copy per track_key
+                                    # that appears in the current playlist, leaving non-playlist tracks alone.
+                                    trim_count = 0
+                                    if current_rows:
+                                        current_playlist_keys = {row[3] for row in current_rows}
+                                        await cur.execute(
+                                            "SELECT id, video_url, title FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus' ORDER BY id ASC",
+                                            (guild_id,)
+                                        )
+                                        all_queue_rows = await cur.fetchall() or []
+                                        seen_by_key = {}
+                                        trim_ids = []
+                                        for qrow in all_queue_rows:
+                                            qid = _row_value(qrow, 'id', _row_value(qrow, 0))
+                                            qurl = _row_value(qrow, 'video_url', _row_value(qrow, 1))
+                                            qtitle = _row_value(qrow, 'title', _row_value(qrow, 2))
+                                            qkey = _track_key(qurl, qtitle)
+                                            if qkey in current_playlist_keys:
+                                                if qkey in seen_by_key:
+                                                    trim_ids.append(qid)
+                                                else:
+                                                    seen_by_key[qkey] = qid
+                                        for trim_id in trim_ids:
+                                            await cur.execute("DELETE FROM nexus_queue WHERE id = %s AND guild_id = %s AND bot_name = 'nexus'", (trim_id, guild_id))
+                                        trim_count = len(trim_ids)
+                                        if trim_count > 0:
+                                            logger.info("[nexus] Playlist sync trimmed %s excess loop-mode queue copies for guild %s.", trim_count, guild_id)
 
-                            # Also purge content-duplicate entries from the backup queue that survived
-                            # UID-based dedup (same song re-added with a different track_uid over time).
-                            backup_content_trim = await dedupe_queue_table_by_track_key(cur, "nexus_queue_backup", guild_id=guild_id, bot_name="nexus")
-                            if backup_content_trim > 0:
-                                logger.info("[nexus] Playlist sync removed %s content-duplicate backup row(s) for guild %s.", backup_content_trim, guild_id)
+                                    # Also purge content-duplicate entries from the backup queue that survived
+                                    # UID-based dedup (same song re-added with a different track_uid over time).
+                                    backup_content_trim = await dedupe_queue_table_by_track_key(cur, "nexus_queue_backup", guild_id=guild_id, bot_name="nexus")
+                                    if backup_content_trim > 0:
+                                        logger.info("[nexus] Playlist sync removed %s content-duplicate backup row(s) for guild %s.", backup_content_trim, guild_id)
 
-                            if added_rows or purged_live or purged_backup or trim_count or backup_content_trim:
-                                await snapshot_queue_backup(cur, guild_id)
+                                    if added_rows or purged_live or purged_backup or trim_count or backup_content_trim:
+                                        await snapshot_queue_backup(cur, guild_id)
 
-                            await cur.execute("DELETE FROM nexus_active_playlist_tracks WHERE guild_id = %s AND bot_name = 'nexus'", (guild_id,))
-                            await cur.executemany(
-                                "INSERT INTO nexus_active_playlist_tracks (guild_id, bot_name, playlist_url, position_idx, track_key, track_uid, video_url, title, requester_id) VALUES (%s, 'nexus', %s, %s, %s, %s, %s, %s, %s)",
-                                [(guild_id, url, idx, key, track_uid, t_url, t_title, t_req) for idx, (t_url, t_title, t_req, key, track_uid) in enumerate(current_rows)],
+                                    await cur.execute("DELETE FROM nexus_active_playlist_tracks WHERE guild_id = %s AND bot_name = 'nexus'", (guild_id,))
+                                    await cur.executemany(
+                                        "INSERT INTO nexus_active_playlist_tracks (guild_id, bot_name, playlist_url, position_idx, track_key, track_uid, video_url, title, requester_id) VALUES (%s, 'nexus', %s, %s, %s, %s, %s, %s, %s)",
+                                        [(guild_id, url, idx, key, track_uid, t_url, t_title, t_req) for idx, (t_url, t_title, t_req, key, track_uid) in enumerate(current_rows)],
+                                    )
+                                    await cur.execute("UPDATE nexus_active_playlists SET known_track_count = %s WHERE guild_id = %s AND bot_name = 'nexus'", (current_count, guild_id))
+                        break
+                    except Exception as _psync_exc:
+                        if _is_retryable_mysql_error(_psync_exc) and _psync_attempt < 2:
+                            logger.warning(
+                                "[%s] Playlist sync DB hit retryable error %s for guild %s; retrying (%s/3).",
+                                BOT_ENV_PREFIX.lower(), _mysql_error_code(_psync_exc) or type(_psync_exc).__name__,
+                                guild_id, _psync_attempt + 1,
                             )
-                            await cur.execute("UPDATE nexus_active_playlists SET known_track_count = %s WHERE guild_id = %s AND bot_name = 'nexus'", (current_count, guild_id))
+                            await asyncio.sleep(_psync_delays[_psync_attempt])
+                            continue
+                        raise
 
                 if added_count or purged_live or purged_backup or trim_count or backup_content_trim:
                     guild = bot.get_guild(int(guild_id))
