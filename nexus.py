@@ -4378,7 +4378,7 @@ async def requeue_failed_track(cur, guild_id, channel_id, url, title, requester_
                 schedule_recovery_retry(guild_id, channel_id, start_position=position, reason=f"{reason}_deduped")
                 return False
 
-            logger.warning(
+            logger.info(
                 "[%s] %s requeue for '%s' hit the dedupe window, but the track is missing from live queue; restoring one guarded copy from backup/current payload.",
                 guild_id,
                 reason,
@@ -4418,7 +4418,6 @@ async def requeue_failed_track(cur, guild_id, channel_id, url, title, requester_
 
         recent_track_requeues[recent_key] = now + TRACK_REQUEUE_DEDUP_SECONDS
         if len(recent_track_requeues) > MAX_RUNTIME_GUILD_CACHE_ENTRIES * 4:
-            recent_track_requeues.clear()
             for old_key, expires_at in list(recent_track_requeues.items()):
                 if expires_at <= now:
                     recent_track_requeues.pop(old_key, None)
@@ -5234,30 +5233,44 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
             listen_seconds = consume_realtime_listen_delta(track_data, final_position, playing=True) if track_data else max(0, final_position)
             outcome = "finished" if reason == "FINISHED" else "skipped"
 
-            async with DBPoolManager() as pool:
-                # SELECT loop_mode and record_track_outcome write are independent —
-                # run them in parallel on separate pool connections.
-                async with pool.acquire() as conn:
-                    async with conn.cursor() as cur:
-                        loop_mode_coro = cur.execute("SELECT loop_mode FROM nexus_guild_settings WHERE guild_id = %s", (guild.id,))
-                        outcome_coro = _record_track_outcome_parallel(pool, guild.id, track_uri, track_title, original_requester, outcome, listen_seconds)
-                        await asyncio.gather(loop_mode_coro, outcome_coro)
-                        mode_row = await cur.fetchone()
-                        loop_mode = mode_row[0] if mode_row and mode_row[0] else 'queue'
+            _track_end_db_delays = [0.05, 0.1]
+            for _track_end_attempt in range(3):
+                try:
+                    async with DBPoolManager() as pool:
+                        # SELECT loop_mode and record_track_outcome write are independent —
+                        # run them in parallel on separate pool connections.
+                        async with pool.acquire() as conn:
+                            async with conn.cursor() as cur:
+                                loop_mode_coro = cur.execute("SELECT loop_mode FROM nexus_guild_settings WHERE guild_id = %s", (guild.id,))
+                                outcome_coro = _record_track_outcome_parallel(pool, guild.id, track_uri, track_title, original_requester, outcome, listen_seconds)
+                                await asyncio.gather(loop_mode_coro, outcome_coro)
+                                mode_row = await cur.fetchone()
+                                loop_mode = mode_row[0] if mode_row and mode_row[0] else 'queue'
 
-                        if reason == "FINISHED":
-                            clear_track_failure(guild.id, track_uri, track_title)
-                            if loop_mode == 'queue':
-                                await requeue_finished_track(cur, guild.id, track_uri, track_title, original_requester, resolved_track_uid)
-                            elif loop_mode == 'song':
-                                await insert_queue_front(cur, "nexus_queue", guild.id, "nexus", track_uri, track_title, original_requester, resolved_track_uid)
-                            else:
-                                if track_uri and track_title:
-                                    await delete_backup_track(cur, guild.id, track_uid=resolved_track_uid, video_url=track_uri, title=track_title)
-                                original_url = track_data.get('original_queue_url')
-                                original_title = track_data.get('original_queue_title')
-                                if original_url and original_title and (original_url != track_uri or original_title != track_title):
-                                    await delete_backup_track(cur, guild.id, video_url=original_url, title=original_title)
+                                if reason == "FINISHED":
+                                    clear_track_failure(guild.id, track_uri, track_title)
+                                    if loop_mode == 'queue':
+                                        await requeue_finished_track(cur, guild.id, track_uri, track_title, original_requester, resolved_track_uid)
+                                    elif loop_mode == 'song':
+                                        await insert_queue_front(cur, "nexus_queue", guild.id, "nexus", track_uri, track_title, original_requester, resolved_track_uid)
+                                    else:
+                                        if track_uri and track_title:
+                                            await delete_backup_track(cur, guild.id, track_uid=resolved_track_uid, video_url=track_uri, title=track_title)
+                                        original_url = track_data.get('original_queue_url')
+                                        original_title = track_data.get('original_queue_title')
+                                        if original_url and original_title and (original_url != track_uri or original_title != track_title):
+                                            await delete_backup_track(cur, guild.id, video_url=original_url, title=original_title)
+                    break
+                except Exception as _track_end_exc:
+                    if _is_retryable_mysql_error(_track_end_exc) and _track_end_attempt < 2:
+                        logger.warning(
+                            "[%s] Track-end DB hit retryable error %s; retrying (%s/3).",
+                            guild.id, _mysql_error_code(_track_end_exc) or type(_track_end_exc).__name__,
+                            _track_end_attempt + 1,
+                        )
+                        await asyncio.sleep(_track_end_db_delays[_track_end_attempt])
+                        continue
+                    raise
     except Exception as e:
         logger.error(f"[{guild.id}] Track-end queue/loop handling error: {e}")
 
