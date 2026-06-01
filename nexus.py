@@ -3897,9 +3897,7 @@ async def prime_loop_queue_defaults(cur, guild_id, *, shuffle_if_needed=True):
         "INSERT INTO nexus_guild_settings (guild_id, loop_mode) VALUES (%s, 'queue') ON DUPLICATE KEY UPDATE loop_mode = 'queue'",
         (guild_id,),
     )
-    if not shuffle_if_needed:
-        return 0
-    return True
+    return 0
 
 async def restore_queue_from_backup(cur, guild_id, requester_id=None):
     await cur.execute("SELECT COUNT(*) FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus'", (guild_id,))
@@ -7122,10 +7120,6 @@ def apply_filter_preset(wav_filters, mode, current_speed=1.0):
 async def replace_audio_filters(voice_client, wav_filters):
     if not voice_client:
         return
-    try:
-        pass
-    except Exception as tx_error:
-        logger.debug("[%s] Audio filter reset skipped before replacement.", BOT_ENV_PREFIX.lower(), exc_info=True)
     await voice_client.set_filters(wav_filters)
 
 # --- MODIFIERS & FILTERS ---
@@ -7167,8 +7161,7 @@ async def filter_cmd(interaction: discord.Interaction, mode: str):
     async with DBPoolManager() as pool:
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
-                if mode != 'none': await cur.execute("UPDATE nexus_guild_settings SET filter_mode = %s, custom_speed = 1.0, custom_pitch = 1.0, custom_modifiers_left = 0 WHERE guild_id = %s", (mode, interaction.guild.id))
-                else: await cur.execute("UPDATE nexus_guild_settings SET filter_mode = %s, custom_speed = 1.0, custom_pitch = 1.0, custom_modifiers_left = 0 WHERE guild_id = %s", (mode, interaction.guild.id))
+                await cur.execute("UPDATE nexus_guild_settings SET filter_mode = %s, custom_speed = 1.0, custom_pitch = 1.0, custom_modifiers_left = 0 WHERE guild_id = %s", (mode, interaction.guild.id))
     new_speed = 1.0
     if interaction.guild.voice_client:
         wav_filters = wavelink.Filters()
