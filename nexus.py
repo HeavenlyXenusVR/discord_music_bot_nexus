@@ -691,6 +691,7 @@ LAVALINK_PLAY_TIMEOUT_SECONDS = max(8.0, float(os.getenv(f"{BOT_ENV_PREFIX}_LAVA
 PLAYLIST_SYNC_EXTRACT_TIMEOUT_SECONDS = max(30.0, float(os.getenv(f"{BOT_ENV_PREFIX}_PLAYLIST_SYNC_EXTRACT_TIMEOUT_SECONDS", os.getenv("PLAYLIST_SYNC_EXTRACT_TIMEOUT_SECONDS", "180"))))
 POSITION_UPDATER_INTERVAL = max(2.0, float(os.getenv(f"{BOT_ENV_PREFIX}_POSITION_UPDATER_INTERVAL", os.getenv("POSITION_UPDATER_INTERVAL", "5"))))
 POSITION_PERSIST_INTERVAL = max(POSITION_UPDATER_INTERVAL, float(os.getenv(f"{BOT_ENV_PREFIX}_POSITION_PERSIST_INTERVAL", os.getenv("POSITION_PERSIST_INTERVAL", "5"))))
+POSITION_PAUSED_PERSIST_INTERVAL = max(POSITION_PERSIST_INTERVAL, float(os.getenv(f"{BOT_ENV_PREFIX}_POSITION_PAUSED_PERSIST_INTERVAL_SECONDS", os.getenv("POSITION_PAUSED_PERSIST_INTERVAL_SECONDS", "60"))))
 POSITION_STATE_FILE_INTERVAL = max(POSITION_PERSIST_INTERVAL, float(os.getenv(f"{BOT_ENV_PREFIX}_POSITION_STATE_FILE_INTERVAL", os.getenv("POSITION_STATE_FILE_INTERVAL", "15"))))
 PLAYTIME_MIN_DELTA_SECONDS = max(1, int(os.getenv(f"{BOT_ENV_PREFIX}_PLAYTIME_MIN_DELTA_SECONDS", os.getenv("PLAYTIME_MIN_DELTA_SECONDS", "1"))))
 PLAYER_POSITION_STALE_ZERO_SECONDS = max(3.0, float(os.getenv(f"{BOT_ENV_PREFIX}_PLAYER_POSITION_STALE_ZERO_SECONDS", os.getenv("PLAYER_POSITION_STALE_ZERO_SECONDS", "8"))))
@@ -1268,9 +1269,12 @@ async def flush_and_close_for_shutdown(reason: str = "signal"):
         pass
     try:
         await close_shared_runtime_resources()
-        os._exit(0)
     except Exception as tx_error:
         pass
+    # Always exit, even if resource cleanup raised — otherwise the process can hang
+    # after a shutdown signal until the supervisor force-kills it (losing the flush
+    # we just performed and starving the next restart cycle).
+    os._exit(0)
 
 
 def install_shutdown_signal_handlers():
@@ -1431,6 +1435,7 @@ DIRECT_ORDER_RETRY_BACKDATE_SECONDS = max(0, DIRECT_ORDER_CLAIM_TIMEOUT_SECONDS 
 DIRECT_ORDER_STALE_SECONDS = max(300, int(os.getenv(f"{BOT_ENV_PREFIX}_DIRECT_ORDER_STALE_SECONDS", os.getenv("DIRECT_ORDER_STALE_SECONDS", "900"))))
 DIRECT_ORDER_DB_RETRY_ATTEMPTS = max(1, int(os.getenv(f"{BOT_ENV_PREFIX}_DIRECT_ORDER_DB_RETRY_ATTEMPTS", os.getenv("DIRECT_ORDER_DB_RETRY_ATTEMPTS", "4"))))
 DIRECT_ORDER_DB_RETRY_BASE_DELAY_SECONDS = max(0.05, float(os.getenv(f"{BOT_ENV_PREFIX}_DIRECT_ORDER_DB_RETRY_BASE_DELAY_SECONDS", os.getenv("DIRECT_ORDER_DB_RETRY_BASE_DELAY_SECONDS", "0.25"))))
+DIRECT_ORDER_POLL_INTERVAL_SECONDS = max(5.0, float(os.getenv(f"{BOT_ENV_PREFIX}_DIRECT_ORDER_POLL_INTERVAL_SECONDS", os.getenv("DIRECT_ORDER_POLL_INTERVAL_SECONDS", "8.0"))))
 SWARM_BRIDGE_DB_ERROR_LOG_INTERVAL_SECONDS = max(
     30.0,
     float(os.getenv(f"{BOT_ENV_PREFIX}_SWARM_BRIDGE_DB_ERROR_LOG_INTERVAL_SECONDS", os.getenv("SWARM_BRIDGE_DB_ERROR_LOG_INTERVAL_SECONDS", "120"))),
@@ -2035,6 +2040,7 @@ async def init_db():
                 await safe_schema_execute(cur, "CREATE INDEX nexus_playback_resume_idx ON nexus_playback_state (bot_name, is_playing, guild_id)")
                 await safe_schema_execute(cur, "CREATE INDEX nexus_playback_track_uid_idx ON nexus_playback_state (bot_name, track_uid)")
                 await safe_schema_execute(cur, "CREATE INDEX nexus_playlist_bot_idx ON nexus_active_playlists (bot_name, guild_id)")
+                await cur.execute(f"CREATE TABLE IF NOT EXISTS {BOT_ENV_PREFIX.lower()}_search_cache (cache_key VARCHAR(128) PRIMARY KEY, resolved_uri TEXT NOT NULL, title VARCHAR(512), duration_ms INT DEFAULT 0, cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, expires_at TIMESTAMP NOT NULL, INDEX sc_expires_idx (expires_at))")
                 await safe_schema_execute(cur, "CREATE INDEX nexus_playlist_track_uid_idx ON nexus_active_playlist_tracks (guild_id, bot_name, track_uid)")
                 await safe_schema_execute(cur, "CREATE INDEX nexus_active_playlist_tracks_guild_bot_idx ON nexus_active_playlist_tracks (guild_id, bot_name, position_idx)")
                 await safe_schema_execute(cur, "CREATE INDEX nexus_active_playlist_tracks_del_idx ON nexus_active_playlist_tracks (guild_id, bot_name, playlist_url(255))")
@@ -2066,8 +2072,26 @@ async def init_db():
                 )
                 await dedupe_queue_table_by_track_uid(cur, "nexus_queue", bot_name="nexus")
                 await dedupe_queue_table_by_track_uid(cur, "nexus_queue_backup", bot_name="nexus")
-                await dedupe_queue_table_by_track_key(cur, "nexus_queue", bot_name="nexus")
-                await dedupe_queue_table_by_track_key(cur, "nexus_queue_backup", bot_name="nexus")
+                # One-time legacy migration only: content-based dedupe collapses rows that
+                # predate the track_uid column (those all got distinct random UIDs backfilled
+                # above, so the UID-based dedupe above can't catch same-content duplicates).
+                # Gate this on the unique index not existing yet — otherwise this purges
+                # legitimate intentionally-repeated queue entries (same song queued twice)
+                # on *every* container restart, silently shrinking guild queues over time.
+                await cur.execute(
+                    "SELECT COUNT(*) FROM information_schema.statistics "
+                    "WHERE table_schema = DATABASE() AND table_name = 'nexus_queue' "
+                    "AND index_name = 'nexus_queue_track_uid_unique_idx'"
+                )
+                _uid_unique_idx_row = await cur.fetchone()
+                if not (_uid_unique_idx_row and _uid_unique_idx_row[0]):
+                    removed_legacy_live = await dedupe_queue_table_by_track_key(cur, "nexus_queue", bot_name="nexus")
+                    removed_legacy_backup = await dedupe_queue_table_by_track_key(cur, "nexus_queue_backup", bot_name="nexus")
+                    if removed_legacy_live or removed_legacy_backup:
+                        logger.warning(
+                            "[%s] One-time legacy queue migration removed %s live / %s backup content-duplicate row(s) before adding the track_uid unique index.",
+                            BOT_ENV_PREFIX.lower(), removed_legacy_live, removed_legacy_backup,
+                        )
                 await safe_schema_execute(cur, "CREATE UNIQUE INDEX nexus_queue_track_uid_unique_idx ON nexus_queue (guild_id, bot_name, track_uid)")
                 await safe_schema_execute(cur, "CREATE UNIQUE INDEX nexus_queue_backup_track_uid_unique_idx ON nexus_queue_backup (guild_id, bot_name, track_uid)")
                 await safe_schema_execute(cur, "CREATE INDEX nexus_active_playlists_lookup_idx ON nexus_active_playlists (guild_id, bot_name)")
@@ -3286,8 +3310,15 @@ async def collect_and_persist_metrics(guild=None):
         live_duration = int(playback_tracking.get(g.id, {}).get('duration', 0)) if g.id in playback_tracking else 0
         guild_snapshots.append((g, channel_id, voice_connected, player_playing, player_paused, live_position, live_duration))
 
-    async def _fetch_guild_metrics_row(pool, g, voice_connected, player_playing, player_paused, live_position):
-        """Fetch per-guild DB counts on its own connection so all guilds run in parallel."""
+    async def _fetch_guild_queue_counts(pool, g):
+        """Fetch per-guild queue counts on its own connection so all guilds run in parallel.
+
+        Note: does NOT join nexus_playback_state — reconcile_runtime_playback_state()
+        already wrote the authoritative is_playing/is_paused/position_seconds for every
+        guild in guild_snapshot immediately before this runs (see metrics_heartbeat_loop),
+        so re-reading it back here would just be re-fetching values we already hold
+        in-memory (player_playing/player_paused/live_position below).
+        """
         try:
             async with pool.acquire() as conn:
                 async with conn.cursor(aiomysql.DictCursor) as cur:
@@ -3295,45 +3326,34 @@ async def collect_and_persist_metrics(guild=None):
                         """
                         SELECT
                             (SELECT COUNT(*) FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus') AS queue_total,
-                            (SELECT COUNT(*) FROM nexus_queue_backup WHERE guild_id = %s AND bot_name = 'nexus') AS backup_total,
-                            ps.is_playing,
-                            ps.is_paused,
-                            ps.position_seconds
-                        FROM (SELECT %s AS guild_id) seed
-                        LEFT JOIN nexus_playback_state ps
-                          ON ps.guild_id = seed.guild_id AND ps.bot_name = 'nexus'
-                        LIMIT 1
+                            (SELECT COUNT(*) FROM nexus_queue_backup WHERE guild_id = %s AND bot_name = 'nexus') AS backup_total
                         """,
-                        (g.id, g.id, g.id),
+                        (g.id, g.id),
                     )
                     return await cur.fetchone() or {}
         except Exception:
-            logger.debug("[nexus] Per-guild metrics SELECT failed for guild %s", g.id, exc_info=True)
+            logger.debug("[nexus] Per-guild queue-count SELECT failed for guild %s", g.id, exc_info=True)
             return {}
 
     try:
         async with DBPoolManager() as pool:
-            # Phase 1: fan-out all per-guild SELECTs in parallel (each on its own connection).
+            # Phase 1: fan-out all per-guild queue-count SELECTs in parallel (each on its own connection).
+            # nexus_playback_state is intentionally NOT re-read here — reconcile_runtime_playback_state()
+            # already wrote the authoritative is_playing/is_paused/position_seconds for these exact guilds
+            # moments ago (metrics_heartbeat_loop runs it first), so the in-memory snapshot below is both
+            # fresher and cheaper than a round trip to read back what we just wrote.
             fetch_results = await asyncio.gather(
-                *[_fetch_guild_metrics_row(pool, g, vc, pp, pa, lp)
-                  for g, _ch, vc, pp, pa, lp, _ld in guild_snapshots],
+                *[_fetch_guild_queue_counts(pool, g) for g, *_rest in guild_snapshots],
                 return_exceptions=True,
             )
 
-            # Phase 2: conditional UPDATEs and bulk REPLACE on one connection.
+            # Phase 2: bulk REPLACE on one connection (no per-guild UPDATEs — reconcile already persisted state).
             async with pool.acquire() as conn:
                 async with conn.cursor(aiomysql.DictCursor) as cur:
                     metrics_rows = []
-                    for (g, channel_id, voice_connected, player_playing, player_paused, live_position, live_duration), metrics_row in zip(guild_snapshots, fetch_results):
-                        if isinstance(metrics_row, Exception):
-                            metrics_row = {}
-                        if not voice_connected and (metrics_row.get("is_playing") or metrics_row.get("is_paused")):
-                            await cur.execute("UPDATE nexus_playback_state SET is_playing = FALSE, is_paused = FALSE WHERE guild_id = %s AND bot_name = 'nexus'", (g.id,))
-                        elif voice_connected and (player_playing or player_paused or g.id in playback_tracking):
-                            await cur.execute(
-                                "UPDATE nexus_playback_state SET channel_id = COALESCE(%s, channel_id), is_playing = %s, is_paused = %s, position_seconds = %s WHERE guild_id = %s AND bot_name = 'nexus'",
-                                (channel_id, player_playing, player_paused, int(live_position or metrics_row.get("position_seconds") or 0), g.id),
-                            )
+                    for (g, channel_id, voice_connected, player_playing, player_paused, live_position, live_duration), counts_row in zip(guild_snapshots, fetch_results):
+                        if isinstance(counts_row, Exception):
+                            counts_row = {}
                         metrics_rows.append((
                             g.id,
                             voice_connected,
@@ -3341,11 +3361,11 @@ async def collect_and_persist_metrics(guild=None):
                             voice_connected,
                             player_playing,
                             player_paused,
-                            int(metrics_row.get("queue_total") or 0),
-                            int(metrics_row.get("backup_total") or 0),
-                            bool(metrics_row.get("is_playing")) if voice_connected else False,
-                            bool(metrics_row.get("is_paused")) if voice_connected else False,
-                            int(live_position or metrics_row.get("position_seconds") or 0),
+                            int(counts_row.get("queue_total") or 0),
+                            int(counts_row.get("backup_total") or 0),
+                            player_playing if voice_connected else False,
+                            player_paused if voice_connected else False,
+                            int(live_position or 0),
                             live_duration,
                             g.id in recovering_guilds or str(g.id) in guild_states,
                             bool(lavalink_ready),
@@ -3947,9 +3967,12 @@ async def restore_queue_from_backup(cur, guild_id, requester_id=None):
     removed_backup_dupes = await dedupe_queue_table_by_track_uid(cur, "nexus_queue_backup", guild_id=guild_id, bot_name="nexus")
     if removed_backup_dupes > 0:
         logger.warning("[%s] Removed %s duplicate backup queue row(s) before restoring live queue.", guild_id, removed_backup_dupes)
-    removed_content_dupes = await dedupe_queue_table_by_track_key(cur, "nexus_queue_backup", guild_id=guild_id, bot_name="nexus")
-    if removed_content_dupes > 0:
-        logger.warning("[%s] Removed %s content-duplicate backup row(s) before restoring live queue.", guild_id, removed_content_dupes)
+    # NOTE: deliberately NOT running dedupe_queue_table_by_track_key here. Each queue
+    # insertion gets its own random track_uid (see _new_track_uid), so two legitimate
+    # plays of the same song are distinct rows with distinct UIDs but identical content
+    # hashes — exactly what _spread_duplicate_tracks below is designed to keep and
+    # space apart. A content-hash dedupe pass on every restore would silently delete
+    # one of every intentionally-repeated track, on every recovery cycle.
     await cur.execute("SELECT video_url, title, requester_id, track_uid FROM nexus_queue_backup WHERE guild_id = %s AND bot_name = 'nexus' ORDER BY id ASC", (guild_id,))
     rows = list(await cur.fetchall() or [])
     if not rows:
@@ -5767,7 +5790,11 @@ async def restore_guild_state(guild_id, state, *, override_backoff=False):
                     db_title = _row_value(pos_row, "title", _row_value(pos_row, 2)) if pos_row else None
                     db_track_uid = _normalize_track_uid(_row_track_uid(pos_row, 3)) if pos_row else None
 
-        resume_position = max(0, int(db_position if db_position else merged_state.get("position", 0)))
+        # NOTE: use `is not None` rather than a truthy check — db_position can
+        # legitimately be 0 (track restarted from the beginning / deep-seek reset),
+        # and a bare truthy check would then fall back to merged_state's possibly
+        # stale position from an earlier snapshot, resuming at the wrong offset.
+        resume_position = max(0, int(db_position if db_position is not None else merged_state.get("position", 0)))
         resume_track_uid = db_track_uid or merged_state.get("track_uid")
         resume_url = db_url or merged_state.get("url")
         resume_title = db_title or merged_state.get("title")
@@ -6219,6 +6246,13 @@ async def position_updater():
                 pos = normalize_position_seconds(data.get("last_position_checkpoint", data.get("offset", state_position)), data.get("duration"))
                 playing = False
                 paused = bool(data.get("paused") or data.get("voice_soft_disconnected"))
+            # Skip DB write for fully idle/stopped state — position isn't moving
+            if not playing and not paused:
+                continue
+            # Rate-limit paused-only writes to POSITION_PAUSED_PERSIST_INTERVAL (default 60s)
+            if paused and not playing and now - last_persist < POSITION_PAUSED_PERSIST_INTERVAL:
+                continue
+
             channel_id = (
                 getattr(getattr(vc, "channel", None), "id", None)
                 or data.get("channel_id")
@@ -7192,6 +7226,20 @@ FILTER_PRESET_CHOICES = [
 FILTER_PRESET_VALUES = {choice.value for choice in FILTER_PRESET_CHOICES}
 
 
+_LOUDNORM_EQ = [
+    (0, -0.05), (1, -0.03), (2, 0.0), (3, 0.0), (4, 0.0),
+    (5, 0.0), (6, 0.0), (7, -0.01), (8, -0.02), (9, -0.02),
+    (10, -0.03), (11, -0.02), (12, 0.01), (13, 0.01), (14, 0.0),
+]
+
+
+def _blend_loudnorm(preset_bands):
+    base = dict(_LOUDNORM_EQ)
+    for band, gain in preset_bands:
+        base[band] = round(base.get(band, 0.0) + gain, 4)
+    return sorted(base.items())
+
+
 def _safe_filter_call(label, callback):
     try:
         callback()
@@ -7204,6 +7252,12 @@ def _safe_filter_call(label, callback):
 def apply_filter_preset(wav_filters, mode, current_speed=1.0):
     mode = str(mode or 'none').lower().replace(' ', '')
     speed = current_speed
+    preset_uses_eq = False
+    if mode != 'earrape':
+        _safe_filter_call('base_compress', lambda: wav_filters.distortion.set(
+            sin_offset=0.0, sin_scale=0.5, cos_offset=0.0, cos_scale=0.0,
+            tan_offset=0.0, tan_scale=0.0, offset=0.0, scale=0.5
+        ))
     if mode == 'nightcore':
         if _safe_filter_call(mode, lambda: wav_filters.timescale.set(speed=1.25, pitch=1.3)):
             speed = 1.25
@@ -7211,7 +7265,8 @@ def apply_filter_preset(wav_filters, mode, current_speed=1.0):
         if _safe_filter_call(mode, lambda: wav_filters.timescale.set(speed=0.8, pitch=0.8)):
             speed = 0.8
     elif mode == 'bassboost':
-        _safe_filter_call(mode, lambda: wav_filters.equalizer.set(bands=[(0, 0.32), (1, 0.24), (2, 0.12)]))
+        preset_uses_eq = True
+        _safe_filter_call(mode, lambda: wav_filters.equalizer.set(bands=_blend_loudnorm([(0, 0.32), (1, 0.24), (2, 0.12)])))
     elif mode == '8d':
         _safe_filter_call(mode, lambda: wav_filters.rotation.set(rotation_hz=0.18))
     elif mode == 'karaoke':
@@ -7226,34 +7281,41 @@ def apply_filter_preset(wav_filters, mode, current_speed=1.0):
             _safe_filter_call(mode, lambda: wav_filters.timescale.set(speed=0.94, pitch=0.96))
             speed = 0.94
     elif mode == 'electronic':
-        _safe_filter_call(mode, lambda: wav_filters.equalizer.set(bands=[(0, 0.12), (1, 0.10), (4, -0.05), (8, 0.08), (10, 0.14)]))
+        preset_uses_eq = True
+        _safe_filter_call(mode, lambda: wav_filters.equalizer.set(bands=_blend_loudnorm([(0, 0.12), (1, 0.10), (4, -0.05), (8, 0.08), (10, 0.14)])))
     elif mode == 'party':
-        _safe_filter_call(mode, lambda: wav_filters.equalizer.set(bands=[(0, 0.25), (1, 0.18), (2, 0.08), (9, 0.10)]))
+        preset_uses_eq = True
+        _safe_filter_call(mode, lambda: wav_filters.equalizer.set(bands=_blend_loudnorm([(0, 0.25), (1, 0.18), (2, 0.08), (9, 0.10)])))
     elif mode == 'radio':
-        _safe_filter_call(mode, lambda: wav_filters.equalizer.set(bands=[(0, -0.18), (1, -0.10), (4, 0.12), (5, 0.12), (10, -0.12)]))
+        preset_uses_eq = True
+        _safe_filter_call(mode, lambda: wav_filters.equalizer.set(bands=_blend_loudnorm([(0, -0.18), (1, -0.10), (4, 0.12), (5, 0.12), (10, -0.12)])))
         _safe_filter_call(mode, lambda: wav_filters.low_pass.set(smoothing=18.0))
     elif mode == 'cinema':
-        _safe_filter_call(mode, lambda: wav_filters.equalizer.set(bands=[(0, 0.18), (1, 0.12), (8, 0.08), (9, 0.10)]))
+        preset_uses_eq = True
+        _safe_filter_call(mode, lambda: wav_filters.equalizer.set(bands=_blend_loudnorm([(0, 0.18), (1, 0.12), (8, 0.08), (9, 0.10)])))
     elif mode == 'soft':
         _safe_filter_call(mode, lambda: wav_filters.low_pass.set(smoothing=25.0))
     elif mode == 'pop':
-        _safe_filter_call(mode, lambda: wav_filters.equalizer.set(bands=[
+        preset_uses_eq = True
+        _safe_filter_call(mode, lambda: wav_filters.equalizer.set(bands=_blend_loudnorm([
             (0, -0.1), (1, 0.1), (2, 0.2), (3, 0.25), (4, 0.2),
             (5, 0.1), (6, 0.0), (7, -0.05), (8, -0.1), (9, -0.1),
             (10, -0.05), (11, 0.0), (12, 0.1), (13, 0.2), (14, 0.1)
-        ]))
+        ])))
     elif mode == 'rock':
-        _safe_filter_call(mode, lambda: wav_filters.equalizer.set(bands=[
+        preset_uses_eq = True
+        _safe_filter_call(mode, lambda: wav_filters.equalizer.set(bands=_blend_loudnorm([
             (0, 0.3), (1, 0.25), (2, 0.1), (3, -0.1), (4, -0.15),
             (5, -0.1), (6, 0.0), (7, 0.1), (8, 0.3), (9, 0.35),
             (10, 0.3), (11, 0.2), (12, 0.1), (13, 0.05), (14, 0.0)
-        ]))
+        ])))
     elif mode == 'classical':
-        _safe_filter_call(mode, lambda: wav_filters.equalizer.set(bands=[
+        preset_uses_eq = True
+        _safe_filter_call(mode, lambda: wav_filters.equalizer.set(bands=_blend_loudnorm([
             (0, 0.1), (1, 0.1), (2, 0.05), (3, 0.0), (4, -0.05),
             (5, -0.05), (6, -0.05), (7, -0.05), (8, -0.05), (9, -0.05),
             (10, 0.0), (11, 0.05), (12, 0.1), (13, 0.15), (14, 0.2)
-        ]))
+        ])))
     elif mode == 'earrape':
         _safe_filter_call(mode, lambda: wav_filters.distortion.set(
             sin_offset=0.0, sin_scale=1.0, cos_offset=0.0, cos_scale=1.0,
@@ -7270,11 +7332,14 @@ def apply_filter_preset(wav_filters, mode, current_speed=1.0):
     elif mode == 'pitch_down':
         _safe_filter_call(mode, lambda: wav_filters.timescale.set(speed=1.0, pitch=0.7))
     elif mode == 'deep':
-        _safe_filter_call(mode, lambda: wav_filters.equalizer.set(bands=[(0, 0.5), (1, 0.4), (2, 0.3)]))
+        preset_uses_eq = True
+        _safe_filter_call(mode, lambda: wav_filters.equalizer.set(bands=_blend_loudnorm([(0, 0.5), (1, 0.4), (2, 0.3)])))
         _safe_filter_call(mode, lambda: wav_filters.timescale.set(speed=1.0, pitch=0.8))
     elif mode == 'anime':
         if _safe_filter_call(mode, lambda: wav_filters.timescale.set(speed=1.4, pitch=1.5)):
             speed = 1.4
+    if not preset_uses_eq:
+        _safe_filter_call('loudnorm_eq', lambda: wav_filters.equalizer.set(bands=_LOUDNORM_EQ))
     return speed
 
 async def replace_audio_filters(voice_client, wav_filters):
@@ -7728,6 +7793,42 @@ async def expand_playlist_with_ytdlp(source):
     return entries, playlist
 
 
+async def _db_search_cache_get(cache_key: str):
+    """Return (uri, title) from the DB search cache, or None on miss/error."""
+    try:
+        async with DBPoolManager() as pool:
+            async with pool.acquire() as conn:
+                async with conn.cursor(aiomysql.DictCursor) as cur:
+                    await cur.execute(
+                        f"SELECT resolved_uri, title FROM {BOT_ENV_PREFIX.lower()}_search_cache"
+                        " WHERE cache_key = %s AND expires_at > NOW() LIMIT 1",
+                        (cache_key[:128],),
+                    )
+                    row = await cur.fetchone()
+                    if row:
+                        return row["resolved_uri"], row.get("title")
+    except Exception:
+        pass
+    return None
+
+async def _db_search_cache_put(cache_key: str, uri: str, title):
+    """Write a search result to the DB cache (TTL = SEARCH_CACHE_TTL_SECONDS, min 1h)."""
+    if not uri:
+        return
+    ttl_hours = max(1, int(SEARCH_CACHE_TTL_SECONDS / 3600))
+    try:
+        async with DBPoolManager() as pool:
+            async with pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        f"REPLACE INTO {BOT_ENV_PREFIX.lower()}_search_cache"
+                        " (cache_key, resolved_uri, title, expires_at)"
+                        " VALUES (%s, %s, %s, DATE_ADD(NOW(), INTERVAL %s HOUR))",
+                        (cache_key[:128], uri[:2048], (title or "")[:512], ttl_hours),
+                    )
+    except Exception:
+        pass
+
 async def search_playables(query):
     cleaned = str(query or "").strip()
     if not cleaned:
@@ -7749,12 +7850,30 @@ async def search_playables(query):
             entries, playlist_result = cached
             import copy
             return [copy.copy(_t) for _t in entries], copy.copy(playlist_result)
+        # DB-backed cache: survives restarts — check before hitting YouTube
+        _db_hit = await _db_search_cache_get(cache_key)
+        if _db_hit is not None:
+            _db_uri, _db_title = _db_hit
+            try:
+                if await ensure_lavalink_ready():
+                    _db_results = await asyncio.wait_for(
+                        wavelink.Playable.search(_db_uri), timeout=LAVALINK_SEARCH_TIMEOUT_SECONDS
+                    )
+                    _db_entries, _db_playlist = unwrap_search_results(_db_results)
+                    if _db_entries:
+                        _cache_set(SEARCH_RESULT_CACHE, cache_key, (tuple(_db_entries), _db_playlist))
+                        return _db_entries, _db_playlist
+            except Exception:
+                pass  # DB cache miss/stale — fall through to live search
     if not await ensure_lavalink_ready():
         raise RuntimeError("Lavalink is still starting up. Try again in a few seconds.")
     results = await asyncio.wait_for(wavelink.Playable.search(cleaned), timeout=LAVALINK_SEARCH_TIMEOUT_SECONDS)
     entries, playlist_result = unwrap_search_results(results)
     if cacheable and entries:
         _cache_set(SEARCH_RESULT_CACHE, cache_key, (tuple(entries), playlist_result))
+        asyncio.get_event_loop().create_task(
+            _db_search_cache_put(cache_key, getattr(entries[0], 'uri', None) or cleaned, getattr(entries[0], 'title', None))
+        )
     return entries, playlist_result
 
 def _is_direct_media_url(value):
@@ -8063,7 +8182,7 @@ async def on_ready_sync():
 bot.add_listener(on_ready_sync, 'on_ready')
 
 # --- ARIA SWARM OVERRIDE LISTENER ---
-@tasks.loop(seconds=2.0)
+@tasks.loop(seconds=DIRECT_ORDER_POLL_INTERVAL_SECONDS)
 async def aria_command_listener():
     try:
         if not await ensure_swarm_command_tables():
@@ -8429,7 +8548,15 @@ async def before_queue_shuffle_maintenance_loop():
 async def cache_cleanup_loop():
     if not bot.is_ready():
         return
-    await clear_local_cache_systems("scheduled_10h")
+    # NOTE: must be wrapped — an uncaught exception here (e.g. a filesystem error
+    # from _clear_directory_contents, which has no internal try/except around
+    # os.makedirs/os.scandir) would silently stop this @tasks.loop forever, just
+    # like the other maintenance loops guard themselves (database_janitor_loop,
+    # queue_shuffle_maintenance_loop, playlist_sync_loop, etc).
+    try:
+        await clear_local_cache_systems("scheduled_10h")
+    except Exception as tx_error:
+        logger.exception("[%s] Cache cleanup loop failed.", BOT_ENV_PREFIX.lower())
 
 
 @cache_cleanup_loop.before_loop
@@ -8480,7 +8607,7 @@ async def on_ready_maintenance():
 bot.add_listener(on_ready_maintenance, 'on_ready')
 
 # --- ARIA DIRECT DRONE CONTROL ---
-@tasks.loop(seconds=2.0)
+@tasks.loop(seconds=DIRECT_ORDER_POLL_INTERVAL_SECONDS)
 async def direct_order_listener():
     orders = []
     try:
@@ -8642,6 +8769,20 @@ async def direct_order_listener():
                         await clear_active_playlist(guild.id)
                         await stop_playback(guild)
                         executed = True
+
+
+                elif cmd == 'SEEK':
+                    vc = guild.voice_client
+                    if vc and (_player_is_playing(vc) or _player_is_paused(vc)):
+                        try:
+                            position_seconds = max(0, int(float(str(data or '0').strip() or 0)))
+                            await vc.seek(position_seconds * 1000)
+                            await reset_runtime_position_after_seek(guild.id, position_seconds)
+                            executed = True
+                        except Exception as _seek_err:
+                            logger.warning("[nexus] Direct SEEK failed in guild %s at %ss: %s", guild.id, position_seconds if 'position_seconds' in dir() else '?', _seek_err)
+                    else:
+                        logger.info("[nexus] Direct SEEK ignored — no active player in guild %s.", guild.id)
 
                 else:
                     logger.warning(f"[nexus] Unsupported direct order {cmd!r} for guild {guild.id}.")
