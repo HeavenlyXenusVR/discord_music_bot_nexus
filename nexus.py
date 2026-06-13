@@ -1935,6 +1935,8 @@ async def get_saved_settings_summary(guild_id):
                 _cache_set(GUILD_SETTINGS_CACHE, int(guild_id), row)
                 return row
 
+_YTDLP_COOKIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+
 ytdl_format_options = {
     'format': 'bestaudio/best', 'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
     'restrictfilenames': True, 'noplaylist': True, 'extract_flat': 'in_playlist', 'skip_download': True, 'nocheckcertificate': True,
@@ -1942,6 +1944,11 @@ ytdl_format_options = {
     'no_warnings': True, 'default_search': 'auto', 'source_address': '0.0.0.0',
     'cachedir': YTDLP_CACHE_DIR
 }
+if os.path.isfile(_YTDLP_COOKIES_FILE) and os.path.getsize(_YTDLP_COOKIES_FILE) > 0:
+    # YouTube paginates flat-playlist extraction past the first ~100 entries only
+    # for authenticated requests; without cookies, larger playlists silently
+    # truncate at the first page.
+    ytdl_format_options['cookiefile'] = _YTDLP_COOKIES_FILE
 
 
 
