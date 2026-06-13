@@ -1,5 +1,6 @@
 import copy
 import json
+import math
 import asyncio
 from collections import Counter, deque
 import discord
@@ -877,6 +878,13 @@ SMART_SEED_POOL_LIMIT = max(10, int(os.getenv(f"{BOT_ENV_PREFIX}_SMART_SEED_POOL
 SMART_CANDIDATE_SCAN_LIMIT = max(3, int(os.getenv(f"{BOT_ENV_PREFIX}_SMART_CANDIDATE_SCAN_LIMIT", os.getenv("SMART_CANDIDATE_SCAN_LIMIT", "12"))))
 SMART_FEEDBACK_SCORE = float(os.getenv(f"{BOT_ENV_PREFIX}_SMART_FEEDBACK_SCORE", os.getenv("SMART_FEEDBACK_SCORE", "4.0")))
 SMART_AUTODJ_RADIO_SUFFIXES = tuple(part.strip() for part in os.getenv(f"{BOT_ENV_PREFIX}_SMART_AUTODJ_SUFFIXES", os.getenv("SMART_AUTODJ_SUFFIXES", "radio,audio,playlist,mix")).split(",") if part.strip())
+SMART_RECENCY_HALFLIFE_DAYS = max(1.0, float(os.getenv(f"{BOT_ENV_PREFIX}_SMART_RECENCY_HALFLIFE_DAYS", os.getenv("SMART_RECENCY_HALFLIFE_DAYS", "21"))))
+SMART_GLOBAL_POOL_WEIGHT = float(os.getenv(f"{BOT_ENV_PREFIX}_SMART_GLOBAL_POOL_WEIGHT", os.getenv("SMART_GLOBAL_POOL_WEIGHT", "0.4")))
+SMART_COOCCURRENCE_LIMIT = max(3, int(os.getenv(f"{BOT_ENV_PREFIX}_SMART_COOCCURRENCE_LIMIT", os.getenv("SMART_COOCCURRENCE_LIMIT", "8"))))
+SMART_EMBEDDING_ENABLED = os.getenv(f"{BOT_ENV_PREFIX}_SMART_EMBEDDING_ENABLED", os.getenv("SMART_EMBEDDING_ENABLED", "true")).strip().lower() not in ("0", "false", "no", "off")
+SMART_EMBEDDING_SIMILARITY_THRESHOLD = float(os.getenv(f"{BOT_ENV_PREFIX}_SMART_EMBEDDING_SIMILARITY_THRESHOLD", os.getenv("SMART_EMBEDDING_SIMILARITY_THRESHOLD", "0.86")))
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "gemini-embedding-001").strip()
 
 def _cache_get(cache, key, ttl_seconds):
     item = cache.get(key)
@@ -1470,7 +1478,8 @@ GLOBAL_DISCORD_LOGIN_GATE_MAX_WAIT_SECONDS = max(60.0, float(os.getenv(f"{BOT_EN
 MUSIC_BOT_RUNTIME_DIR = os.getenv(f"{BOT_ENV_PREFIX}_RUNTIME_DIR", os.getenv("MUSIC_BOT_RUNTIME_DIR", "/app/.runtime"))
 BOT_STAGGER_SLOTS = {
     "GWS": 0, "HARMONIC": 1, "MAESTRO": 2, "MELODIC": 3, "NEXUS": 4, "RHYTHM": 5,
-    "SYMPHONY": 6, "TUNESTREAM": 7, "NEXUS": 8, "SAPPHIRE": 9, "STRIFE": 10, "LOCKHART": 11,
+    "SYMPHONY": 6, "TUNESTREAM": 7, "ALUCARD": 8, "SAPPHIRE": 9, "STRIFE": 10, "LOCKHART": 11,
+    "GLITCH": 12,
 }
 
 
@@ -1497,6 +1506,19 @@ def _runtime_write_float(path: str, value: float) -> None:
             handle.write(str(float(value)))
     except Exception as tx_error:
         logger.debug("[%s] Could not write runtime float file %s", BOT_ENV_PREFIX.lower(), path, exc_info=True)
+
+
+def _login_gate_clock() -> float:
+    """Monotonic clock that keeps advancing across host suspend/sleep.
+
+    time.monotonic() pauses while the host is suspended, which let the
+    shared login gate's max-wait timeout stall for hours after a host
+    sleep/wake cycle. CLOCK_BOOTTIME includes suspended time on Linux.
+    """
+    try:
+        return time.clock_gettime(time.CLOCK_BOOTTIME)
+    except (AttributeError, OSError):
+        return time.monotonic()
 
 
 def _global_login_next_path() -> str:
@@ -1542,9 +1564,9 @@ def _wait_for_global_discord_login_gate() -> None:
         return
 
     warned_shared = False
-    wait_started_at = time.monotonic()
+    wait_started_at = _login_gate_clock()
     while True:
-        elapsed = time.monotonic() - wait_started_at
+        elapsed = _login_gate_clock() - wait_started_at
         if elapsed >= GLOBAL_DISCORD_LOGIN_GATE_MAX_WAIT_SECONDS:
             logger.warning(
                 "[%s] Shared Discord login gate max wait %.0fs exceeded; continuing so the bot does not stall forever.",
@@ -1552,13 +1574,12 @@ def _wait_for_global_discord_login_gate() -> None:
             )
             return
 
-        now = time.monotonic()
         cooldown_until = _runtime_file_float(_global_login_cooldown_path(), 0.0)
-        if cooldown_until > now:
-            wait_for = min(GLOBAL_DISCORD_LOGIN_COOLDOWN_POLL_SECONDS, cooldown_until - now)
+        if cooldown_until > time.time():
+            wait_for = min(GLOBAL_DISCORD_LOGIN_COOLDOWN_POLL_SECONDS, cooldown_until - time.time())
             logger.warning(
                 "[%s] Waiting %.0fs for shared Discord login cooldown to clear before login.",
-                BOT_ENV_PREFIX.lower(), max(1.0, cooldown_until - now),
+                BOT_ENV_PREFIX.lower(), max(1.0, cooldown_until - time.time()),
             )
             time.sleep(max(1.0, min(wait_for, max(0.0, GLOBAL_DISCORD_LOGIN_GATE_MAX_WAIT_SECONDS - elapsed))))
             continue
@@ -1586,9 +1607,9 @@ def _wait_for_global_discord_login_gate() -> None:
 
         try:
             next_allowed = _runtime_file_float(_global_login_next_path(), 0.0)
-            now = time.monotonic()
+            now = _login_gate_clock()
             if next_allowed > now:
-                wait_for = min(next_allowed - now, max(0.0, GLOBAL_DISCORD_LOGIN_GATE_MAX_WAIT_SECONDS - (time.monotonic() - wait_started_at)))
+                wait_for = min(next_allowed - now, max(0.0, GLOBAL_DISCORD_LOGIN_GATE_MAX_WAIT_SECONDS - (_login_gate_clock() - wait_started_at)))
                 if wait_for <= 0:
                     logger.warning(
                         "[%s] Shared Discord login gate spacing wait exceeded max wait; continuing without extra delay.",
@@ -1597,7 +1618,7 @@ def _wait_for_global_discord_login_gate() -> None:
                 else:
                     logger.info("[%s] Shared Discord login gate waiting %.1fs for previous bot attempt spacing.", BOT_ENV_PREFIX.lower(), wait_for)
                     time.sleep(wait_for)
-                now = time.monotonic()
+                now = _login_gate_clock()
             reserve_until = now + GLOBAL_DISCORD_LOGIN_MIN_INTERVAL_SECONDS + random.uniform(0.0, GLOBAL_DISCORD_LOGIN_JITTER_SECONDS)
             _runtime_write_float(_global_login_next_path(), reserve_until)
             logger.info(
@@ -2010,10 +2031,14 @@ async def init_db():
                 await cur.execute("CREATE TABLE IF NOT EXISTS nexus_track_intelligence (guild_id BIGINT NOT NULL, url_key VARCHAR(64) NOT NULL, video_url TEXT, title TEXT, queued_count INT NOT NULL DEFAULT 0, play_count INT NOT NULL DEFAULT 0, finish_count INT NOT NULL DEFAULT 0, skip_count INT NOT NULL DEFAULT 0, like_count INT NOT NULL DEFAULT 0, dislike_count INT NOT NULL DEFAULT 0, total_listen_seconds INT NOT NULL DEFAULT 0, last_requester_id BIGINT DEFAULT NULL, source VARCHAR(40) DEFAULT 'unknown', first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP, last_queued TIMESTAMP NULL DEFAULT NULL, last_played TIMESTAMP NULL DEFAULT NULL, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, PRIMARY KEY (guild_id, url_key))")
                 await cur.execute("CREATE TABLE IF NOT EXISTS nexus_user_track_affinity (guild_id BIGINT NOT NULL, user_id BIGINT NOT NULL, url_key VARCHAR(64) NOT NULL, video_url TEXT, title TEXT, queued_count INT NOT NULL DEFAULT 0, play_count INT NOT NULL DEFAULT 0, finish_count INT NOT NULL DEFAULT 0, skip_count INT NOT NULL DEFAULT 0, like_count INT NOT NULL DEFAULT 0, dislike_count INT NOT NULL DEFAULT 0, score FLOAT NOT NULL DEFAULT 0, last_requested TIMESTAMP NULL DEFAULT NULL, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, PRIMARY KEY (guild_id, user_id, url_key))")
                 await cur.execute("CREATE TABLE IF NOT EXISTS nexus_smart_recommendations (id INT AUTO_INCREMENT PRIMARY KEY, guild_id BIGINT NOT NULL, requester_id BIGINT DEFAULT NULL, seed_title TEXT, seed_url TEXT, query_text TEXT, chosen_url TEXT, chosen_title TEXT, reason VARCHAR(80), accepted BOOLEAN DEFAULT TRUE, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+                await cur.execute("CREATE TABLE IF NOT EXISTS nexus_track_embeddings (url_key VARCHAR(64) NOT NULL PRIMARY KEY, title TEXT, video_url TEXT, embedding MEDIUMTEXT, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)")
+                await cur.execute("CREATE TABLE IF NOT EXISTS nexus_track_cooccurrence (guild_id BIGINT NOT NULL, url_key_a VARCHAR(64) NOT NULL, url_key_b VARCHAR(64) NOT NULL, weight FLOAT NOT NULL DEFAULT 0, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, PRIMARY KEY (guild_id, url_key_a, url_key_b))")
                 await safe_schema_execute(cur, "CREATE INDEX nexus_track_intelligence_recent_idx ON nexus_track_intelligence (guild_id, last_played)")
                 await safe_schema_execute(cur, "CREATE INDEX nexus_track_intelligence_requester_idx ON nexus_track_intelligence (guild_id, last_requester_id, last_played)")
                 await safe_schema_execute(cur, "CREATE INDEX nexus_user_affinity_recent_idx ON nexus_user_track_affinity (guild_id, user_id, last_requested)")
                 await safe_schema_execute(cur, "CREATE INDEX nexus_smart_recommendations_recent_idx ON nexus_smart_recommendations (guild_id, created_at)")
+                await safe_schema_execute(cur, "CREATE INDEX nexus_track_intelligence_global_idx ON nexus_track_intelligence (url_key, last_played)")
+                await safe_schema_execute(cur, "CREATE INDEX nexus_track_cooccurrence_weight_idx ON nexus_track_cooccurrence (guild_id, url_key_a, weight)")
                 await cur.execute("CREATE TABLE IF NOT EXISTS nexus_bot_home_channels (guild_id BIGINT, bot_name VARCHAR(50), home_vc_id BIGINT, PRIMARY KEY (guild_id, bot_name))")
                 await cur.execute("CREATE TABLE IF NOT EXISTS nexus_voice_state (guild_id BIGINT, bot_name VARCHAR(50), last_channel_id BIGINT NULL, connected_channel_id BIGINT NULL, text_channel_id BIGINT NULL, disconnected_at TIMESTAMP NULL, last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, desired_connected BOOLEAN DEFAULT FALSE, reconnect_attempts INT NOT NULL DEFAULT 0, last_error TEXT NULL, PRIMARY KEY (guild_id, bot_name))")
                 await cur.execute("CREATE TABLE IF NOT EXISTS nexus_metrics (guild_id BIGINT, bot_name VARCHAR(50), voice_connected BOOLEAN DEFAULT FALSE, connected_channel_id BIGINT NULL, player_connected BOOLEAN DEFAULT FALSE, player_playing BOOLEAN DEFAULT FALSE, player_paused BOOLEAN DEFAULT FALSE, queue_count INT DEFAULT 0, backup_queue_count INT DEFAULT 0, is_playing_db BOOLEAN DEFAULT FALSE, is_paused_db BOOLEAN DEFAULT FALSE, position_seconds INT DEFAULT 0, recovery_pending BOOLEAN DEFAULT FALSE, heartbeat_age_seconds INT DEFAULT 0, lavalink_ready BOOLEAN DEFAULT FALSE, last_error TEXT NULL, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, PRIMARY KEY (guild_id, bot_name))")
@@ -2356,6 +2381,109 @@ def _weighted_smart_pick(rows):
     return {"title": title, "video_url": url, "reason": reason, "weight": weight}
 
 
+def _cosine_similarity(vec_a, vec_b):
+    if not vec_a or not vec_b or len(vec_a) != len(vec_b):
+        return 0.0
+    dot = sum(a * b for a, b in zip(vec_a, vec_b))
+    norm_a = math.sqrt(sum(a * a for a in vec_a))
+    norm_b = math.sqrt(sum(b * b for b in vec_b))
+    if norm_a <= 0 or norm_b <= 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+async def fetch_track_embedding_vector(title):
+    """Call the Gemini embedding API for a cleaned track title. Returns list[float] or None."""
+    if not SMART_EMBEDDING_ENABLED or not GEMINI_API_KEY:
+        return None
+    cleaned = _clean_smart_title(title)
+    if not cleaned:
+        return None
+    try:
+        async with HTTPSessionManager() as session:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_EMBEDDING_MODEL}:embedContent?key={GEMINI_API_KEY}"
+            payload = {"model": f"models/{GEMINI_EMBEDDING_MODEL}", "content": {"parts": [{"text": cleaned}]}}
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                values = (data.get("embedding") or {}).get("values")
+                if isinstance(values, list) and values:
+                    return [float(v) for v in values]
+    except Exception as tx_error:
+        return None
+    return None
+
+
+async def get_or_fetch_track_embedding(cur, url_key, title, video_url=None):
+    """Return a cached embedding vector for url_key, generating and storing one if missing."""
+    await cur.execute("SELECT embedding FROM nexus_track_embeddings WHERE url_key = %s", (url_key,))
+    row = await cur.fetchone()
+    if row:
+        raw = _row_value(row, "embedding", _row_value(row, 0))
+        if raw:
+            try:
+                return json.loads(raw)
+            except Exception as tx_error:
+                pass
+    vector = await fetch_track_embedding_vector(title)
+    if vector:
+        try:
+            await cur.execute(
+                "INSERT INTO nexus_track_embeddings (url_key, title, video_url, embedding) VALUES (%s, %s, %s, %s) "
+                "ON DUPLICATE KEY UPDATE title = VALUES(title), video_url = VALUES(video_url), embedding = VALUES(embedding)",
+                (url_key, title, video_url, json.dumps(vector)),
+            )
+        except Exception as tx_error:
+            pass
+    return vector
+
+
+async def find_similar_tracks_global(cur, seed_vector, avoid_keys, limit=5):
+    """Cross-server similarity search: scan the shared embedding table for tracks close to seed_vector."""
+    if not seed_vector:
+        return []
+    await cur.execute("SELECT url_key, title, video_url, embedding FROM nexus_track_embeddings ORDER BY updated_at DESC LIMIT 1500")
+    rows = await cur.fetchall()
+    scored = []
+    for row in rows:
+        url_key = _row_value(row, "url_key", _row_value(row, 0))
+        title = _row_value(row, "title", _row_value(row, 1))
+        video_url = _row_value(row, "video_url", _row_value(row, 2))
+        raw = _row_value(row, "embedding", _row_value(row, 3))
+        if not raw or not video_url or url_key in avoid_keys:
+            continue
+        try:
+            vector = json.loads(raw)
+        except Exception as tx_error:
+            continue
+        similarity = _cosine_similarity(seed_vector, vector)
+        if similarity >= SMART_EMBEDDING_SIMILARITY_THRESHOLD:
+            scored.append((similarity, title, video_url, url_key))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return scored[:limit]
+
+
+async def record_track_cooccurrence(cur, guild_id, prev_url, prev_title, next_url, next_title):
+    """Track which tracks tend to play back-to-back so Auto-DJ can chain similar sessions."""
+    if not (prev_url or prev_title) or not (next_url or next_title):
+        return
+    key_a = _track_key(prev_url, prev_title)
+    key_b = _track_key(next_url, next_title)
+    if key_a == key_b:
+        return
+    await cur.execute(
+        "INSERT INTO nexus_track_cooccurrence (guild_id, url_key_a, url_key_b, weight) VALUES (%s, %s, %s, 1) "
+        "ON DUPLICATE KEY UPDATE weight = weight + 1, updated_at = NOW()",
+        (guild_id, key_a, key_b),
+    )
+    await cur.execute(
+        "INSERT INTO nexus_track_cooccurrence (guild_id, url_key_a, url_key_b, weight) VALUES (%s, %s, %s, 1) "
+        "ON DUPLICATE KEY UPDATE weight = weight + 1, updated_at = NOW()",
+        (guild_id, key_b, key_a),
+    )
+
+
 async def bulk_record_tracks_queued(cur, guild_id, tracks):
     """Bulk-update queue intelligence for rows shaped as (video_url, title, requester_id)."""
     if not tracks:
@@ -2509,18 +2637,21 @@ async def load_smart_avoid_keys(cur, guild_id, listener_ids=None):
 
 async def build_smart_recommendation(cur, guild_id, listener_ids=None):
     candidates = []
+    recency_decay = "POW(0.5, LEAST(GREATEST(DATEDIFF(NOW(), COALESCE(last_requested, NOW())), 0), 365) / %s)"
+    server_recency_decay = "POW(0.5, LEAST(GREATEST(DATEDIFF(NOW(), COALESCE(last_played, last_queued, first_seen)), 0), 365) / %s)"
     ids = sorted({int(v) for v in (listener_ids or []) if v})
     if ids:
         placeholders = ",".join(["%s"] * len(ids))
         await cur.execute(
             f"""SELECT title, video_url,
-                       (score + play_count * 1.35 + finish_count * 1.5 + like_count * 3.0 - skip_count * 1.25 - dislike_count * 4.0) AS weight,
+                       (score + play_count * 1.35 + finish_count * 1.5 + like_count * 3.0 - dislike_count * 4.0
+                        - (skip_count / (play_count + finish_count + 1)) * 6.0) * {recency_decay} AS weight,
                        'listener taste' AS reason
                 FROM nexus_user_track_affinity
                 WHERE guild_id = %s AND user_id IN ({placeholders}) AND (dislike_count <= like_count OR like_count > 0)
                 ORDER BY weight DESC, last_requested DESC
                 LIMIT %s""",
-            (guild_id, *ids, SMART_SEED_POOL_LIMIT),
+            (SMART_RECENCY_HALFLIFE_DAYS, guild_id, *ids, SMART_SEED_POOL_LIMIT),
         )
         candidates.extend(await cur.fetchall())
 
@@ -2538,16 +2669,50 @@ async def build_smart_recommendation(cur, guild_id, listener_ids=None):
         candidates.extend(await cur.fetchall())
 
     await cur.execute(
-        """SELECT title, video_url,
-                   (play_count * 1.1 + finish_count * 1.6 + like_count * 3.0 + queued_count * 0.2 - skip_count * 1.2 - dislike_count * 4.0) AS weight,
+        f"""SELECT title, video_url,
+                   (play_count * 1.1 + finish_count * 1.6 + like_count * 3.0 + queued_count * 0.2 - dislike_count * 4.0
+                    - (skip_count / (play_count + finish_count + 1)) * 5.0) * {server_recency_decay} AS weight,
                    'server taste' AS reason
             FROM nexus_track_intelligence
             WHERE guild_id = %s AND (dislike_count <= like_count OR like_count > 0)
             ORDER BY weight DESC, COALESCE(last_played, last_queued, first_seen) DESC
             LIMIT %s""",
-        (guild_id, SMART_SEED_POOL_LIMIT),
+        (SMART_RECENCY_HALFLIFE_DAYS, guild_id, SMART_SEED_POOL_LIMIT),
     )
     candidates.extend(await cur.fetchall())
+
+    # Cross-server learning: blend in trending tracks from every other guild this bot serves.
+    await cur.execute(
+        """SELECT MIN(title) AS title, MIN(video_url) AS video_url,
+                   (SUM(play_count) * 0.6 + SUM(finish_count) * 0.9 + SUM(like_count) * 1.5 - SUM(dislike_count) * 2.0) * %s AS weight,
+                   'cross-server trend' AS reason
+            FROM nexus_track_intelligence
+            WHERE guild_id != %s AND (dislike_count <= like_count OR like_count > 0)
+            GROUP BY url_key
+            HAVING weight > 0
+            ORDER BY weight DESC
+            LIMIT %s""",
+        (SMART_GLOBAL_POOL_WEIGHT, guild_id, SMART_SEED_POOL_LIMIT),
+    )
+    candidates.extend(await cur.fetchall())
+
+    # "Often played next": boost tracks that have historically followed the current/most recent track.
+    await cur.execute("SELECT video_url, title FROM nexus_history WHERE guild_id = %s ORDER BY played_at DESC LIMIT 1", (guild_id,))
+    last_row = await cur.fetchone()
+    if last_row:
+        last_key = _track_key(_row_value(last_row, "video_url", _row_value(last_row, 0)), _row_value(last_row, "title", _row_value(last_row, 1)))
+        await cur.execute(
+            """SELECT ti.title AS title, ti.video_url AS video_url,
+                       (tc.weight * 2.0) AS weight,
+                       'often played next' AS reason
+                FROM nexus_track_cooccurrence tc
+                JOIN nexus_track_intelligence ti ON ti.guild_id = tc.guild_id AND ti.url_key = tc.url_key_b
+                WHERE tc.guild_id = %s AND tc.url_key_a = %s AND (ti.dislike_count <= ti.like_count OR ti.like_count > 0)
+                ORDER BY tc.weight DESC
+                LIMIT %s""",
+            (guild_id, last_key, SMART_COOCCURRENCE_LIMIT),
+        )
+        candidates.extend(await cur.fetchall())
 
     if not candidates:
         await cur.execute("SELECT title, video_url, 1.0 AS weight, 'recent history' AS reason FROM nexus_history WHERE guild_id = %s ORDER BY played_at DESC LIMIT %s", (guild_id, SMART_SEED_POOL_LIMIT))
@@ -2566,6 +2731,22 @@ async def build_smart_recommendation(cur, guild_id, listener_ids=None):
 async def pick_smart_recommendation_track(cur, guild_id, listener_ids=None):
     recommendation = await build_smart_recommendation(cur, guild_id, listener_ids=listener_ids)
     avoid_keys = await load_smart_avoid_keys(cur, guild_id, listener_ids=listener_ids)
+
+    # Embedding-based similarity: try to find a close match to the seed track from the
+    # cross-server embedding library before falling back to a keyword search.
+    if SMART_EMBEDDING_ENABLED and recommendation.get("seed_title"):
+        try:
+            seed_key = _track_key(recommendation.get("seed_url"), recommendation.get("seed_title"))
+            seed_vector = await get_or_fetch_track_embedding(cur, seed_key, recommendation["seed_title"], recommendation.get("seed_url"))
+            similar = await find_similar_tracks_global(cur, seed_vector, avoid_keys | {seed_key}, limit=5)
+            if similar:
+                _similarity, sim_title, sim_url, _sim_key = random.choice(similar)
+                chosen = SimpleNamespace(uri=sim_url, title=sim_title)
+                recommendation["reason"] = "similar track"
+                return chosen, recommendation
+        except Exception as tx_error:
+            pass
+
     entries, _playlist_result = await search_playables(recommendation["query"])
     chosen = None
     scanned = 0
@@ -3882,6 +4063,59 @@ async def delete_live_queue_copies(cur, guild_id, video_url, title, track_uid=No
         deleted += max(0, int(getattr(cur, "rowcount", 0) or 0))
     return deleted
 
+async def _fetch_shuffle_weights(cur, guild_id, rows):
+    """Score queued tracks from this server's play/finish/skip history so the
+    smart shuffle nudges crowd-favorites earlier while staying randomized."""
+    url_keys = {_queue_source_identity(row) for row in rows}
+    if not url_keys:
+        return {}
+    weights = {}
+    try:
+        placeholders = ",".join(["%s"] * len(url_keys))
+        await cur.execute(
+            f"SELECT url_key, play_count, finish_count, skip_count, like_count, dislike_count "
+            f"FROM nexus_track_intelligence WHERE guild_id = %s AND url_key IN ({placeholders})",
+            (guild_id, *url_keys),
+        )
+        for row in await cur.fetchall() or []:
+            url_key = _row_value(row, "url_key", _row_value(row, 0))
+            play_count = int(_row_value(row, "play_count", _row_value(row, 1)) or 0)
+            finish_count = int(_row_value(row, "finish_count", _row_value(row, 2)) or 0)
+            skip_count = int(_row_value(row, "skip_count", _row_value(row, 3)) or 0)
+            like_count = int(_row_value(row, "like_count", _row_value(row, 4)) or 0)
+            dislike_count = int(_row_value(row, "dislike_count", _row_value(row, 5)) or 0)
+            plays = max(1, play_count)
+            score = 1.0
+            score += (finish_count / plays) * 0.4
+            score -= (skip_count / plays) * 0.5
+            score += like_count * 0.15
+            score -= dislike_count * 0.2
+            weights[url_key] = max(0.15, min(2.5, score))
+    except Exception:
+        return {}
+    return weights
+
+def _weighted_shuffle(rows, weights):
+    """Randomize order while biasing toward higher-weighted tracks. Falls
+    back to a plain shuffle when no weight data is available."""
+    if not weights:
+        random.shuffle(rows)
+        return rows
+    pool = [(row, max(0.05, weights.get(_queue_source_identity(row), 1.0))) for row in rows]
+    ordered = []
+    while pool:
+        total = sum(w for _, w in pool)
+        target = random.random() * total
+        upto = 0.0
+        for idx, (row, w) in enumerate(pool):
+            upto += w
+            if upto >= target:
+                ordered.append(pool.pop(idx)[0])
+                break
+        else:
+            ordered.append(pool.pop()[0])
+    return ordered
+
 async def shuffle_queue_rows(cur, guild_id, *, preserve_first=True):
     await cur.execute("SELECT id, guild_id, bot_name, video_url, title, requester_id, track_uid FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus' ORDER BY id ASC", (guild_id,))
     rows = list(await cur.fetchall() or [])
@@ -3890,7 +4124,8 @@ async def shuffle_queue_rows(cur, guild_id, *, preserve_first=True):
     head = []
     if preserve_first:
         head = [rows.pop(0)]
-    random.shuffle(rows)
+    weights = await _fetch_shuffle_weights(cur, guild_id, rows)
+    rows = _weighted_shuffle(rows, weights)
     reorder_limit = max(1, QUEUE_SPREAD_REORDER_LIMIT - len(head))
     rows = head + _spread_duplicate_tracks(rows, head[-1] if head else None, reorder_limit=reorder_limit)
 
@@ -4733,7 +4968,7 @@ async def requeue_verified_playback_failure(guild, channel_id, url, title, reque
     return True
 
 
-async def verify_track_stuck_before_requeue(guild_id, channel_id, url, title, requester_id, observed_position, observed_reported_position, track_uid=None):
+async def verify_track_stuck_before_requeue(guild_id, channel_id, url, title, requester_id, observed_position, observed_reported_position, track_uid=None, *, reason="track_stuck"):
     expected_key = _track_key(url, title)
     try:
         await asyncio.sleep(TRACK_STUCK_VERIFY_DELAY_SECONDS)
@@ -4744,8 +4979,9 @@ async def verify_track_stuck_before_requeue(guild_id, channel_id, url, title, re
         current_key = _current_player_track_key(player)
         if current_key and current_key != expected_key:
             logger.info(
-                "[%s] Lavalink track_stuck for '%s' ignored; current track changed during %.0fs verification window.",
+                "[%s] Lavalink %s for '%s' ignored; current track changed during %.0fs verification window.",
                 guild_id,
+                reason,
                 title,
                 TRACK_STUCK_VERIFY_DELAY_SECONDS,
             )
@@ -4757,8 +4993,9 @@ async def verify_track_stuck_before_requeue(guild_id, channel_id, url, title, re
             progress = later_reported_position - observed_reported_position
             if progress >= TRACK_STUCK_MIN_PROGRESS_SECONDS:
                 logger.info(
-                    "[%s] Lavalink track_stuck for '%s' self-recovered; player advanced %ss during verification, no queue restore needed.",
+                    "[%s] Lavalink %s for '%s' self-recovered; player advanced %ss during verification, no queue restore needed.",
                     guild_id,
+                    reason,
                     title,
                     progress,
                 )
@@ -4767,8 +5004,9 @@ async def verify_track_stuck_before_requeue(guild_id, channel_id, url, title, re
 
         if later_reported_position is None and player and _player_is_active(player) and TRACK_STUCK_SKIP_WHEN_POSITION_UNKNOWN:
             logger.warning(
-                "[%s] Lavalink track_stuck for '%s' could not verify player position, but the player still reports active; skipping queue restore to avoid duplicates.",
+                "[%s] Lavalink %s for '%s' could not verify player position, but the player still reports active; skipping queue restore to avoid duplicates.",
                 guild_id,
+                reason,
                 title,
             )
             return False
@@ -4789,22 +5027,23 @@ async def verify_track_stuck_before_requeue(guild_id, channel_id, url, title, re
         )
         if is_seek_induced:
             logger.warning(
-                "[%s] Lavalink track_stuck for '%s' is seek-induced (player=%ss, checkpoint=%ss); "
+                "[%s] Lavalink %s for '%s' is seek-induced (player=%ss, checkpoint=%ss); "
                 "requeuing at position 0 without counting as a failure.",
-                guild_id, title, later_reported_position, observed_position,
+                guild_id, reason, title, later_reported_position, observed_position,
             )
             # Requeue at 0 directly — skip mark_track_failure so the track isn't penalised.
             async with DBPoolManager() as pool:
                 async with pool.acquire() as conn:
                     async with conn.cursor() as cur:
-                        await requeue_failed_track(cur, guild_id, channel_id, url, title, requester_id, position=0, reason="track_stuck_seek_induced", track_uid=track_uid)
+                        await requeue_failed_track(cur, guild_id, channel_id, url, title, requester_id, position=0, reason=f"{reason}_seek_induced", track_uid=track_uid)
             if channel_id:
                 schedule_named_task(f"lavalink_failure_process_queue:{guild_id}", process_queue(guild, channel_id, start_position=0, allow_recovery_restore=True))
             return True
 
         logger.warning(
-            "[%s] Lavalink track_stuck for '%s' did not recover after %.0fs; restoring exactly one live queue copy.",
+            "[%s] Lavalink %s for '%s' did not recover after %.0fs; restoring exactly one live queue copy.",
             guild_id,
+            reason,
             title,
             TRACK_STUCK_VERIFY_DELAY_SECONDS,
         )
@@ -4815,37 +5054,39 @@ async def verify_track_stuck_before_requeue(guild_id, channel_id, url, title, re
             title,
             requester_id,
             max(0, int(verified_position or 0)),
-            reason="track_stuck_verified",
+            reason=f"{reason}_verified",
             track_uid=track_uid,
         )
     except asyncio.CancelledError:
         raise
     except Exception as tx_error:
-        logger.exception("[%s] Failed delayed track_stuck verification for '%s'.", guild_id, title)
+        logger.exception("[%s] Failed delayed %s verification for '%s'.", guild_id, reason, title)
         return False
 
 
-def schedule_track_stuck_verification(guild, channel_id, url, title, requester_id, position, player, track_uid=None):
+def schedule_track_stuck_verification(guild, channel_id, url, title, requester_id, position, player, track_uid=None, *, reason="track_stuck"):
     observed_reported_position = _player_reported_position_seconds(player)
     task_key = _track_key(url, title)[:16]
     task_name = f"track_stuck_verify:{guild.id}:{task_key}"
     existing = startup_task_registry.get(task_name)
     if existing and not existing.done():
         logger.info(
-            "[%s] Coalesced duplicate Lavalink track_stuck for '%s'; verification already pending.",
+            "[%s] Coalesced duplicate Lavalink %s for '%s'; verification already pending.",
             guild.id,
+            reason,
             title,
         )
         return True
     logger.warning(
-        "[%s] Lavalink track_stuck hit '%s'; waiting %.0fs to verify playback before touching the live queue.",
+        "[%s] Lavalink %s hit '%s'; waiting %.0fs to verify playback before touching the live queue.",
         guild.id,
+        reason,
         title,
         TRACK_STUCK_VERIFY_DELAY_SECONDS,
     )
     schedule_named_task(
         task_name,
-        verify_track_stuck_before_requeue(guild.id, channel_id, url, title, requester_id, position, observed_reported_position, track_uid),
+        verify_track_stuck_before_requeue(guild.id, channel_id, url, title, requester_id, position, observed_reported_position, track_uid, reason=reason),
     )
     return True
 
@@ -4890,8 +5131,8 @@ async def handle_track_playback_failure(payload, *, reason="track_exception"):
         return False
 
     reason_name = str(reason or "").strip().lower()
-    if reason_name == "track_stuck":
-        return schedule_track_stuck_verification(guild, channel_id, url, title, requester_id, position, player, track_data.get("track_uid"))
+    if reason_name in {"track_stuck", "track_exception"}:
+        return schedule_track_stuck_verification(guild, channel_id, url, title, requester_id, position, player, track_data.get("track_uid"), reason=reason_name)
 
     return await requeue_verified_playback_failure(guild, channel_id, url, title, requester_id, position, reason=reason_name or "track_exception", track_uid=track_data.get("track_uid"))
 
@@ -5045,6 +5286,23 @@ async def clear_voice_channel_status(guild):
         pass
 
 
+async def _resolve_feedback_channel(guild, channel_id):
+    """Resolve a feedback channel id to a TextChannel or Thread.
+
+    guild.get_channel() doesn't see threads, so check get_channel_or_thread
+    first and fall back to fetch_channel for archived/uncached threads.
+    """
+    if not channel_id:
+        return None
+    channel = guild.get_channel_or_thread(int(channel_id))
+    if channel:
+        return channel
+    try:
+        channel = await bot.fetch_channel(int(channel_id))
+    except Exception:
+        return None
+    return channel if getattr(channel, "guild", None) and channel.guild.id == guild.id else None
+
 async def send_or_update_status_message(guild, embed):
     """Maintain one live status message per guild for this bot without duplicate edits."""
     fingerprint = _embed_fingerprint(embed)
@@ -5060,7 +5318,7 @@ async def send_or_update_status_message(guild, embed):
                 res = await cur.fetchone()
                 if not res or not res[0]:
                     return
-                channel = guild.get_channel(int(res[0]))
+                channel = await _resolve_feedback_channel(guild, res[0])
                 if not channel:
                     return
                 cached_message_id = cached.get("message_id") if cached and cached.get("channel_id") == channel.id else None
@@ -5094,10 +5352,13 @@ async def send_feedback(guild, embed):
                 await cur.execute("SELECT feedback_channel_id FROM nexus_guild_settings WHERE guild_id = %s", (guild.id,))
                 res = await cur.fetchone()
                 if res and res[0]:
-                    channel = guild.get_channel(res[0])
+                    channel = await _resolve_feedback_channel(guild, res[0])
                     if channel:
                         try: await channel.send(embed=embed)
                         except discord.Forbidden: pass
+                        except discord.HTTPException as e:
+                            if getattr(e, "code", None) != 50083:  # thread archived & locked
+                                raise
 
 
 async def send_feedback_notice(guild, title, description, color, *, dedupe_key=None, fields=None):
@@ -5265,8 +5526,20 @@ async def _record_track_play_started_bg(guild_id, video_url, title, requester_id
             async with pool.acquire() as conn:
                 async with conn.cursor() as cur:
                     await record_track_play_started(cur, guild_id, video_url, title, requester_id)
+                    if SMART_EMBEDDING_ENABLED:
+                        await get_or_fetch_track_embedding(cur, _track_key(video_url, title), title, video_url)
     except Exception:
         logger.debug("[%s] track_play_started intelligence write skipped (bg).", guild_id, exc_info=True)
+
+async def _record_track_cooccurrence_bg(guild_id, prev_url, prev_title, next_url, next_title):
+    """Fire-and-forget wrapper: record back-to-back track pairs on their own connection."""
+    try:
+        async with DBPoolManager() as pool:
+            async with pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await record_track_cooccurrence(cur, guild_id, prev_url, prev_title, next_url, next_title)
+    except Exception:
+        logger.debug("[%s] track_cooccurrence write skipped (bg).", guild_id, exc_info=True)
 
 
 async def _record_track_play_resumed_bg(guild_id, video_url, title, requester_id):
@@ -5621,6 +5894,9 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
                     await cur.execute("INSERT INTO nexus_history (guild_id, video_url, title, requester_id) VALUES (%s, %s, %s, %s)", (guild.id, url, title, requester_id))
                     # Fire-and-forget: intelligence write gets its own connection so playback resumes immediately.
                     asyncio.ensure_future(_record_track_play_started_bg(guild.id, url, title, requester_id))
+                    _prev_track = playback_tracking.get(guild.id)
+                    if _prev_track and (_prev_track.get("url") or _prev_track.get("title")):
+                        asyncio.ensure_future(_record_track_cooccurrence_bg(guild.id, _prev_track.get("url"), _prev_track.get("title"), url, title))
                 else:
                     asyncio.ensure_future(_record_track_play_resumed_bg(guild.id, url, title, requester_id))
                 try:
@@ -5651,6 +5927,19 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
                     requester_name = await resolve_requester_name(guild, requester_id)
                     embed.add_field(name="Requested by", value=requester_name, inline=True)
                 await send_or_update_status_message(guild, embed)
+                if TRACK_FEEDBACK_BROADCAST and start_position <= 0:
+                    now_playing_desc = f"**[{_compact_track_title(title)}]({url})**\n*By: {uploader}*"
+                    if requester_id:
+                        requester_name = await resolve_requester_name(guild, requester_id)
+                        now_playing_desc += f"\nRequested by **{requester_name}**"
+                    await send_feedback_notice(
+                        guild,
+                        "🎵 Now Playing",
+                        now_playing_desc,
+                        discord.Color.from_rgb(88, 101, 242),
+                        dedupe_key=f"now_playing:{track_uid}",
+                        fields=_track_feedback_fields(track_uid),
+                    )
                 if TRACK_FEEDBACK_BROADCAST and start_position > 0:
                     await send_feedback_notice(
                         guild,
@@ -5947,10 +6236,13 @@ async def auto_heal_loop():
         return
 
     if not auto_heal_initialized:
-        db_states = await bootstrap_recovery_states_from_db()
-        for gid, state in db_states.items():
-            schedule_named_task(f"restore_guild_state:{gid}", restore_guild_state(gid, state))
-        auto_heal_initialized = True
+        try:
+            db_states = await bootstrap_recovery_states_from_db()
+            for gid, state in db_states.items():
+                schedule_named_task(f"restore_guild_state:{gid}", restore_guild_state(gid, state))
+            auto_heal_initialized = True
+        except Exception as tx_error:
+            logger.exception("[%s] Auto-heal bootstrap failed; will retry on next tick.", BOT_ENV_PREFIX.lower())
 
     for gid, state in list(guild_states.items()):
         try:
@@ -6121,7 +6413,33 @@ async def on_ready():
     schedule_named_task("bootstrap_recovery_after_ready", bootstrap_recovery_after_ready())
 
 @bot.event
+async def _enforce_home_channel_suppression(member, before, after):
+    """Keep non-DJ listeners suppressed (no mic) in the bot's Stage home channel.
+
+    Discord lets Stage audience members request-to-speak or be invited to
+    speak, which un-suppresses their voice state and lets their mic through.
+    If that happens in this bot's home Stage channel, force them back to the
+    audience unless they're a DJ/admin.
+    """
+    try:
+        if after.channel is None or after.suppress or not isinstance(after.channel, discord.StageChannel):
+            return
+        settings = await get_saved_settings_summary(member.guild.id)
+        home_vc_id = settings[0] if settings else None
+        if not home_vc_id or after.channel.id != int(home_vc_id):
+            return
+        if member.guild_permissions.administrator:
+            return
+        dj_role_id = settings[4] if settings else None
+        if dj_role_id and discord.utils.get(member.roles, id=dj_role_id):
+            return
+        await member.edit(suppress=True)
+    except Exception:
+        logger.debug("[%s] Failed to enforce home-channel suppression for %s.", BOT_ENV_PREFIX.lower(), getattr(member, "id", None))
+
 async def on_voice_state_update(member, before, after):
+    if member != bot.user:
+        await _enforce_home_channel_suppression(member, before, after)
     if member == bot.user:
         guild_id = member.guild.id
         if after.channel is not None:
@@ -6200,15 +6518,19 @@ async def on_voice_state_update(member, before, after):
 
 @tasks.loop(seconds=METRICS_HEARTBEAT_INTERVAL)
 async def metrics_heartbeat_loop():
-    prune_runtime_state_cache()
-    # reconcile_runtime_playback_state acquires its own DBPoolManager connection — safe to gather.
-    reconcile_results = await asyncio.gather(
-        *[reconcile_runtime_playback_state(guild) for guild in list(bot.guilds)],
-        return_exceptions=True,
-    )
-    for guild, result in zip(list(bot.guilds), reconcile_results):
-        if isinstance(result, Exception):
-            logger.exception("[nexus] Metrics reconcile failed for guild %s", getattr(guild, 'id', None))
+    try:
+        prune_runtime_state_cache()
+        # reconcile_runtime_playback_state acquires its own DBPoolManager connection — safe to gather.
+        guild_snapshot = list(bot.guilds)
+        reconcile_results = await asyncio.gather(
+            *[reconcile_runtime_playback_state(guild) for guild in guild_snapshot],
+            return_exceptions=True,
+        )
+        for guild, result in zip(guild_snapshot, reconcile_results):
+            if isinstance(result, Exception):
+                logger.exception("[nexus] Metrics reconcile failed for guild %s", getattr(guild, 'id', None))
+    except Exception as tx_error:
+        logger.exception("[nexus] Metrics heartbeat pre-pass failed.")
     try:
         await collect_and_persist_metrics()
     except Exception as tx_error:
@@ -6387,9 +6709,9 @@ async def sethome(interaction: discord.Interaction, channel: discord.VoiceChanne
     invalidate_feature_caches(interaction.guild.id)
     await interaction.followup.send(embed=discord.Embed(title="🏠 Home Set", description=f"Home channel set to {channel.mention}.", color=discord.Color.green()), ephemeral=True)
 
-@bot.tree.command(name="nexus_main_setfeedback", description="Choose the text channel for updates, queue actions, and recovery notices.")
+@bot.tree.command(name="nexus_main_setfeedback", description="Choose the text channel (or thread) for updates, queue actions, and recovery notices.")
 @commands.has_permissions(administrator=True)
-async def setfeedback(interaction: discord.Interaction, channel: discord.TextChannel):
+async def setfeedback(interaction: discord.Interaction, channel: discord.TextChannel | discord.Thread):
     await interaction.response.defer(ephemeral=True)
     await ensure_guild_settings(interaction.guild.id)
     async with DBPoolManager() as pool:
@@ -7253,11 +7575,6 @@ def apply_filter_preset(wav_filters, mode, current_speed=1.0):
     mode = str(mode or 'none').lower().replace(' ', '')
     speed = current_speed
     preset_uses_eq = False
-    if mode != 'earrape':
-        _safe_filter_call('base_compress', lambda: wav_filters.distortion.set(
-            sin_offset=0.0, sin_scale=0.5, cos_offset=0.0, cos_scale=0.0,
-            tan_offset=0.0, tan_scale=0.0, offset=0.0, scale=0.5
-        ))
     if mode == 'nightcore':
         if _safe_filter_call(mode, lambda: wav_filters.timescale.set(speed=1.25, pitch=1.3)):
             speed = 1.25
@@ -7269,6 +7586,14 @@ def apply_filter_preset(wav_filters, mode, current_speed=1.0):
         _safe_filter_call(mode, lambda: wav_filters.equalizer.set(bands=_blend_loudnorm([(0, 0.32), (1, 0.24), (2, 0.12)])))
     elif mode == '8d':
         _safe_filter_call(mode, lambda: wav_filters.rotation.set(rotation_hz=0.18))
+        # Lavalink's rotation filter pans hard left/right (100% to one
+        # channel at the extremes of its cycle), which makes the "8D" effect
+        # cut out completely in one ear. Blend in a bit of the opposite
+        # channel so audio stays faintly audible on both sides while it pans.
+        _safe_filter_call(mode, lambda: wav_filters.channel_mix.set(
+            left_to_left=0.8, left_to_right=0.2,
+            right_to_left=0.2, right_to_right=0.8,
+        ))
     elif mode == 'karaoke':
         _safe_filter_call(mode, lambda: wav_filters.karaoke.set(level=1.0, mono_level=1.0, filter_band=220.0, filter_width=100.0))
     elif mode == 'tremolo':
@@ -7318,8 +7643,8 @@ def apply_filter_preset(wav_filters, mode, current_speed=1.0):
         ])))
     elif mode == 'earrape':
         _safe_filter_call(mode, lambda: wav_filters.distortion.set(
-            sin_offset=0.0, sin_scale=1.0, cos_offset=0.0, cos_scale=1.0,
-            tan_offset=0.0, tan_scale=1.0, r_offset=0.0, r_scale=1.0, k_rate=100.0
+            sin_offset=0.0, sin_scale=1.5, cos_offset=0.0, cos_scale=1.5,
+            tan_offset=0.0, tan_scale=1.0, offset=0.0, scale=1.5
         ))
     elif mode == 'doubletime':
         if _safe_filter_call(mode, lambda: wav_filters.timescale.set(speed=2.0, pitch=1.0)):
@@ -7451,6 +7776,9 @@ async def modify_audio(interaction: discord.Interaction, speed: float = 1.0, pit
                 await cur.execute("SELECT filter_mode FROM nexus_guild_settings WHERE guild_id = %s", (interaction.guild.id,))
                 res = await cur.fetchone()
                 if res and res[0] != 'none': return await interaction.followup.send(embed=discord.Embed(description="❌ **Conflict:** Disable standard Filters via `/nexus_main_filter none` first.", color=discord.Color.red()), ephemeral=True)
+                if interaction.guild.id in playback_tracking:
+                    playback_tracking[interaction.guild.id]["speed"] = speed
+                    update_runtime_position_baseline(interaction.guild.id, current_track_position(interaction.guild.id))
                 await cur.execute("UPDATE nexus_guild_settings SET custom_speed = %s, custom_pitch = %s, custom_modifiers_left = %s WHERE guild_id = %s", (speed, pitch, duration, interaction.guild.id))
     if interaction.guild.voice_client:
         wav_filters = wavelink.Filters()
@@ -8441,8 +8769,13 @@ async def zombie_reaper_loop():
         logger.debug(f"[{BOT_ENV_PREFIX.lower()}] Zombie reaper voice cleanup is disabled while automatic voice recovery is off.")
         return
     for guild in list(bot.guilds):
-        vc = guild.voice_client
-        if vc and not _player_is_active(vc):
+        try:
+            vc = guild.voice_client
+            should_inspect = bool(vc and not _player_is_active(vc))
+        except Exception as tx_error:
+            logger.exception("[nexus] Zombie reaper failed to inspect voice state for guild %s.", getattr(guild, "id", "?"))
+            continue
+        if should_inspect:
             try:
                 async with DBPoolManager() as pool:
                     async with pool.acquire() as conn:
@@ -8515,6 +8848,13 @@ async def database_janitor_loop():
                     await cur.execute(
                         "DELETE FROM nexus_user_track_affinity WHERE last_requested < NOW() - INTERVAL 365 DAY AND play_count <= 1"
                     )
+                    await cur.execute(
+                        "DELETE FROM nexus_track_cooccurrence WHERE updated_at < NOW() - INTERVAL 180 DAY"
+                    )
+                    await cur.execute(
+                        "DELETE te FROM nexus_track_embeddings te LEFT JOIN nexus_track_intelligence ti ON ti.url_key = te.url_key "
+                        "WHERE ti.url_key IS NULL AND te.updated_at < NOW() - INTERVAL 365 DAY"
+                    )
     except Exception as e:
         logger.error(f"Janitor Error: {e}")
 
@@ -8527,6 +8867,11 @@ async def queue_shuffle_maintenance_loop():
             async with pool.acquire() as conn:
                 async with conn.cursor() as cur:
                     for guild in list(bot.guilds):
+                        vc = guild.voice_client
+                        # Skip guilds with nobody around to hear it — no point
+                        # rewriting the queue order for an idle/empty channel.
+                        if not vc or not _voice_client_connected(vc) or not _has_human_listeners(vc):
+                            continue
                         await cur.execute("SELECT loop_mode FROM nexus_guild_settings WHERE guild_id = %s", (guild.id,))
                         row = await cur.fetchone()
                         loop_mode = row[0] if row and row[0] else 'queue'
@@ -8948,17 +9293,32 @@ class SwarmIntelligence(commands.Cog):
                                             await send_webhook_log(self.bot.user.name if self.bot.user else "Unknown Node", "⚙️ Watchdog Cooldown", f"Stall persisted in `{guild.name}`; watchdog parked to prevent revival loop.", discord.Color.orange())
                                             continue
                                         current_pos = current_track_position(guild.id)
-                                        await requeue_failed_track(
-                                            cur,
-                                            guild.id,
-                                            track_info.get('channel_id'),
-                                            track_info.get('url', ''),
-                                            track_info.get('title', 'Recovered Track'),
-                                            track_info.get('requester_id', self.bot.user.id if self.bot.user else None),
-                                            position=current_pos,
-                                            reason="watchdog_stall",
-                                            track_uid=track_info.get("track_uid"),
-                                        )
+                                        for _wd_attempt in range(DIRECT_ORDER_DB_RETRY_ATTEMPTS):
+                                            try:
+                                                await requeue_failed_track(
+                                                    cur,
+                                                    guild.id,
+                                                    track_info.get('channel_id'),
+                                                    track_info.get('url', ''),
+                                                    track_info.get('title', 'Recovered Track'),
+                                                    track_info.get('requester_id', self.bot.user.id if self.bot.user else None),
+                                                    position=current_pos,
+                                                    reason="watchdog_stall",
+                                                    track_uid=track_info.get("track_uid"),
+                                                )
+                                                break
+                                            except Exception as _wd_exc:
+                                                if _is_retryable_mysql_error(_wd_exc) and _wd_attempt + 1 < DIRECT_ORDER_DB_RETRY_ATTEMPTS:
+                                                    logger.warning(
+                                                        "[%s] Watchdog requeue hit retryable DB error %s; retrying (%s/%s).",
+                                                        BOT_ENV_PREFIX.lower(),
+                                                        _mysql_error_code(_wd_exc) or type(_wd_exc).__name__,
+                                                        _wd_attempt + 1,
+                                                        DIRECT_ORDER_DB_RETRY_ATTEMPTS,
+                                                    )
+                                                    await asyncio.sleep(DIRECT_ORDER_DB_RETRY_BASE_DELAY_SECONDS * (_wd_attempt + 1) + random.uniform(0.0, 0.25))
+                                                    continue
+                                                raise
                                         track_info['watchdog_revival_attempts'] = revival_attempts + 1
                                         track_info['last_watchdog_revival'] = now
                                         track_info['start_time'] = now
