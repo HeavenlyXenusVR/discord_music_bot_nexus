@@ -1935,6 +1935,57 @@ async def get_saved_settings_summary(guild_id):
                 _cache_set(GUILD_SETTINGS_CACHE, int(guild_id), row)
                 return row
 
+YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
+_YOUTUBE_PLAYLIST_ID_RE = re.compile(r"[?&]list=([A-Za-z0-9_-]+)")
+_YOUTUBE_PLAYLIST_MAX_ENTRIES = int(os.getenv("YOUTUBE_PLAYLIST_MAX_ENTRIES", "1000"))
+
+
+def _extract_youtube_playlist_id(url):
+    match = _YOUTUBE_PLAYLIST_ID_RE.search(str(url or ""))
+    return match.group(1) if match else None
+
+
+async def _resolve_youtube_playlist_via_api(playlist_id):
+    """Enumerate a YouTube playlist via the YouTube Data API's playlistItems.list,
+    which paginates via nextPageToken with no practical limit -- unlike yt-dlp's
+    flat-playlist extraction, which YouTube caps at roughly 205 entries regardless
+    of cookies/session for large playlists. Returns [] on any error so the caller
+    falls back to yt-dlp."""
+    entries = []
+    page_token = None
+    async with aiohttp.ClientSession() as session:
+        while len(entries) < _YOUTUBE_PLAYLIST_MAX_ENTRIES:
+            params = {
+                "part": "snippet",
+                "playlistId": playlist_id,
+                "maxResults": min(50, _YOUTUBE_PLAYLIST_MAX_ENTRIES - len(entries)),
+                "key": YOUTUBE_API_KEY,
+            }
+            if page_token:
+                params["pageToken"] = page_token
+            async with session.get(
+                "https://www.googleapis.com/youtube/v3/playlistItems",
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+            for item in data.get("items", []):
+                snippet = item.get("snippet") or {}
+                video_id = (snippet.get("resourceId") or {}).get("videoId")
+                title = snippet.get("title") or ""
+                if not video_id or title in ("Deleted video", "Private video"):
+                    continue
+                entries.append(SimpleNamespace(
+                    uri=f"https://www.youtube.com/watch?v={video_id}",
+                    title=title,
+                ))
+            page_token = data.get("nextPageToken")
+            if not page_token:
+                break
+    return entries
+
+
 _YTDLP_COOKIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
 
 ytdl_format_options = {
@@ -8091,6 +8142,18 @@ def _decrement_count(counts, key):
 
 
 async def expand_playlist_with_ytdlp(source):
+    if YOUTUBE_API_KEY:
+        playlist_id = _extract_youtube_playlist_id(source)
+        if playlist_id:
+            try:
+                api_entries = await _resolve_youtube_playlist_via_api(playlist_id)
+            except Exception:
+                logger.warning("[%s] YouTube Data API playlist resolve failed, falling back to yt-dlp", BOT_ENV_PREFIX.lower(), exc_info=True)
+                api_entries = []
+            if api_entries:
+                playlist = SimpleNamespace(url=source, uri=source, tracks=api_entries)
+                return api_entries, playlist
+
     opts = dict(ytdl_format_options)
     opts.update({
         "noplaylist": False,
@@ -8317,6 +8380,16 @@ async def playlist_sync_loop():
 
         async def _extract_one(row):
             guild_id, url, known_count, req_id, channel_id = row
+            if YOUTUBE_API_KEY:
+                playlist_id = _extract_youtube_playlist_id(url)
+                if playlist_id:
+                    try:
+                        api_entries = await _resolve_youtube_playlist_via_api(playlist_id)
+                    except Exception:
+                        logger.warning("[%s] YouTube Data API playlist sync failed for guild %s, falling back to yt-dlp", BOT_ENV_PREFIX.lower(), guild_id, exc_info=True)
+                        api_entries = []
+                    if api_entries:
+                        return {'entries': api_entries}
             async with semaphore:
                 return await asyncio.wait_for(
                     loop.run_in_executor(None, lambda playlist_url=url: _extract_playlist(playlist_url)),
@@ -8358,6 +8431,18 @@ async def playlist_sync_loop():
                                         if not p_key:
                                             p_key = _track_key(p_url, p_title)
                                         previous_rows.append((p_url, p_title, p_req, p_key, p_uid or _new_track_uid()))
+
+                                    if previous_rows and len(previous_rows) >= 10 and current_count < len(previous_rows) * 0.5:
+                                            logger.warning(
+                                                "[%s] Playlist sync got suspiciously few tracks (%s) vs previous snapshot (%s) for guild %s; likely a transient extraction issue, skipping this cycle.",
+                                                BOT_ENV_PREFIX.lower(), current_count, len(previous_rows), guild_id,
+                                            )
+                                            added_count = 0
+                                            purged_live = 0
+                                            purged_backup = 0
+                                            trim_count = 0
+                                            backup_content_trim = 0
+                                            break
 
                                     added_rows = []
                                     removed_counts = {}
