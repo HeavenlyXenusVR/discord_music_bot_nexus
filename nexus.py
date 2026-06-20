@@ -1241,7 +1241,15 @@ async def close_shared_runtime_resources():
 
 async def request_supervisor_restart(reason: str, *, announce: bool = True):
     logger.warning("[%s] Restart requested (%s); exiting for container supervisor restart.", BOT_ENV_PREFIX.lower(), reason)
-    await flush_runtime_state_before_restart(reason)
+    # Same hang risk as flush_and_close_for_shutdown: this is called from background
+    # loops (periodic_restart_loop, the override listener) with no outer try/except,
+    # so an unhandled error here would both skip os._exit(0) (process hangs instead of
+    # restarting) and silently kill the calling @tasks.loop forever. Catch broadly and
+    # always fall through to close/exit.
+    try:
+        await flush_runtime_state_before_restart(reason)
+    except Exception:
+        logger.exception("[%s] Failed to flush runtime state before restart (%s).", BOT_ENV_PREFIX.lower(), reason)
     if announce:
         try:
             await send_webhook_log(
@@ -1252,8 +1260,14 @@ async def request_supervisor_restart(reason: str, *, announce: bool = True):
             )
         except Exception as tx_error:
             logger.debug("[%s] Failed to publish restart webhook.", BOT_ENV_PREFIX.lower(), exc_info=True)
-    await bot.close()
-    await close_shared_runtime_resources()
+    try:
+        await bot.close()
+    except Exception:
+        pass
+    try:
+        await close_shared_runtime_resources()
+    except Exception:
+        pass
     os._exit(0)
 
 
