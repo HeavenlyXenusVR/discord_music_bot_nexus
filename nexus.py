@@ -22,6 +22,8 @@ import re
 import urllib.parse
 import hashlib
 import shutil
+import subprocess
+import fcntl
 from types import SimpleNamespace
 
 # --- DAVE PROTOCOL MONKEYPATCH (FIXES LAVALINK 4.2.2 E2EE ENCRYPTION) ---
@@ -805,6 +807,131 @@ async def is_private_owner_user(user):
     if normalized in PRIVATE_OWNER_USER_IDS:
         return True
     return normalized in await load_private_owner_user_ids()
+
+
+# --- Guild authorization monitoring (alert-only: never auto-leaves or blocks) ---------------
+# Owner-approved servers. When empty, monitoring is OFF (legacy behaviour). When set, joining
+# a server NOT on the list DMs the owner + logs a warning, but the bot takes no action.
+MUSIC_BOT_ALLOWED_GUILD_IDS = _parse_id_set(
+    os.getenv(f"{BOT_ENV_PREFIX}_ALLOWED_GUILD_IDS", os.getenv("MUSIC_BOT_ALLOWED_GUILD_IDS", ""))
+)
+# Per-guild session tables cleaned when the bot leaves a server (kills phantom "mysterious
+# guilds" in the panel). Never includes history (kept as a log) or Discord membership.
+_GUILD_CLEANUP_TABLES = (
+    "playback_state", "queue", "queue_backup",
+    "active_playlists", "active_playlist_tracks", "guild_settings",
+)
+_guild_audit_done = False
+
+
+def _guild_is_authorized(guild_id):
+    if not MUSIC_BOT_ALLOWED_GUILD_IDS:
+        return True
+    try:
+        return int(guild_id) in MUSIC_BOT_ALLOWED_GUILD_IDS
+    except (TypeError, ValueError):
+        return True
+
+
+async def alert_owner_unauthorized_guild(guild, action_desc):
+    name = getattr(guild, "name", "?")
+    gid = getattr(guild, "id", "?")
+    members = getattr(guild, "member_count", "?")
+    logger.warning("[%s] UNAUTHORIZED guild %s (%s) — bot %s it; alert-only, no action taken.",
+                   BOT_ENV_PREFIX.lower(), name, gid, action_desc)
+    msg = (f"⚠️ **Security alert** — music bot `{BOT_ENV_PREFIX.lower()}` {action_desc} an "
+           f"**unauthorized** server: **{name}** (`{gid}`, ~{members} members). No automatic action was "
+           f"taken. Authorize it by adding the id to `{BOT_ENV_PREFIX}_ALLOWED_GUILD_IDS`, or remove the "
+           f"bot from that server.")
+    try:
+        for oid in list(await load_private_owner_user_ids())[:3]:
+            try:
+                user = bot.get_user(int(oid)) or await bot.fetch_user(int(oid))
+                if user:
+                    await user.send(msg)
+            except Exception:
+                continue
+    except Exception:
+        logger.debug("[%s] Could not DM owner about unauthorized guild.", BOT_ENV_PREFIX.lower(), exc_info=True)
+
+
+async def cleanup_guild_data(guild_id):
+    """Delete this bot's persisted rows for one guild. Only touches the DB, never Discord."""
+    prefix = BOT_ENV_PREFIX.lower()
+    try:
+        async with DBPoolManager() as pool:
+            async with pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    for suffix in _GUILD_CLEANUP_TABLES:
+                        try:
+                            await cur.execute(f"DELETE FROM {prefix}_{suffix} WHERE guild_id = %s", (guild_id,))
+                        except Exception:
+                            continue
+    except Exception:
+        logger.debug("[%s] Guild data cleanup failed for %s.", prefix, guild_id, exc_info=True)
+
+
+async def cleanup_stale_guild_rows(current_guild_ids):
+    """Remove DB rows for guilds the bot is no longer a member of (phantom-guild cleanup)."""
+    prefix = BOT_ENV_PREFIX.lower()
+    current = [int(g) for g in current_guild_ids if g is not None]
+    if not current:
+        return 0  # never wipe everything if the guild cache looks empty
+    placeholders = ",".join(["%s"] * len(current))
+    removed = 0
+    try:
+        async with DBPoolManager() as pool:
+            async with pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    for suffix in _GUILD_CLEANUP_TABLES:
+                        try:
+                            await cur.execute(
+                                f"DELETE FROM {prefix}_{suffix} WHERE guild_id NOT IN ({placeholders})",
+                                tuple(current),
+                            )
+                            removed += cur.rowcount or 0
+                        except Exception:
+                            continue
+    except Exception:
+        logger.debug("[%s] Stale guild cleanup failed.", prefix, exc_info=True)
+    return removed
+
+
+@bot.event
+async def on_guild_join(guild):
+    if not _guild_is_authorized(getattr(guild, "id", None)):
+        await alert_owner_unauthorized_guild(guild, "was just ADDED to")
+
+
+@bot.event
+async def on_guild_remove(guild):
+    gid = getattr(guild, "id", None)
+    if gid is not None:
+        await cleanup_guild_data(gid)
+        logger.info("[%s] Left guild %s; cleaned up its session data.", BOT_ENV_PREFIX.lower(), gid)
+
+
+@bot.listen("on_ready")
+async def _guild_authorization_audit():
+    global _guild_audit_done
+    if _guild_audit_done:
+        return
+    _guild_audit_done = True
+    try:
+        await asyncio.sleep(5)  # let the guild cache populate
+        if MUSIC_BOT_ALLOWED_GUILD_IDS:
+            for g in list(bot.guilds):
+                if g.id not in MUSIC_BOT_ALLOWED_GUILD_IDS:
+                    logger.warning("[%s] Currently a member of UNAUTHORIZED guild '%s' (%s) — alert only.",
+                                   BOT_ENV_PREFIX.lower(), g.name, g.id)
+        removed = await cleanup_stale_guild_rows({g.id for g in bot.guilds})
+        if removed:
+            logger.info("[%s] Startup audit removed %s stale row(s) for guilds the bot has left.",
+                        BOT_ENV_PREFIX.lower(), removed)
+    except Exception:
+        logger.debug("[%s] Guild authorization audit failed.", BOT_ENV_PREFIX.lower(), exc_info=True)
+
+
 bot.start_time = time.monotonic()
 playback_tracking = {}
 guild_states = {}
@@ -1784,7 +1911,7 @@ async def _connect_lavalink_forever():
                 continue
             try:
                 logger.info(f"Connecting to Lavalink at {LAVALINK_URI}")
-                node = wavelink.Node(uri=LAVALINK_URI, password=LAVALINK_PASSWORD, identifier=f"SWARM_PRIMARY_{BOT_ENV_PREFIX}", resume_timeout=300)
+                node = wavelink.Node(uri=LAVALINK_URI, password=LAVALINK_PASSWORD, identifier=f"SWARM_PRIMARY_{BOT_ENV_PREFIX}", resume_timeout=900)
                 saved_session = _read_saved_lavalink_session_id()
                 if saved_session:
                     # Pre-populate session ID so Wavelink sends Session-Id header,
@@ -1949,9 +2076,32 @@ async def get_saved_settings_summary(guild_id):
                 _cache_set(GUILD_SETTINGS_CACHE, int(guild_id), row)
                 return row
 
-YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
+YOUTUBE_API_KEYS = [k.strip() for k in os.environ.get("YOUTUBE_API_KEY", "").split(",") if k.strip()]
+YOUTUBE_API_KEY = YOUTUBE_API_KEYS[0] if YOUTUBE_API_KEYS else ""
 _YOUTUBE_PLAYLIST_ID_RE = re.compile(r"[?&]list=([A-Za-z0-9_-]+)")
 _YOUTUBE_PLAYLIST_MAX_ENTRIES = int(os.getenv("YOUTUBE_PLAYLIST_MAX_ENTRIES", "1000"))
+_YOUTUBE_API_QUOTA_BACKOFF_SECONDS = int(os.getenv("YOUTUBE_API_QUOTA_BACKOFF_SECONDS", "21600"))
+_yt_api_key_blocked_until = {}
+_PLAYLIST_API_CACHE_SECONDS = float(os.getenv("PLAYLIST_API_CACHE_SECONDS", "1800"))
+_PLAYLIST_API_CACHE_MAX = 256
+_playlist_api_cache = {}
+
+
+def _available_youtube_api_key():
+    now = time.time()
+    for _key in YOUTUBE_API_KEYS:
+        if now >= _yt_api_key_blocked_until.get(_key, 0.0):
+            return _key
+    return None
+
+
+def _youtube_api_available():
+    return _available_youtube_api_key() is not None
+
+
+def _note_youtube_api_quota_exhausted(key):
+    _yt_api_key_blocked_until[key] = time.time() + _YOUTUBE_API_QUOTA_BACKOFF_SECONDS
+    logger.warning("[%s] YouTube Data API key …%s quota exhausted; backing off %ss (rotating to next key / yt-dlp+cookies)", BOT_ENV_PREFIX.lower(), (key or "")[-4:], _YOUTUBE_API_QUOTA_BACKOFF_SECONDS)
 
 
 def _extract_youtube_playlist_id(url):
@@ -1965,6 +2115,13 @@ async def _resolve_youtube_playlist_via_api(playlist_id):
     flat-playlist extraction, which YouTube caps at roughly 205 entries regardless
     of cookies/session for large playlists. Returns [] on any error so the caller
     falls back to yt-dlp."""
+    now = time.monotonic()
+    cached = _playlist_api_cache.get(playlist_id)
+    if cached and cached[0] > now:
+        return list(cached[1])
+    key = _available_youtube_api_key()
+    if not key:
+        return []
     entries = []
     page_token = None
     async with aiohttp.ClientSession() as session:
@@ -1973,7 +2130,7 @@ async def _resolve_youtube_playlist_via_api(playlist_id):
                 "part": "snippet",
                 "playlistId": playlist_id,
                 "maxResults": min(50, _YOUTUBE_PLAYLIST_MAX_ENTRIES - len(entries)),
-                "key": YOUTUBE_API_KEY,
+                "key": key,
             }
             if page_token:
                 params["pageToken"] = page_token
@@ -1982,6 +2139,10 @@ async def _resolve_youtube_playlist_via_api(playlist_id):
                 params=params,
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
+                if resp.status == 403:
+                    body = await resp.text()
+                    if "quotaExceeded" in body or "dailyLimitExceeded" in body:
+                        _note_youtube_api_quota_exhausted(key)
                 resp.raise_for_status()
                 data = await resp.json()
             for item in data.get("items", []):
@@ -1997,10 +2158,20 @@ async def _resolve_youtube_playlist_via_api(playlist_id):
             page_token = data.get("nextPageToken")
             if not page_token:
                 break
+    if entries:
+        if len(_playlist_api_cache) >= _PLAYLIST_API_CACHE_MAX:
+            for _stale in [k for k, v in list(_playlist_api_cache.items()) if v[0] <= now]:
+                _playlist_api_cache.pop(_stale, None)
+        _playlist_api_cache[playlist_id] = (now + _PLAYLIST_API_CACHE_SECONDS, list(entries))
     return entries
 
 
-_YTDLP_COOKIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+_YTDLP_COOKIES_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+# The cookies file is mounted read-only and shared across all bots, but yt-dlp
+# rewrites the cookie jar after each extraction. Stage a private writable copy in
+# the container's own /tmp so yt-dlp can refresh it without hitting the read-only
+# mount or racing the other bots that write the same shared file.
+_YTDLP_COOKIES_FILE = "/tmp/yt-cookies.txt"
 
 ytdl_format_options = {
     'format': 'bestaudio/best', 'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
@@ -2009,11 +2180,15 @@ ytdl_format_options = {
     'no_warnings': True, 'default_search': 'auto', 'source_address': '0.0.0.0',
     'cachedir': YTDLP_CACHE_DIR
 }
-if os.path.isfile(_YTDLP_COOKIES_FILE) and os.path.getsize(_YTDLP_COOKIES_FILE) > 0:
+if os.path.isfile(_YTDLP_COOKIES_SRC) and os.path.getsize(_YTDLP_COOKIES_SRC) > 0:
     # YouTube paginates flat-playlist extraction past the first ~100 entries only
     # for authenticated requests; without cookies, larger playlists silently
     # truncate at the first page.
-    ytdl_format_options['cookiefile'] = _YTDLP_COOKIES_FILE
+    try:
+        shutil.copyfile(_YTDLP_COOKIES_SRC, _YTDLP_COOKIES_FILE)
+        ytdl_format_options['cookiefile'] = _YTDLP_COOKIES_FILE
+    except OSError:
+        logger.warning("[%s] Could not stage writable YouTube cookies copy", BOT_ENV_PREFIX.lower())
 
 
 
@@ -2169,6 +2344,12 @@ async def init_db():
                 )
                 await dedupe_queue_table_by_track_uid(cur, "nexus_queue", bot_name="nexus")
                 await dedupe_queue_table_by_track_uid(cur, "nexus_queue_backup", bot_name="nexus")
+                # Cap loop/re-add URL bloat at 2 copies across ALL guilds (incl. those with
+                # no active playlist), preserving small deliberate repeats. Runs every start.
+                _trim_live = await trim_queue_duplicate_runs(cur, "nexus_queue", bot_name="nexus")
+                _trim_backup = await trim_queue_duplicate_runs(cur, "nexus_queue_backup", bot_name="nexus")
+                if _trim_live or _trim_backup:
+                    logger.info("[%s] Trimmed %s live / %s backup over-duplicated queue row(s).", BOT_ENV_PREFIX.lower(), _trim_live, _trim_backup)
                 # One-time legacy migration only: content-based dedupe collapses rows that
                 # predate the track_uid column (those all got distinct random UIDs backfilled
                 # above, so the UID-based dedupe above can't catch same-content duplicates).
@@ -4056,6 +4237,52 @@ async def dedupe_queue_table_by_track_key(cur, table_name, *, guild_id=None, bot
     return deleted
 
 
+QUEUE_DUPLICATE_CAP = int(os.getenv("QUEUE_DUPLICATE_CAP", "2"))
+
+
+async def trim_queue_duplicate_runs(cur, table_name, *, guild_id=None, bot_name=None, max_copies=QUEUE_DUPLICATE_CAP):
+    """Keep at most max_copies rows per (guild, URL/title), lowest ids first. Collapses
+    loop/re-add bloat while leaving small deliberate repeats intact. Returns rows deleted."""
+    if not re.fullmatch(r"[A-Za-z0-9_]+", table_name):
+        raise ValueError(f"Unsafe table name: {table_name}")
+    cap = max(1, int(max_copies))
+    where = []
+    params = []
+    if guild_id is not None:
+        where.append("guild_id = %s")
+        params.append(int(guild_id))
+    if bot_name is not None:
+        where.append("bot_name = %s")
+        params.append(str(bot_name))
+    where_clause = f"WHERE {' AND '.join(where)}" if where else ""
+    await cur.execute(
+        f"SELECT id, guild_id, bot_name, video_url, title FROM {table_name} {where_clause} ORDER BY guild_id ASC, bot_name ASC, id ASC",
+        tuple(params),
+    )
+    rows = list(await cur.fetchall() or [])
+    if not rows:
+        return 0
+    counts = {}
+    excess_ids = []
+    for row in rows:
+        row_id = _row_value(row, "id", _row_value(row, 0))
+        row_guild_id = int(_row_value(row, "guild_id", _row_value(row, 1, 0)) or 0)
+        row_bot_name = str(_row_value(row, "bot_name", _row_value(row, 2, "")) or "")
+        url = str(_row_value(row, "video_url", _row_value(row, 3, "")) or "")
+        title = str(_row_value(row, "title", _row_value(row, 4, "")) or "")
+        if row_id is None or not url:
+            continue
+        key = (row_guild_id, row_bot_name, _track_key(url, title))
+        counts[key] = counts.get(key, 0) + 1
+        if counts[key] > cap:
+            excess_ids.append(int(row_id))
+    deleted = 0
+    for row_id in excess_ids:
+        await cur.execute(f"DELETE FROM {table_name} WHERE id = %s", (row_id,))
+        deleted += max(0, int(getattr(cur, "rowcount", 0) or 0))
+    return deleted
+
+
 async def find_existing_queue_row(cur, table_name, guild_id, bot_name, *, track_uid=None, video_url=None, title=None, match_identity=False):
     if not re.fullmatch(r"[A-Za-z0-9_]+", table_name):
         raise ValueError(f"Unsafe table name: {table_name}")
@@ -4236,6 +4463,17 @@ async def shuffle_queue_rows(cur, guild_id, *, preserve_first=True):
 
 async def requeue_finished_track(cur, guild_id, video_url, title, requester_id, track_uid=None):
     original_uid = _normalize_track_uid(track_uid)
+    # loop_mode='queue' re-appends the finished track; each re-append gets a fresh UID
+    # (bypassing the track_uid unique index), so cap copies to stop a degenerate loop
+    # (e.g. a single-track queue) from growing without bound.
+    if video_url:
+        await cur.execute(
+            "SELECT COUNT(*) FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus' AND video_url = %s",
+            (guild_id, video_url),
+        )
+        _existing_copies = await cur.fetchone()
+        if _existing_copies and int(_existing_copies[0] or 0) >= QUEUE_DUPLICATE_CAP:
+            return True
     actual_uid = await enqueue_track(cur, guild_id, video_url, title, requester_id, backup=False, track_uid=track_uid)
     # If the insert had to regenerate a new UID (duplicate-key collision), the backup
     # still holds the old UID. Sync it now so parity repair never sees a phantom gap.
@@ -5180,6 +5418,45 @@ def mark_track_failure(guild_id, url=None, title=None):
     return count
 
 
+# --- Anti-storm circuit breaker: cap how fast one guild can churn through failed tracks. ---
+GUILD_FAILURE_BURST_MAX = 8
+GUILD_FAILURE_BURST_WINDOW_SECONDS = 20.0
+GUILD_FAILURE_COOLDOWN_SECONDS = 60.0
+_guild_failure_burst = {}
+_guild_failure_cooldown_until = {}
+
+
+def register_guild_failure(guild_id):
+    """Return True if auto-advance should be suppressed (burst tripped or still in cooldown)."""
+    now = time.monotonic()
+    if now < _guild_failure_cooldown_until.get(guild_id, 0.0):
+        return True
+    count, start = _guild_failure_burst.get(guild_id, (0, now))
+    if now - start > GUILD_FAILURE_BURST_WINDOW_SECONDS:
+        count, start = 0, now
+    count += 1
+    _guild_failure_burst[guild_id] = (count, start)
+    if count >= GUILD_FAILURE_BURST_MAX:
+        _guild_failure_cooldown_until[guild_id] = now + GUILD_FAILURE_COOLDOWN_SECONDS
+        _guild_failure_burst[guild_id] = (0, now)
+        logger.error("[%s] Playback failure burst (%s in %.0fs); pausing auto-advance for %.0fs to stop a skip storm.",
+                     guild_id, count, GUILD_FAILURE_BURST_WINDOW_SECONDS, GUILD_FAILURE_COOLDOWN_SECONDS)
+        return True
+    return False
+
+
+async def _resume_after_failure_cooldown(guild_id, channel_id):
+    try:
+        await asyncio.sleep(GUILD_FAILURE_COOLDOWN_SECONDS + 1.0)
+        guild = bot.get_guild(int(guild_id))
+        if guild and channel_id:
+            await process_queue(guild, channel_id, allow_recovery_restore=True)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.debug("[%s] Failed to resume after failure cooldown.", guild_id, exc_info=True)
+
+
 async def handle_track_playback_failure(payload, *, reason="track_exception"):
     player = getattr(payload, "player", None)
     guild = getattr(player, "guild", None)
@@ -5188,8 +5465,22 @@ async def handle_track_playback_failure(payload, *, reason="track_exception"):
 
     track = getattr(payload, "track", None) or _player_current_track(player)
     track_data = playback_tracking.get(guild.id, {})
-    url = getattr(track, "uri", None) or getattr(track, "url", None) or track_data.get("url")
-    title = getattr(track, "title", None) or _track_title_from_obj(track) or track_data.get("title") or "Recoverable Track"
+    track_uri = getattr(track, "uri", None) or getattr(track, "url", None)
+    # Prefer the original (YouTube) url from runtime tracking. The currently-playing Playable
+    # may be a LOCAL cache file (uri = file://...), which must NEVER be requeued as-is.
+    url = track_data.get("url") or track_uri
+    title = track_data.get("title") or getattr(track, "title", None) or _track_title_from_obj(track) or "Recoverable Track"
+
+    # Local-cache guardrail: a cache file that fails playback is unplayable. Delete it from
+    # disk so it is never served again, and make sure we requeue the streamable YouTube url.
+    if _is_local_cache_uri(track_uri) or _is_local_cache_uri(url):
+        vid = _cache_id_from_uri(track_uri) or _audio_cache_id(url)
+        if vid:
+            await asyncio.to_thread(_audio_cache_drop, vid)
+            logger.warning("[%s] Local cache track %s failed playback (%s); removed it from disk and falling back to streaming.", guild.id, vid, reason)
+            if not _audio_cache_id(url):
+                url = f"https://www.youtube.com/watch?v={vid}"
+
     channel_id = (
         getattr(getattr(player, "channel", None), "id", None)
         or track_data.get("channel_id")
@@ -5200,6 +5491,14 @@ async def handle_track_playback_failure(payload, *, reason="track_exception"):
 
     if not url:
         logger.warning("[%s] Lavalink failure had no track URL; preserving state but cannot requeue unknown track (%s).", guild.id, reason)
+        return False
+
+    # Anti-storm breaker: if failures arrive in a burst, stop auto-advancing so one bad
+    # batch can't churn the whole queue, then schedule a single graceful resume.
+    if register_guild_failure(guild.id):
+        logger.error("[%s] Suppressing requeue/advance for '%s' due to failure-burst cooldown.", guild.id, title)
+        if channel_id:
+            schedule_named_task(f"failure_burst_resume:{guild.id}", _resume_after_failure_cooldown(guild.id, channel_id), overwrite=True)
         return False
 
     reason_name = str(reason or "").strip().lower()
@@ -6379,7 +6678,14 @@ async def on_wavelink_node_ready(payload: wavelink.NodeReadyEventPayload):
                 title = info.get("title", "")
                 duration_s = max(0, int(info.get("length", 0) / 1000))
                 guild = bot.get_guild(gid)
-                if guild and gid not in playback_tracking and (url or title):
+                if not guild:
+                    continue
+                # Lavalink still has this player live — audio never stopped. Cancel any
+                # pending re-play/seek recovery so the bot doesn't restart it (the YouTube
+                # deep seek would fail and reset the song to 0).
+                clear_interrupt_resume(gid)
+                clear_recovery_retry(gid)
+                if gid not in playback_tracking and (url or title):
                     playback_tracking[gid] = {
                         "start_time": __import__("time").monotonic() - position_s,
                         "offset": position_s,
@@ -6480,6 +6786,10 @@ async def on_ready():
         position_updater.start()
     if not metrics_heartbeat_loop.is_running():
         metrics_heartbeat_loop.start()
+    if not audio_cache_eviction_loop.is_running():
+        audio_cache_eviction_loop.start()
+    if not audio_cache_refs_reconcile_loop.is_running():
+        audio_cache_refs_reconcile_loop.start()
 
     schedule_named_task("restore_persistent_voice_states", restore_persistent_voice_states())
     schedule_named_task("bootstrap_recovery_after_ready", bootstrap_recovery_after_ready())
@@ -8156,7 +8466,7 @@ def _decrement_count(counts, key):
 
 
 async def expand_playlist_with_ytdlp(source):
-    if YOUTUBE_API_KEY:
+    if _youtube_api_available():
         playlist_id = _extract_youtube_playlist_id(source)
         if playlist_id:
             try:
@@ -8310,20 +8620,437 @@ async def _expand_media_url(url):
     except Exception as tx_error:
         return candidate
 
-async def resolve_queue_track(source, fallback_title=None):
-    candidate = await _expand_media_url(source)
-    attempts = [candidate]
-    title_search = _build_track_title_search(fallback_title)
-    if title_search and _is_direct_media_url(candidate):
-        attempts.append(title_search)
+# --- Local audio cache: download best-quality audio once, play from disk on repeat ---
+AUDIO_CACHE_DIR = os.getenv("AUDIO_CACHE_DIR", "").strip()
+AUDIO_CACHE_ENABLED = bool(AUDIO_CACHE_DIR) and os.getenv("AUDIO_CACHE_ENABLED", "true").strip().lower() not in {"0", "false", "off", "no"}
+AUDIO_CACHE_MAX_BYTES = int(float(os.getenv("AUDIO_CACHE_MAX_GB", "60")) * (1024 ** 3))
+AUDIO_CACHE_CONCURRENCY = max(1, int(os.getenv("AUDIO_CACHE_CONCURRENCY", "2")))
+AUDIO_CACHE_PREDOWNLOAD = os.getenv("AUDIO_CACHE_PREDOWNLOAD", "true").strip().lower() not in {"0", "false", "off", "no"}
+AUDIO_CACHE_REFS_RECONCILE_SECONDS = max(60, int(os.getenv("AUDIO_CACHE_REFS_RECONCILE_SECONDS", "300")))
+_AUDIO_CACHE_ID_RE = re.compile(r"(?:v=|youtu\.be/|/shorts/|/embed/|/v/)([A-Za-z0-9_-]{11})")
+# Only formats Lavalink's LOCAL source plays reliably (seekable, robust decoders).
+# Raw YouTube bestaudio (webm/opus, m4a/aac) is NOT served from disk — it is normalized
+# to Ogg/Opus on download. Serving raw webm/m4a triggered "Suspicious exception" skip storms.
+_AUDIO_CACHE_EXTS = ("opus", "ogg", "mp3")
+_AUDIO_CACHE_MIN_BYTES = 8192
+_audio_cache_locks = {}
+_audio_cache_sem = None
+_audio_cache_tasks = set()
 
-    last_error = None
-    for attempt in attempts:
+
+def _safe_unlink(path):
+    try:
+        if path:
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def _audio_cache_validate(path):
+    """True only if ffprobe confirms a decodable audio stream (guards corruption/truncation)."""
+    try:
+        if not path or os.path.getsize(path) < _AUDIO_CACHE_MIN_BYTES:
+            return False
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=codec_type", "-of", "default=nw=1:nk=1", path],
+            capture_output=True, text=True, timeout=30,
+        )
+        return proc.returncode == 0 and "audio" in (proc.stdout or "")
+    except Exception:
+        return False
+
+
+def _audio_cache_drop(cache_id):
+    """Remove every on-disk variant of a cache id (used when a local file is proven unplayable)."""
+    if not cache_id or not AUDIO_CACHE_DIR:
+        return
+    for ext in _AUDIO_CACHE_EXTS:
+        _safe_unlink(os.path.join(AUDIO_CACHE_DIR, f"{cache_id}.{ext}"))
+
+
+def _is_local_cache_uri(uri):
+    s = str(uri or "")
+    return s.startswith("file://") or (bool(AUDIO_CACHE_DIR) and AUDIO_CACHE_DIR in s)
+
+
+def _cache_id_from_uri(uri):
+    """file:///audiocache/<id>.opus -> <id> (only when it looks like a YouTube id)."""
+    base = os.path.basename(str(uri or "").split("?", 1)[0])
+    vid = os.path.splitext(base)[0]
+    return vid if re.fullmatch(r"[A-Za-z0-9_-]{11}", vid or "") else None
+
+
+# Shared-dir refcount: the 13 bots share one cache dir, so a file may only be deleted from
+# disk when NO bot's playlist references it. Each bot writes a marker file .refs/<id>/<bot>;
+# a file is unreferenced iff its .refs/<id>/ dir is empty. Each bot only ever touches its own
+# marker, so there is no cross-bot write contention.
+AUDIO_CACHE_REFS_DIR = os.path.join(AUDIO_CACHE_DIR, ".refs") if AUDIO_CACHE_DIR else ""
+_AUDIO_CACHE_REF_NAME = re.sub(r"[^A-Za-z0-9_.-]", "_", BOT_ENV_PREFIX.lower()) or "bot"
+
+
+def _audio_cache_ref_add(cache_id):
+    if not cache_id or not AUDIO_CACHE_REFS_DIR:
+        return
+    d = os.path.join(AUDIO_CACHE_REFS_DIR, cache_id)
+    try:
+        os.makedirs(d, exist_ok=True)
+        open(os.path.join(d, _AUDIO_CACHE_REF_NAME), "a").close()
+    except OSError:
+        pass
+
+
+def _audio_cache_ref_remove(cache_id):
+    if not cache_id or not AUDIO_CACHE_REFS_DIR:
+        return
+    _safe_unlink(os.path.join(AUDIO_CACHE_REFS_DIR, cache_id, _AUDIO_CACHE_REF_NAME))
+    try:
+        os.rmdir(os.path.join(AUDIO_CACHE_REFS_DIR, cache_id))  # succeeds only when empty (no refs left)
+    except OSError:
+        pass
+
+
+def _audio_cache_has_refs(cache_id):
+    """True if ANY bot still references cache_id."""
+    if not cache_id or not AUDIO_CACHE_REFS_DIR:
+        return False
+    try:
+        with os.scandir(os.path.join(AUDIO_CACHE_REFS_DIR, cache_id)) as it:
+            return any(True for _ in it)
+    except OSError:
+        return False
+
+
+def _audio_cache_my_ref_ids():
+    """Cache ids THIS bot currently holds a ref marker for."""
+    ids = set()
+    if not AUDIO_CACHE_REFS_DIR:
+        return ids
+    try:
+        with os.scandir(AUDIO_CACHE_REFS_DIR) as it:
+            for e in it:
+                try:
+                    if e.is_dir() and os.path.isfile(os.path.join(e.path, _AUDIO_CACHE_REF_NAME)):
+                        ids.add(e.name)
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return ids
+
+
+def _audio_cache_id(url):
+    m = _AUDIO_CACHE_ID_RE.search(str(url or ""))
+    return m.group(1) if m else None
+
+
+def _audio_cache_find(cache_id):
+    if not cache_id or not AUDIO_CACHE_DIR:
+        return None
+    for ext in _AUDIO_CACHE_EXTS:
+        p = os.path.join(AUDIO_CACHE_DIR, f"{cache_id}.{ext}")
         try:
-            entries, _playlist_result = await search_playables(attempt)
+            if os.path.getsize(p) >= _AUDIO_CACHE_MIN_BYTES:
+                return p
+        except OSError:
+            continue
+    return None
+
+
+def _audio_cache_lookup_uri(url):
+    if not AUDIO_CACHE_ENABLED:
+        return None
+    p = _audio_cache_find(_audio_cache_id(url))
+    if p:
+        try:
+            os.utime(p, None)  # bump atime for LRU
+        except OSError:
+            pass
+        return "file://" + p
+    return None
+
+
+def _audio_cache_publish_ready(final):
+    try:
+        return os.path.isfile(final) and os.path.getsize(final) >= _AUDIO_CACHE_MIN_BYTES
+    except OSError:
+        return False
+
+
+def _audio_cache_download_blocking(cache_id, url):
+    os.makedirs(AUDIO_CACHE_DIR, exist_ok=True)
+    final = os.path.join(AUDIO_CACHE_DIR, f"{cache_id}.opus")
+    # Cross-process dedup: the 13 bots share one cache dir, so only ONE process should
+    # download a given id. flock is advisory + auto-released if a holder dies (no stale
+    # locks). A waiter reuses the published file instead of downloading a duplicate. If the
+    # locking machinery is unavailable for any reason, we fall through and download anyway.
+    lock_path = os.path.join(AUDIO_CACHE_DIR, f".lock-{cache_id}")
+    lock_fd = None
+    try:
+        try:
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                # Another bot is already downloading this id; wait for it to publish.
+                for _ in range(180):
+                    if _audio_cache_publish_ready(final):
+                        return final
+                    time.sleep(0.5)
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)  # block until the holder finishes
+        except OSError:
+            lock_fd = None
+        # Someone may have finished while we waited / before we acquired the lock.
+        if _audio_cache_publish_ready(final):
+            return final
+        return _audio_cache_fetch_and_normalize(cache_id, url, final)
+    finally:
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(lock_fd)
+
+
+def _audio_cache_fetch_and_normalize(cache_id, url, final):
+    tmp_base = os.path.join(AUDIO_CACHE_DIR, f".dl-{cache_id}-{os.getpid()}")
+    tmpl = tmp_base + ".%(ext)s"
+    # Keep the account cookiefile: YouTube (2026) blocks anonymous downloads with
+    # "Sign in to confirm you're not a bot". The bgutil plugin binds its GVS PoToken to the
+    # cookie session, so cookies + bgutil yields downloadable formats. Normalize to Ogg/Opus
+    # (lossless copy from YouTube's opus, re-encode only for aac) so Lavalink's LOCAL source
+    # plays it reliably — raw webm/m4a from disk throws "Suspicious exception" skip storms.
+    opts = {k: v for k, v in ytdl_format_options.items() if k != "extract_flat"}
+    opts.update({"format": "bestaudio/best", "outtmpl": tmpl, "noplaylist": True,
+                 "skip_download": False, "quiet": True, "no_warnings": True,
+                 "overwrites": True, "ignoreerrors": False,
+                 "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "opus"}]})
+    produced = None
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if not info:
+                return None
+            rd = (info.get("requested_downloads") or [{}])[0]
+            produced = rd.get("filepath") or rd.get("_filename")
+        if not produced or not os.path.isfile(produced):
+            cand = tmp_base + ".opus"
+            produced = cand if os.path.isfile(cand) else produced
+        if not produced or not os.path.isfile(produced):
+            return None
+        # Guardrail: only publish files that actually decode to an audio stream.
+        if not _audio_cache_validate(produced):
+            logger.warning("[%s] Audio cache rejected %s: failed integrity validation.", BOT_ENV_PREFIX.lower(), cache_id)
+            return None
+        if _audio_cache_publish_ready(final):
+            return final
+        os.replace(produced, final)  # atomic — Lavalink never sees a partial file
+        produced = None
+        return final
+    finally:
+        # Never leave a partial/temp file behind for the eviction loop or a future lookup.
+        for ext in ("opus", "webm", "m4a", "mp3", "ogg", "part", "ytdl"):
+            _safe_unlink(tmp_base + "." + ext)
+
+
+async def ensure_audio_cached(url):
+    global _audio_cache_sem
+    if not AUDIO_CACHE_ENABLED:
+        return None
+    cache_id = _audio_cache_id(url)
+    if not cache_id:
+        return None
+    existing = _audio_cache_find(cache_id)
+    if existing:
+        return existing
+    if _audio_cache_sem is None:
+        _audio_cache_sem = asyncio.Semaphore(AUDIO_CACHE_CONCURRENCY)
+    lock = _audio_cache_locks.setdefault(cache_id, asyncio.Lock())
+    async with lock:
+        existing = _audio_cache_find(cache_id)
+        if existing:
+            return existing
+        async with _audio_cache_sem:
+            try:
+                loop = asyncio.get_running_loop()
+                path = await loop.run_in_executor(None, _audio_cache_download_blocking, cache_id, url)
+                if path:
+                    logger.info("[%s] Audio cached: %s", BOT_ENV_PREFIX.lower(), os.path.basename(path))
+                return path
+            except Exception as exc:
+                logger.warning("[%s] Audio cache download FAILED for %s: %s", BOT_ENV_PREFIX.lower(), cache_id, exc)
+                return None
+            finally:
+                _audio_cache_locks.pop(cache_id, None)
+
+
+def schedule_audio_cache_download(url):
+    if not AUDIO_CACHE_ENABLED:
+        return
+    cache_id = _audio_cache_id(url)
+    if not cache_id or _audio_cache_find(cache_id):
+        return
+    task = asyncio.create_task(ensure_audio_cached(url))
+    _audio_cache_tasks.add(task)
+    task.add_done_callback(_audio_cache_tasks.discard)
+
+
+def _audio_cache_evict_blocking():
+    try:
+        entries = []
+        total = 0
+        with os.scandir(AUDIO_CACHE_DIR) as it:
+            for e in it:
+                if e.name.startswith("."):  # skips .dl- / .lock- / .part / .refs
+                    continue
+                try:
+                    if not e.is_file():
+                        continue
+                    st = e.stat()
+                except OSError:
+                    continue
+                entries.append((st.st_atime, st.st_size, e.path, os.path.splitext(e.name)[0]))
+                total += st.st_size
+        if total <= AUDIO_CACHE_MAX_BYTES:
+            return 0
+        entries.sort(key=lambda x: x[0])  # least-recently-used first
+        # Evict UNREFERENCED files first; only touch playlist-referenced files if the disk
+        # cap is still exceeded afterwards (so playlist tracks survive normal eviction).
+        unref = [x for x in entries if not _audio_cache_has_refs(x[3])]
+        ref = [x for x in entries if _audio_cache_has_refs(x[3])]
+        removed = 0
+        for group in (unref, ref):
+            for _atime, size, path, cid in group:
+                if total <= AUDIO_CACHE_MAX_BYTES:
+                    break
+                try:
+                    os.remove(path)
+                    if not _audio_cache_has_refs(cid):
+                        try:
+                            os.rmdir(os.path.join(AUDIO_CACHE_REFS_DIR, cid))
+                        except OSError:
+                            pass
+                    total -= size
+                    removed += 1
+                except OSError:
+                    pass
+        return removed
+    except FileNotFoundError:
+        return 0
+
+
+async def audio_cache_refs_reconcile():
+    """Set THIS bot's cache refs to exactly its current playlists (handles add/remove/clear):
+    new playlist videos get a ref + a download; videos no longer in any playlist lose this
+    bot's ref, and are deleted from disk once no bot references them."""
+    if not AUDIO_CACHE_ENABLED or not AUDIO_CACHE_REFS_DIR:
+        return
+    tbl = f"{BOT_ENV_PREFIX.lower()}_active_playlist_tracks"
+    desired = set()
+    async with DBPoolManager() as pool:
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(f"SELECT DISTINCT video_url FROM {tbl} WHERE bot_name = %s", (BOT_ENV_PREFIX.lower(),))
+                for row in (await cur.fetchall() or []):
+                    cid = _audio_cache_id(_row_value(row, 'video_url', _row_value(row, 0)))
+                    if cid:
+                        desired.add(cid)
+    current = await asyncio.to_thread(_audio_cache_my_ref_ids)
+    to_add = desired - current
+    to_remove = current - desired
+
+    def _apply():
+        freed = 0
+        for cid in to_add:
+            _audio_cache_ref_add(cid)
+        for cid in to_remove:
+            _audio_cache_ref_remove(cid)
+            if not _audio_cache_has_refs(cid):
+                _audio_cache_drop(cid)
+                freed += 1
+        return freed
+
+    freed = await asyncio.to_thread(_apply)
+    for cid in to_add:
+        schedule_audio_cache_download(f"https://www.youtube.com/watch?v={cid}")
+    if to_add or to_remove:
+        logger.info("[%s] Audio cache refs reconciled: +%s, -%s, freed %s file(s) from disk.",
+                    BOT_ENV_PREFIX.lower(), len(to_add), len(to_remove), freed)
+
+
+@tasks.loop(seconds=AUDIO_CACHE_REFS_RECONCILE_SECONDS)
+async def audio_cache_refs_reconcile_loop():
+    if not AUDIO_CACHE_ENABLED or not AUDIO_CACHE_REFS_DIR:
+        return
+    try:
+        await audio_cache_refs_reconcile()
+    except Exception:
+        logger.debug("[%s] Audio cache refs reconcile error.", BOT_ENV_PREFIX.lower(), exc_info=True)
+
+
+@tasks.loop(seconds=1800)
+async def audio_cache_eviction_loop():
+    if not AUDIO_CACHE_ENABLED:
+        return
+    try:
+        removed = await asyncio.to_thread(_audio_cache_evict_blocking)
+        if removed:
+            logger.info("[%s] Audio cache LRU eviction removed %s file(s) to stay under %sGB.", BOT_ENV_PREFIX.lower(), removed, int(AUDIO_CACHE_MAX_BYTES / (1024 ** 3)))
+    except Exception:
+        logger.debug("[%s] Audio cache eviction error.", BOT_ENV_PREFIX.lower(), exc_info=True)
+
+
+# Retry the exact requested video this many times before a title-search substitution.
+RESOLVE_DIRECT_RETRIES = max(1, int(os.getenv("RESOLVE_DIRECT_RETRIES", "3")))
+RESOLVE_DIRECT_RETRY_DELAY = float(os.getenv("RESOLVE_DIRECT_RETRY_DELAY", "0.5"))
+
+
+async def resolve_queue_track(source, fallback_title=None):
+    _cached_uri = _audio_cache_lookup_uri(source)
+    if _cached_uri:
+        try:
+            if await ensure_lavalink_ready():
+                _cres = await asyncio.wait_for(wavelink.Playable.search(_cached_uri), timeout=LAVALINK_SEARCH_TIMEOUT_SECONDS)
+                _cent, _ = unwrap_search_results(_cres)
+                if _cent:
+                    logger.info("[%s] Local cache HIT (playing from disk): %s", BOT_ENV_PREFIX.lower(), _audio_cache_id(source))
+                    return _cent[0], source
+        except Exception:
+            logger.debug("[%s] Local audio cache play failed; using live source.", BOT_ENV_PREFIX.lower(), exc_info=True)
+    candidate = await _expand_media_url(source)
+
+    # Retry the EXACT requested source before ever substituting a title-search result. Most
+    # resolution failures are transient (DNS / rate-limit / a YouTube AAC stream hiccup), and a
+    # title-search fallback can return a DIFFERENT video that merely shares the title — which is
+    # exactly the "playing a whole different track that's not in the playlist" symptom. Only
+    # substitute as a genuine last resort, and log it loudly so it's never silent.
+    is_direct = _is_direct_media_url(candidate)
+    direct_tries = RESOLVE_DIRECT_RETRIES if is_direct else 1
+    last_error = None
+    for _try in range(direct_tries):
+        try:
+            entries, _playlist_result = await search_playables(candidate)
             if entries:
-                return entries[0], attempt
+                schedule_audio_cache_download(source)
+                return entries[0], candidate
             last_error = ValueError("No stream found.")
+        except Exception as exc:
+            last_error = exc
+        if _try < direct_tries - 1:
+            await asyncio.sleep(RESOLVE_DIRECT_RETRY_DELAY)
+
+    title_search = _build_track_title_search(fallback_title)
+    if title_search and is_direct:
+        try:
+            entries, _playlist_result = await search_playables(title_search)
+            if entries:
+                logger.warning(
+                    "[%s] Exact source for '%s' unavailable after %s tries; using title-search alternate "
+                    "(may be a different upload than the playlist entry).",
+                    BOT_ENV_PREFIX.lower(), fallback_title or source, direct_tries,
+                )
+                return entries[0], title_search
         except Exception as exc:
             last_error = exc
 
@@ -8343,6 +9070,13 @@ async def set_active_playlist(guild_id, playlist_url, known_track_count, request
     if not playlist_url:
         return
     await init_playlist_db()
+    if AUDIO_CACHE_PREDOWNLOAD:
+        for _pe in (playlist_entries or []):
+            _pe_url = getattr(_pe, 'uri', None) or getattr(_pe, 'url', None)
+            schedule_audio_cache_download(_pe_url)
+            _pe_cid = _audio_cache_id(_pe_url)
+            if _pe_cid:
+                _audio_cache_ref_add(_pe_cid)
     snapshot_rows = _playlist_rows_to_snapshot(playlist_entries or [], requester_id)
     async with DBPoolManager() as pool:
         async with pool.acquire() as conn:
@@ -8394,7 +9128,7 @@ async def playlist_sync_loop():
 
         async def _extract_one(row):
             guild_id, url, known_count, req_id, channel_id = row
-            if YOUTUBE_API_KEY:
+            if _youtube_api_available():
                 playlist_id = _extract_youtube_playlist_id(url)
                 if playlist_id:
                     try:
