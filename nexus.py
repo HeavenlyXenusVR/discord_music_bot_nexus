@@ -5948,8 +5948,12 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
             # Collect all in-memory data before touching the DB.
             track_data = playback_tracking.get(guild.id, {})
             original_requester = track_data.get('requester_id', bot.user.id if bot.user else None)
-            track_uri = getattr(track, 'uri', None) or track_data.get('url')
-            track_title = getattr(track, 'title', None) or track_data.get('title')
+            # Prefer the original queue url/title from runtime tracking. A track played from the
+            # local cache reports its uri/title from the file — the title becomes "Opus" (no
+            # metadata) and the uri may be a file:// path — which would otherwise pollute the
+            # queue/backup/history/state with "Opus" entries on loop re-queue.
+            track_uri = track_data.get('original_queue_url') or track_data.get('url') or getattr(track, 'uri', None)
+            track_title = track_data.get('original_queue_title') or track_data.get('title') or getattr(track, 'title', None)
             resolved_track_uid = track_data.get("track_uid") or _track_uid_from_obj(track)
             if reason == "FINISHED":
                 final_position = int(track_data.get('duration') or current_track_position(guild.id) or 0)
