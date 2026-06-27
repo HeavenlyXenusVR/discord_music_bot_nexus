@@ -8961,22 +8961,23 @@ async def audio_cache_refs_reconcile():
     to_remove = current - desired
 
     def _apply():
-        freed = 0
         for cid in to_add:
             _audio_cache_ref_add(cid)
         for cid in to_remove:
             _audio_cache_ref_remove(cid)
-            if not _audio_cache_has_refs(cid):
-                _audio_cache_drop(cid)
-                freed += 1
-        return freed
+        # IMPORTANT: never delete audio from here. Immediate ref-based deletion raced with
+        # playback — a file could be removed while a bot was streaming it from disk (the live
+        # queue is broader than this bot's playlist snapshot, and 13 bots share the dir),
+        # producing wrong/"unknown" tracks + a download/delete/re-download storm. Unreferenced
+        # files are reclaimed lazily by the capacity-based LRU eviction, which spares both
+        # referenced files and anything recently played (atime grace).
 
-    freed = await asyncio.to_thread(_apply)
+    await asyncio.to_thread(_apply)
     for cid in to_add:
         schedule_audio_cache_download(f"https://www.youtube.com/watch?v={cid}")
     if to_add or to_remove:
-        logger.info("[%s] Audio cache refs reconciled: +%s, -%s, freed %s file(s) from disk.",
-                    BOT_ENV_PREFIX.lower(), len(to_add), len(to_remove), freed)
+        logger.info("[%s] Audio cache refs reconciled: +%s ref, -%s ref (deletion deferred to LRU eviction).",
+                    BOT_ENV_PREFIX.lower(), len(to_add), len(to_remove))
 
 
 @tasks.loop(seconds=AUDIO_CACHE_REFS_RECONCILE_SECONDS)
