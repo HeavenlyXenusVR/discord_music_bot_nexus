@@ -3193,6 +3193,15 @@ def current_track_position(guild_id, now=None):
         return normalize_position_seconds(state.get("position", 0))
 
     estimated_position = _estimated_runtime_position_seconds(data, now=now)
+    # Cap the runtime-clock estimate at the track duration. The wall-clock estimate can race
+    # past the end of the track (loop replays, a stalled/looping player), which otherwise
+    # shows a nonsensical position like 362s on a 205s track in the panel/status.
+    _track_duration = data.get("duration")
+    try:
+        if _track_duration and float(_track_duration) > 0:
+            estimated_position = min(estimated_position, int(float(_track_duration)))
+    except (TypeError, ValueError):
+        pass
     last_checkpoint = normalize_position_seconds(
         data.get("last_position_checkpoint", data.get("offset", estimated_position)),
         data.get("duration"),
