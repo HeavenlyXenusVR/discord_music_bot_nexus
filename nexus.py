@@ -8640,6 +8640,12 @@ AUDIO_CACHE_MAX_BYTES = int(float(os.getenv("AUDIO_CACHE_MAX_GB", "60")) * (1024
 AUDIO_CACHE_CONCURRENCY = max(1, int(os.getenv("AUDIO_CACHE_CONCURRENCY", "2")))
 AUDIO_CACHE_PREDOWNLOAD = os.getenv("AUDIO_CACHE_PREDOWNLOAD", "true").strip().lower() not in {"0", "false", "off", "no"}
 AUDIO_CACHE_REFS_RECONCILE_SECONDS = max(60, int(os.getenv("AUDIO_CACHE_REFS_RECONCILE_SECONDS", "300")))
+# When YouTube rate-limits downloads, pause scheduling new ones for this long so the throttle
+# can recover instead of being prolonged by a flood of failing requests.
+AUDIO_CACHE_RATELIMIT_BACKOFF_SECONDS = float(os.getenv("AUDIO_CACHE_RATELIMIT_BACKOFF_SECONDS", "1800"))
+# Per-download request pacing (seconds) so bulk caching doesn't hammer YouTube into a rate limit.
+AUDIO_CACHE_SLEEP_INTERVAL = float(os.getenv("AUDIO_CACHE_SLEEP_INTERVAL", "1"))
+AUDIO_CACHE_SLEEP_INTERVAL_MAX = float(os.getenv("AUDIO_CACHE_SLEEP_INTERVAL_MAX", "4"))
 _AUDIO_CACHE_ID_RE = re.compile(r"(?:v=|youtu\.be/|/shorts/|/embed/|/v/)([A-Za-z0-9_-]{11})")
 # Only formats Lavalink's LOCAL source plays reliably (seekable, robust decoders).
 # Raw YouTube bestaudio (webm/opus, m4a/aac) is NOT served from disk — it is normalized
@@ -8649,6 +8655,7 @@ _AUDIO_CACHE_MIN_BYTES = 8192
 _audio_cache_locks = {}
 _audio_cache_sem = None
 _audio_cache_tasks = set()
+_audio_cache_ratelimit_until = 0.0
 
 
 def _safe_unlink(path):
@@ -8838,6 +8845,9 @@ def _audio_cache_fetch_and_normalize(cache_id, url, final):
     opts.update({"format": "bestaudio/best", "outtmpl": tmpl, "noplaylist": True,
                  "skip_download": False, "quiet": True, "no_warnings": True,
                  "overwrites": True, "ignoreerrors": False,
+                 # Pace requests so bulk caching doesn't trip YouTube's rate limit.
+                 "sleep_interval": AUDIO_CACHE_SLEEP_INTERVAL, "max_sleep_interval": AUDIO_CACHE_SLEEP_INTERVAL_MAX,
+                 "sleep_interval_requests": 1,
                  "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "opus"}]})
     produced = None
     try:
@@ -8868,7 +8878,7 @@ def _audio_cache_fetch_and_normalize(cache_id, url, final):
 
 
 async def ensure_audio_cached(url):
-    global _audio_cache_sem
+    global _audio_cache_sem, _audio_cache_ratelimit_until
     if not AUDIO_CACHE_ENABLED:
         return None
     cache_id = _audio_cache_id(url)
@@ -8892,7 +8902,13 @@ async def ensure_audio_cached(url):
                     logger.info("[%s] Audio cached: %s", BOT_ENV_PREFIX.lower(), os.path.basename(path))
                 return path
             except Exception as exc:
-                logger.warning("[%s] Audio cache download FAILED for %s: %s", BOT_ENV_PREFIX.lower(), cache_id, exc)
+                _msg = str(exc).lower()
+                if "rate-limit" in _msg or "isn't available, try again" in _msg or "sign in to confirm" in _msg:
+                    _audio_cache_ratelimit_until = time.monotonic() + AUDIO_CACHE_RATELIMIT_BACKOFF_SECONDS
+                    logger.warning("[%s] YouTube rate-limited audio downloads; pausing cache downloads for %.0f min.",
+                                   BOT_ENV_PREFIX.lower(), AUDIO_CACHE_RATELIMIT_BACKOFF_SECONDS / 60)
+                else:
+                    logger.warning("[%s] Audio cache download FAILED for %s: %s", BOT_ENV_PREFIX.lower(), cache_id, exc)
                 return None
             finally:
                 _audio_cache_locks.pop(cache_id, None)
@@ -8901,6 +8917,8 @@ async def ensure_audio_cached(url):
 def schedule_audio_cache_download(url):
     if not AUDIO_CACHE_ENABLED:
         return
+    if time.monotonic() < _audio_cache_ratelimit_until:
+        return  # backing off after a YouTube rate-limit so the throttle can recover
     cache_id = _audio_cache_id(url)
     if not cache_id or _audio_cache_find(cache_id):
         return
@@ -9018,6 +9036,24 @@ async def audio_cache_eviction_loop():
 # Retry the exact requested video this many times before a title-search substitution.
 RESOLVE_DIRECT_RETRIES = max(1, int(os.getenv("RESOLVE_DIRECT_RETRIES", "3")))
 RESOLVE_DIRECT_RETRY_DELAY = float(os.getenv("RESOLVE_DIRECT_RETRY_DELAY", "0.5"))
+_TITLE_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def _title_tokens(text):
+    return {t for t in _TITLE_TOKEN_RE.findall(str(text or "").lower()) if len(t) >= 3}
+
+
+def _titles_roughly_match(requested, candidate):
+    """True if the candidate title plausibly matches the requested one. Guards against a
+    rate-limited/garbage search returning an unrelated video (e.g. 'Super Mario' -> 'Livescape
+    Opus 1') that would otherwise be substituted and poison the queue."""
+    req = _title_tokens(requested)
+    cand = _title_tokens(candidate)
+    if not req:
+        return True   # nothing to compare against; allow
+    if not cand:
+        return False
+    return len(req & cand) / len(req) >= 0.34
 
 
 async def resolve_queue_track(source, fallback_title=None):
@@ -9059,12 +9095,21 @@ async def resolve_queue_track(source, fallback_title=None):
         try:
             entries, _playlist_result = await search_playables(title_search)
             if entries:
+                _alt_title = getattr(entries[0], "title", "") or ""
+                if _titles_roughly_match(fallback_title, _alt_title):
+                    logger.warning(
+                        "[%s] Exact source for '%s' unavailable after %s tries; using title-search alternate '%s'.",
+                        BOT_ENV_PREFIX.lower(), fallback_title or source, direct_tries, _alt_title[:60],
+                    )
+                    return entries[0], title_search
+                # Title mismatch: almost always a rate-limited/garbage search result (the exact
+                # symptom behind multiple bots playing the same wrong "Opus" track). Do NOT
+                # substitute it — fail the resolve so the real track is retried later instead.
                 logger.warning(
-                    "[%s] Exact source for '%s' unavailable after %s tries; using title-search alternate "
-                    "(may be a different upload than the playlist entry).",
-                    BOT_ENV_PREFIX.lower(), fallback_title or source, direct_tries,
+                    "[%s] Rejected title-search alternate '%s' for '%s' (title mismatch — likely a bad/rate-limited result).",
+                    BOT_ENV_PREFIX.lower(), _alt_title[:60], fallback_title or source,
                 )
-                return entries[0], title_search
+                last_error = ValueError("Title-search alternate rejected (mismatch).")
         except Exception as exc:
             last_error = exc
 
