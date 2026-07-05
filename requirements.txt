@@ -5,3 +5,4 @@ PyNaCl==1.6.2
 wavelink==3.5.2
 aiohttp==3.13.5
 bgutil-ytdlp-pot-provider
+aubio==0.4.9
