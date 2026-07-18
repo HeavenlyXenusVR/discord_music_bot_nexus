@@ -962,6 +962,7 @@ recent_track_requeues = {}
 queue_playback_claims = {}
 recovery_exhausted_until = {}
 voice_disconnect_grace_tasks = {}
+sleep_timer_tasks = {}
 interrupt_resume_tasks = {}
 interrupt_resume_armed_until = {}
 idle_voice_since = {}
@@ -982,6 +983,7 @@ AUTO_DJ_ENABLED_CACHE = {}
 GUILD_SETTINGS_CACHE = {}
 HOME_CHANNEL_CACHE = {}
 SEARCH_RESULT_CACHE = {}
+SEARCH_SUGGEST_CACHE = {}
 VOICE_STATUS_CACHE = {}
 STATUS_MESSAGE_CACHE = {}
 VOICE_STATE_PERSIST_CACHE = {}
@@ -993,6 +995,7 @@ AUTO_DJ_CACHE_TTL_SECONDS = max(5.0, float(os.getenv(f"{BOT_ENV_PREFIX}_AUTO_DJ_
 GUILD_SETTINGS_CACHE_TTL_SECONDS = max(5.0, float(os.getenv(f"{BOT_ENV_PREFIX}_GUILD_SETTINGS_CACHE_TTL_SECONDS", os.getenv("GUILD_SETTINGS_CACHE_TTL_SECONDS", "30"))))
 HOME_CHANNEL_CACHE_TTL_SECONDS = max(5.0, float(os.getenv(f"{BOT_ENV_PREFIX}_HOME_CHANNEL_CACHE_TTL_SECONDS", os.getenv("HOME_CHANNEL_CACHE_TTL_SECONDS", "30"))))
 SEARCH_CACHE_TTL_SECONDS = max(10.0, float(os.getenv(f"{BOT_ENV_PREFIX}_SEARCH_CACHE_TTL_SECONDS", os.getenv("SEARCH_CACHE_TTL_SECONDS", "900"))))
+SEARCH_SUGGEST_CACHE_TTL_SECONDS = max(30.0, float(os.getenv(f"{BOT_ENV_PREFIX}_SEARCH_SUGGEST_CACHE_TTL_SECONDS", os.getenv("SEARCH_SUGGEST_CACHE_TTL_SECONDS", "300"))))
 VOICE_STATUS_DEDUP_SECONDS = max(10.0, float(os.getenv(f"{BOT_ENV_PREFIX}_VOICE_STATUS_DEDUP_SECONDS", os.getenv("VOICE_STATUS_DEDUP_SECONDS", "60"))))
 STATUS_MESSAGE_DEDUP_SECONDS = max(5.0, float(os.getenv(f"{BOT_ENV_PREFIX}_STATUS_MESSAGE_DEDUP_SECONDS", os.getenv("STATUS_MESSAGE_DEDUP_SECONDS", "20"))))
 VOICE_STATE_DEDUP_SECONDS = max(5.0, float(os.getenv(f"{BOT_ENV_PREFIX}_VOICE_STATE_DEDUP_SECONDS", os.getenv("VOICE_STATE_DEDUP_SECONDS", "12"))))
@@ -4408,7 +4411,7 @@ async def dedupe_queue_table_by_track_key(cur, table_name, *, guild_id=None, bot
     return deleted
 
 
-QUEUE_DUPLICATE_CAP = int(os.getenv("QUEUE_DUPLICATE_CAP", "2"))
+QUEUE_DUPLICATE_CAP = int(os.getenv("QUEUE_DUPLICATE_CAP", "8"))
 
 
 async def trim_queue_duplicate_runs(cur, table_name, *, guild_id=None, bot_name=None, max_copies=QUEUE_DUPLICATE_CAP):
@@ -5993,8 +5996,10 @@ async def ensure_voice_connection(guild, channel_id, *, respect_recovery_backoff
 
             if isinstance(channel, discord.StageChannel):
                 if guild.me.voice and guild.me.voice.suppress:
-                    try: await guild.me.edit(suppress=False)
-                    except Exception as tx_error: pass
+                    try:
+                        await guild.me.edit(suppress=False)
+                    except Exception as tx_error:
+                        logger.warning(f"[{guild.id}] Could not clear stage suppression on connect (bot may lack Stage Moderator permission): {tx_error}")
 
             await persist_voice_state(guild.id, channel_id, desired_connected=True, connected=True)
             clear_recovery_backoff(guild.id)
@@ -6182,6 +6187,18 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
                                         original_title = track_data.get('original_queue_title')
                                         if original_url and original_title and (original_url != track_uri or original_title != track_title):
                                             await delete_backup_track(cur, guild.id, video_url=original_url, title=original_title)
+                                else:
+                                    # Track left playback for a reason other than natural completion (e.g.
+                                    # STOPPED from /skip or vote-skip, or an unrecovered LOAD_FAILED/CLEANUP).
+                                    # It is gone from live for good -- loop-mode's repeat semantics must not
+                                    # re-add it, and its backup mirror needs cleanup so it doesn't accumulate
+                                    # as a stale row that repair_queue_backup_parity later resurrects.
+                                    if track_uri and track_title:
+                                        await delete_backup_track(cur, guild.id, track_uid=resolved_track_uid, video_url=track_uri, title=track_title)
+                                    original_url = track_data.get('original_queue_url')
+                                    original_title = track_data.get('original_queue_title')
+                                    if original_url and original_title and (original_url != track_uri or original_title != track_title):
+                                        await delete_backup_track(cur, guild.id, video_url=original_url, title=original_title)
                     break
                 except Exception as _track_end_exc:
                     if _is_retryable_mysql_error(_track_end_exc) and _track_end_attempt < 2:
@@ -6241,7 +6258,12 @@ async def on_wavelink_websocket_closed(payload: wavelink.WebsocketClosedEventPay
                 dedupe_key=f"ws_closed:{track_data.get('track_uid')}:{position // 15}",
                 fields=_track_feedback_fields(track_data.get("track_uid"), position),
             )
-        schedule_targeted_interrupt_resume(guild.id, channel_id, start_position=position, reason="wavelink_websocket_closed")
+        scheduled = schedule_targeted_interrupt_resume(guild.id, channel_id, start_position=position, reason="wavelink_websocket_closed")
+        if not scheduled and VOICE_DISCONNECT_REJOIN_RECOVERY and not ARIA_RECOVERY_AUTHORITY:
+            # Targeted resume silently no-ops when its cooldown/min-position gates aren't met (e.g.
+            # a second glitch within the 20s arm window) -- fall back to soft recovery instead of
+            # leaving this disconnect with zero recovery attempts scheduled.
+            schedule_soft_voice_recovery(guild.id, channel_id, start_position=position, reason="wavelink_websocket_closed_fallback")
     elif VOICE_DISCONNECT_REJOIN_RECOVERY and not ARIA_RECOVERY_AUTHORITY:
         schedule_soft_voice_recovery(guild.id, channel_id, start_position=position, reason="wavelink_websocket_closed")
     else:
@@ -7036,6 +7058,16 @@ async def on_voice_state_update(member, before, after):
             clear_interrupt_resume(guild_id)
             unfreeze_playback_after_voice_return(guild_id)
             await persist_voice_state(guild_id, after.channel.id, desired_connected=True, connected=True)
+            if isinstance(after.channel, discord.StageChannel) and after.suppress:
+                # Discord (or a stage moderator) demoted the bot back to audience -- Lavalink keeps
+                # streaming and the bot's internal state still says "connected and playing," but no
+                # audio actually reaches the stage until suppression is cleared again. The one-shot
+                # attempt at connect time can't catch this; this event fires on the suppress flip.
+                try:
+                    await member.guild.me.edit(suppress=False)
+                    logger.info(f"[{guild_id}] Re-cleared stage suppression after a voice-state update.")
+                except Exception as tx_error:
+                    logger.warning(f"[{guild_id}] Could not clear stage suppression (bot may lack Stage Moderator permission): {tx_error}")
             await asyncio.sleep(0.5)
             await reconcile_runtime_playback_state(member.guild)
             return
@@ -7050,7 +7082,23 @@ async def on_voice_state_update(member, before, after):
             or getattr(before.channel, "id", None)
         )
 
-        if (tracked or guild_id in guild_states) and remembered_channel_id:
+        stay_in_vc = False
+        if not (tracked or guild_id in guild_states):
+            # An idling 24/7 guild has no tracked/guild_states entry (both get popped on
+            # queue-empty), so without this check any transient disconnect here -- a Discord
+            # hiccup, a mod action, a network drop -- was being treated identically to a
+            # deliberate /leave and the bot would never auto-rejoin even with stay_in_vc on.
+            try:
+                async with DBPoolManager() as pool:
+                    async with pool.acquire() as conn:
+                        async with conn.cursor() as cur:
+                            await cur.execute("SELECT stay_in_vc FROM nexus_guild_settings WHERE guild_id = %s", (guild_id,))
+                            stay_row = await cur.fetchone()
+                            stay_in_vc = bool(stay_row[0]) if stay_row else False
+            except Exception:
+                stay_in_vc = False
+
+        if (tracked or guild_id in guild_states or stay_in_vc) and remembered_channel_id:
             position = current_track_position(guild_id)
             if not VOICE_DISCONNECT_REJOIN_RECOVERY:
                 recovering_guilds.discard(guild_id)
@@ -7373,12 +7421,46 @@ async def restart_bot(interaction: discord.Interaction):
 
 # --- COMMAND SURFACE: slash handlers should stay thin and delegate to runtime helpers above. ---
 # --- PLAYBACK COMMANDS ---
+async def _youtube_search_suggestions(query):
+    """Best-effort YouTube 'suggest' lookup for /play autocomplete; never raises, always fast."""
+    cleaned = str(query or "").strip()
+    if len(cleaned) < 2 or _is_explicit_lavalink_query(cleaned):
+        return []
+    cache_key = cleaned.casefold()
+    cached = _cache_get(SEARCH_SUGGEST_CACHE, cache_key, SEARCH_SUGGEST_CACHE_TTL_SECONDS)
+    if cached is not None:
+        return cached
+    try:
+        async with HTTPSessionManager() as session:
+            async with session.get(
+                "https://suggestqueries.google.com/complete/search",
+                params={"client": "firefox", "ds": "yt", "q": cleaned},
+                timeout=aiohttp.ClientTimeout(total=1.5),
+            ) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json(content_type=None)
+        suggestions = [str(s) for s in (data[1] if len(data) > 1 else []) if str(s).strip()][:10]
+    except Exception:
+        return []
+    _cache_set(SEARCH_SUGGEST_CACHE, cache_key, suggestions)
+    return suggestions
+
+
+async def play_search_autocomplete(interaction: discord.Interaction, current: str):
+    suggestions = await _youtube_search_suggestions(current)
+    if not suggestions and current.strip():
+        suggestions = [current.strip()]
+    return [app_commands.Choice(name=s[:100], value=s[:100]) for s in suggestions[:10]]
+
+
 @bot.tree.command(name="nexus_main_play", description="Queue a track, URL, livestream, search result, or playlist and start playback if idle.")
 @app_commands.describe(search="Track name, URL, or search text", source="Where to search (defaults to YouTube for plain text)")
 @app_commands.choices(source=[
     app_commands.Choice(name="YouTube", value="ytmsearch"),
     app_commands.Choice(name="SoundCloud", value="scsearch"),
 ])
+@app_commands.autocomplete(search=play_search_autocomplete)
 async def play(interaction: discord.Interaction, search: str, source: str = "ytmsearch"):
     if source in {"ytmsearch", "scsearch"} and not _is_explicit_lavalink_query(search):
         search = f"{source}:{search}"
@@ -7429,24 +7511,28 @@ async def play(interaction: discord.Interaction, search: str, source: str = "ytm
     queue_rows = [(track.uri, track.title, interaction.user.id, _new_track_uid()) for track in entries_to_add]
     added_count = len(queue_rows)
 
-    async with DBPoolManager() as pool:
-        async with pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await prime_loop_queue_defaults(cur, interaction.guild.id)
-                if queue_rows:
-                    await cur.executemany(
-                        "INSERT INTO nexus_queue (guild_id, bot_name, video_url, title, requester_id, track_uid) VALUES (%s, %s, %s, %s, %s, %s)",
-                        [(interaction.guild.id, 'nexus', url, title, requester_id, track_uid) for url, title, requester_id, track_uid in queue_rows],
-                    )
-                    try:
-                        await bulk_record_tracks_queued(cur, interaction.guild.id, [(url, title, requester_id) for url, title, requester_id, _track_uid in queue_rows])
-                    except Exception as tx_error:
-                        logger.debug("[nexus] Bulk track intelligence queue write skipped.", exc_info=True)
-                if added_count > 1:
-                    await shuffle_queue_rows(cur, interaction.guild.id, preserve_first=True)
-                await snapshot_queue_backup(cur, interaction.guild.id)
-                await cur.execute("SELECT COUNT(*) FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus'", (interaction.guild.id,))
-                q_len = (await cur.fetchone())[0]
+    # Hold the same lock process_queue uses so a concurrent dequeue/insert (or another command's
+    # rebuild) can't be silently dropped by this insert-then-shuffle-then-snapshot sequence
+    # (queue leak fix).
+    async with get_process_queue_lock(interaction.guild.id):
+        async with DBPoolManager() as pool:
+            async with pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await prime_loop_queue_defaults(cur, interaction.guild.id)
+                    if queue_rows:
+                        await cur.executemany(
+                            "INSERT INTO nexus_queue (guild_id, bot_name, video_url, title, requester_id, track_uid) VALUES (%s, %s, %s, %s, %s, %s)",
+                            [(interaction.guild.id, 'nexus', url, title, requester_id, track_uid) for url, title, requester_id, track_uid in queue_rows],
+                        )
+                        try:
+                            await bulk_record_tracks_queued(cur, interaction.guild.id, [(url, title, requester_id) for url, title, requester_id, _track_uid in queue_rows])
+                        except Exception as tx_error:
+                            logger.debug("[nexus] Bulk track intelligence queue write skipped.", exc_info=True)
+                    if added_count > 1:
+                        await shuffle_queue_rows(cur, interaction.guild.id, preserve_first=True)
+                    await snapshot_queue_backup(cur, interaction.guild.id)
+                    await cur.execute("SELECT COUNT(*) FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus'", (interaction.guild.id,))
+                    q_len = (await cur.fetchone())[0]
     if playlist_url:
         await set_active_playlist(interaction.guild.id, playlist_url, len(entries_to_add), interaction.user.id, channel.id, entries_to_add)
 
@@ -7531,6 +7617,45 @@ async def stop(interaction: discord.Interaction):
     await stop_playback(interaction.guild)
     await clear_active_playlist(interaction.guild.id)
     await interaction.response.send_message(embed=discord.Embed(title="⏹️ Stopped", description="Music stopped and cleared.", color=discord.Color.red()), ephemeral=True)
+
+@bot.tree.command(name="nexus_main_sleep", description="Stop playback and disconnect after N minutes. Use 0 to cancel an active timer.")
+@app_commands.describe(minutes="Minutes until playback stops automatically (0 cancels the current timer)")
+async def sleep_timer_cmd(interaction: discord.Interaction, minutes: app_commands.Range[int, 0, 240]):
+    if not await is_dj(interaction): return
+    guild_id = interaction.guild.id
+    existing_task = sleep_timer_tasks.pop(guild_id, None)
+    if existing_task and not existing_task.done():
+        existing_task.cancel()
+    if minutes <= 0:
+        await interaction.response.send_message(embed=discord.Embed(description="⏰ Sleep timer cancelled.", color=discord.Color.orange()), ephemeral=True)
+        return
+
+    channel_id = interaction.channel_id
+
+    async def _sleep_and_stop():
+        try:
+            await asyncio.sleep(minutes * 60)
+        except asyncio.CancelledError:
+            return
+        sleep_timer_tasks.pop(guild_id, None)
+        guild = bot.get_guild(guild_id)
+        if not guild or not guild.voice_client:
+            return
+        process_queue_locks.pop(guild_id, None)
+        voice_connect_locks.pop(guild_id, None)
+        snooze_auto_restore(guild_id)
+        await stop_playback(guild)
+        await clear_active_playlist(guild_id)
+        channel = guild.get_channel(channel_id) if channel_id else None
+        if channel:
+            try:
+                await channel.send(embed=discord.Embed(title="😴 Sleep Timer", description="Playback stopped — sleep timer elapsed.", color=discord.Color.dark_purple()))
+            except Exception as tx_error:
+                pass
+        await send_webhook_log(bot.user.name if bot.user else "Unknown Node", "😴 Sleep Timer", f"Guild {guild.name}: sleep timer elapsed, playback stopped.", discord.Color.dark_purple())
+
+    sleep_timer_tasks[guild_id] = asyncio.get_event_loop().create_task(_sleep_and_stop())
+    await interaction.response.send_message(embed=discord.Embed(description=f"😴 Sleep timer set for **{minutes}** minute(s). Playback will stop automatically.", color=discord.Color.blue()), ephemeral=True)
 
 @bot.tree.command(name="nexus_main_pause", description="Pause the current track without clearing the queue or playback position.")
 async def pause(interaction: discord.Interaction):
@@ -7667,16 +7792,48 @@ async def queue_cmd(interaction: discord.Interaction, page: int = 1):
 @bot.tree.command(name="nexus_main_shuffle", description="Smart-shuffle the upcoming queue while keeping duplicate tracks separated when possible.")
 async def shuffle(interaction: discord.Interaction):
     if not await is_dj(interaction): return
-    async with DBPoolManager() as pool:
-        async with pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                queue_len = await shuffle_queue_rows(cur, interaction.guild.id, preserve_first=False)
-                if queue_len <= 0:
-                    return await interaction.response.send_message("Queue empty.", ephemeral=True)
-                await snapshot_queue_backup(cur, interaction.guild.id)
+    # Hold the same lock process_queue uses so a concurrent dequeue/insert can't be silently
+    # dropped by this command's rebuild-live-queue sequence (queue leak fix).
+    async with get_process_queue_lock(interaction.guild.id):
+        async with DBPoolManager() as pool:
+            async with pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    queue_len = await shuffle_queue_rows(cur, interaction.guild.id, preserve_first=False)
+                    if queue_len <= 0:
+                        return await interaction.response.send_message("Queue empty.", ephemeral=True)
+                    await snapshot_queue_backup(cur, interaction.guild.id)
     await interaction.response.send_message(embed=discord.Embed(description=f"🔀 Smart-shuffled {queue_len} queued track(s), keeping repeat tracks apart where possible.", color=discord.Color.green()), ephemeral=True)
 
+async def _queue_index_autocomplete(interaction: discord.Interaction, current: str):
+    guild = interaction.guild
+    if not guild:
+        return []
+    try:
+        async with DBPoolManager() as pool:
+            async with pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT video_url, title FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus' ORDER BY id ASC LIMIT 200",
+                        (guild.id,),
+                    )
+                    rows = await cur.fetchall() or []
+    except Exception:
+        return []
+    needle = current.strip().lower()
+    choices = []
+    for position, row in enumerate(rows, start=1):
+        title = _row_value(row, "title", _row_value(row, 1, "")) or "Unknown title"
+        if needle and needle != str(position) and needle not in title.lower():
+            continue
+        label = _compact_track_title(f"{position}. {title}", limit=95)
+        choices.append(app_commands.Choice(name=label, value=position))
+        if len(choices) >= 25:
+            break
+    return choices
+
+
 @bot.tree.command(name="nexus_main_remove", description="Remove a queued track by its queue number so it will not play later.")
+@app_commands.autocomplete(index=_queue_index_autocomplete)
 async def remove(interaction: discord.Interaction, index: int):
     if not await is_dj(interaction): return
     if index < 1:
@@ -7694,6 +7851,7 @@ async def remove(interaction: discord.Interaction, index: int):
                 else: await interaction.response.send_message("Invalid index.", ephemeral=True)
 
 @bot.tree.command(name="nexus_main_skipto", description="Drop everything before a chosen queue position and jump playback forward to that track.")
+@app_commands.autocomplete(index=_queue_index_autocomplete)
 async def skipto(interaction: discord.Interaction, index: int):
     if not await is_dj(interaction): return
     if index < 1:
@@ -7732,63 +7890,71 @@ async def skipto(interaction: discord.Interaction, index: int):
     await interaction.followup.send(embed=discord.Embed(description=f"Skipped to #{index}", color=discord.Color.green()), ephemeral=True)
 
 @bot.tree.command(name="nexus_main_move", description="Move a queued track from one queue slot to another without rebuilding the entire session manually.")
+@app_commands.autocomplete(frm=_queue_index_autocomplete, to=_queue_index_autocomplete)
 async def move(interaction: discord.Interaction, frm: int, to: int):
     if not await is_dj(interaction): return
     await interaction.response.defer(ephemeral=True)
-    async with DBPoolManager() as pool:
-        async with pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("SELECT id, video_url, title, requester_id, track_uid FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus' ORDER BY id ASC", (interaction.guild.id,))
-                q_rows = list(await cur.fetchall())
-                if frm > len(q_rows) or to > len(q_rows) or frm < 1 or to < 1:
-                    return await interaction.followup.send("Invalid index", ephemeral=True)
-                item = q_rows.pop(frm - 1)
-                insert_at = to - 1
-                q_rows.insert(max(0, min(insert_at, len(q_rows))), item)
-                insert_data = [(
-                    interaction.guild.id,
-                    'nexus',
-                    _row_value(row, "video_url", _row_value(row, 1)),
-                    _row_value(row, "title", _row_value(row, 2)),
-                    _row_value(row, "requester_id", _row_value(row, 3)),
-                    _ensure_track_uid(_row_track_uid(row, 4)),
-                ) for row in q_rows]
-                try:
-                    await cur.execute("START TRANSACTION")
-                    await cur.execute("DELETE FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus'", (interaction.guild.id,))
-                    if insert_data:
-                        await cur.executemany(
-                            "INSERT INTO nexus_queue (guild_id, bot_name, video_url, title, requester_id, track_uid) VALUES (%s, %s, %s, %s, %s, %s)",
-                            insert_data,
-                        )
-                    await snapshot_queue_backup(cur, interaction.guild.id)
-                    await cur.execute("COMMIT")
-                except Exception as tx_error:
+    # Hold the same lock process_queue uses so a concurrent dequeue/insert can't be silently
+    # dropped by this command's read-snapshot-then-blind-rebuild sequence (queue leak fix).
+    async with get_process_queue_lock(interaction.guild.id):
+        async with DBPoolManager() as pool:
+            async with pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("SELECT id, video_url, title, requester_id, track_uid FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus' ORDER BY id ASC", (interaction.guild.id,))
+                    q_rows = list(await cur.fetchall())
+                    if frm > len(q_rows) or to > len(q_rows) or frm < 1 or to < 1:
+                        return await interaction.followup.send("Invalid index", ephemeral=True)
+                    item = q_rows.pop(frm - 1)
+                    insert_at = to - 1
+                    q_rows.insert(max(0, min(insert_at, len(q_rows))), item)
+                    insert_data = [(
+                        interaction.guild.id,
+                        'nexus',
+                        _row_value(row, "video_url", _row_value(row, 1)),
+                        _row_value(row, "title", _row_value(row, 2)),
+                        _row_value(row, "requester_id", _row_value(row, 3)),
+                        _ensure_track_uid(_row_track_uid(row, 4)),
+                    ) for row in q_rows]
                     try:
-                        await cur.execute("ROLLBACK")
+                        await cur.execute("START TRANSACTION")
+                        await cur.execute("DELETE FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus'", (interaction.guild.id,))
+                        if insert_data:
+                            await cur.executemany(
+                                "INSERT INTO nexus_queue (guild_id, bot_name, video_url, title, requester_id, track_uid) VALUES (%s, %s, %s, %s, %s, %s)",
+                                insert_data,
+                            )
+                        await snapshot_queue_backup(cur, interaction.guild.id)
+                        await cur.execute("COMMIT")
                     except Exception as tx_error:
-                        pass
-                    logger.exception("[nexus] move transaction failed; queue was rolled back instead of leaking tracks.")
-                    raise
+                        try:
+                            await cur.execute("ROLLBACK")
+                        except Exception as tx_error:
+                            pass
+                        logger.exception("[nexus] move transaction failed; queue was rolled back instead of leaking tracks.")
+                        raise
     await interaction.followup.send(embed=discord.Embed(description=f"Moved item from {frm} to {to}", color=discord.Color.green()), ephemeral=True)
 
 
 
 @bot.tree.command(name="nexus_main_bump", description="Move a queued track to the front so it plays next")
+@app_commands.autocomplete(index=_queue_index_autocomplete)
 async def bump(interaction: discord.Interaction, index: int):
     if not await is_dj(interaction): return
     if index < 1:
         return await interaction.response.send_message("Invalid index.", ephemeral=True)
-    async with DBPoolManager() as pool:
-        async with pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("SELECT id, video_url, title, requester_id, track_uid FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus' ORDER BY id ASC LIMIT 1 OFFSET %s", (interaction.guild.id, index-1))
-                row = await cur.fetchone()
-                if not row:
-                    return await interaction.response.send_message("Invalid index.", ephemeral=True)
-                await cur.execute("DELETE FROM nexus_queue WHERE id = %s AND guild_id = %s AND bot_name = 'nexus'", (row[0], interaction.guild.id))
-                await insert_queue_front(cur, "nexus_queue", interaction.guild.id, "nexus", row[1], row[2], row[3], _row_track_uid(row, 4))
-                await snapshot_queue_backup(cur, interaction.guild.id)
+    # Hold the same lock process_queue uses so a concurrent dequeue/insert can't be silently
+    # dropped by this command's read-then-rebuild sequence (queue leak fix).
+    async with get_process_queue_lock(interaction.guild.id):
+        async with DBPoolManager() as pool:
+            async with pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("SELECT id, video_url, title, requester_id, track_uid FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus' ORDER BY id ASC LIMIT 1 OFFSET %s", (interaction.guild.id, index-1))
+                    row = await cur.fetchone()
+                    if not row:
+                        return await interaction.response.send_message("Invalid index.", ephemeral=True)
+                    await cur.execute("DELETE FROM nexus_queue WHERE id = %s AND guild_id = %s AND bot_name = 'nexus'", (row[0], interaction.guild.id))
+                    await insert_queue_front(cur, "nexus_queue", interaction.guild.id, "nexus", row[1], row[2], row[3], _row_track_uid(row, 4))
+                    await snapshot_queue_backup(cur, interaction.guild.id)
     await interaction.response.send_message(embed=discord.Embed(description=f"⬆️ Moved **{row[2]}** to play next.", color=discord.Color.green()), ephemeral=True)
 
 @bot.tree.command(name="nexus_main_clearmine", description="Remove your own queued songs without touching other listeners' tracks")
@@ -8638,12 +8804,15 @@ async def panel(interaction: discord.Interaction):
         async def shuf(self, i: discord.Interaction, _button: discord.ui.Button):
             if not await is_dj(i): return
             await i.response.defer(ephemeral=True)
-            async with DBPoolManager() as pool:
-                async with pool.acquire() as conn:
-                    async with conn.cursor() as cur:
-                        queue_len = await shuffle_queue_rows(cur, i.guild.id, preserve_first=False)
-                        if not queue_len: return await i.followup.send("Queue empty.")
-                        await snapshot_queue_backup(cur, i.guild.id)
+            # Hold the same lock process_queue uses so a concurrent dequeue/insert can't be
+            # silently dropped by this rebuild-live-queue sequence (queue leak fix).
+            async with get_process_queue_lock(i.guild.id):
+                async with DBPoolManager() as pool:
+                    async with pool.acquire() as conn:
+                        async with conn.cursor() as cur:
+                            queue_len = await shuffle_queue_rows(cur, i.guild.id, preserve_first=False)
+                            if not queue_len: return await i.followup.send("Queue empty.")
+                            await snapshot_queue_backup(cur, i.guild.id)
             await i.followup.send("🔀 Queue successfully shuffled!")
         @discord.ui.button(label="📜 View Queue", style=discord.ButtonStyle.secondary, row=2)
         async def vq(self, i: discord.Interaction, _button: discord.ui.Button):
@@ -9865,6 +10034,11 @@ async def playlist_sync_loop():
                                             await bulk_record_tracks_queued(cur, guild_id, [(u, t, r) for u, t, r, _k, _uid in added_rows])
                                         except Exception as tx_error:
                                             logger.debug("[nexus] Bulk playlist-sync intelligence write skipped.", exc_info=True)
+                                        # Mirror to backup immediately, not just once at the end of this
+                                        # block -- otherwise a concurrent parity repair can see these
+                                        # brand-new live rows as backup-less "surplus" and delete them
+                                        # from live before backup ever catches up (queue leak fix).
+                                        await snapshot_queue_backup(cur, guild_id)
                                         if added_count > 1:
                                             await shuffle_queue_rows(cur, guild_id, preserve_first=True)
 
@@ -9939,6 +10113,9 @@ async def playlist_sync_loop():
                                             except Exception as tx_error:
                                                 logger.debug("[nexus] Bulk playlist-sync intelligence write skipped (refill).", exc_info=True)
                                             refilled_count = len(refill_rows)
+                                            # Mirror to backup immediately -- see the added_rows snapshot
+                                            # above for why (queue leak fix).
+                                            await snapshot_queue_backup(cur, guild_id)
                                             await shuffle_queue_rows(cur, guild_id, preserve_first=True)
                                             logger.warning(
                                                 "[%s] Playlist sync: live queue was thin (%s/%s tracked tracks queued) for guild %s; refilled %s track(s) from the snapshot.",
@@ -10884,7 +11061,11 @@ async def queue_integrity_check_loop():
                             continue  # perfect parity — nothing to repair
                         if player_active and backup_cnt > 0 and backup_cnt - live_cnt == 1:
                             continue  # one track dequeued for active playback — expected
-                        restored_live, _restored_backup = await repair_queue_backup_parity(cur, guild_id, active_player=player_active)
+                        # Actually hold the lock (not just check it) for the repair itself -- the
+                        # count checks above can yield to another coroutine between the earlier
+                        # .locked() peek and here, so that peek alone isn't race-proof (queue leak fix).
+                        async with get_process_queue_lock(guild_id):
+                            restored_live, _restored_backup = await repair_queue_backup_parity(cur, guild_id, active_player=player_active)
                         if restored_live <= 0:
                             continue
                         if player_active:

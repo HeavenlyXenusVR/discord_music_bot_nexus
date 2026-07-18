@@ -24,13 +24,15 @@ Nexus is one node in the 13-bot Discord music fleet. A connection point for serv
 - Tracks per-server leaderboards and play history, and can grab the currently playing track via DM.
 - Cleans local, pre-cache, and Lavalink-adjacent cache state on the built-in 10-hour maintenance timer.
 - Reports heartbeat, queue depth, backup depth, track state, and errors for Aria and SwarmPanel.
+- Offers live autocomplete on `/play` (YouTube search suggestions as you type) and on queue position arguments (`remove`, `skipto`, `bump`, `move`), so users pick tracks by title instead of memorizing queue numbers.
+- Supports a `/sleep` timer that stops playback and disconnects after a set number of minutes, cancellable by re-running it with `0`.
 
 ## Commands
 
 All commands are namespaced as `/nexus_main_<command>`.
 
 **Playback & Transport**
-`play`, `playnext`, `skip`, `skipto`, `stop`, `pause`, `resume`, `replay`, `seek`, `forward`, `rewind`, `join`, `leave`, `nowplaying`
+`play`, `playnext`, `skip`, `skipto`, `stop`, `sleep`, `pause`, `resume`, `replay`, `seek`, `forward`, `rewind`, `join`, `leave`, `nowplaying`
 
 **Queue Management**
 `queue`, `remove`, `move`, `bump`, `clearmine`, `clear`, `shuffle`, `voteskip`, `loop`
