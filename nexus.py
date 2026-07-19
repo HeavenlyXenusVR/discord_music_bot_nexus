@@ -2353,6 +2353,7 @@ async def init_db():
                 await safe_schema_execute(cur, "ALTER TABLE nexus_guild_settings MODIFY loop_mode VARCHAR(10) DEFAULT 'queue'")
                 await safe_schema_execute(cur, "ALTER TABLE nexus_guild_settings ADD COLUMN fade_seconds FLOAT DEFAULT 3.0")
                 await safe_schema_execute(cur, "ALTER TABLE nexus_guild_settings ADD COLUMN fade_curve VARCHAR(20) DEFAULT 'linear'")
+                await safe_schema_execute(cur, "ALTER TABLE nexus_guild_settings ADD COLUMN filter_stack VARCHAR(20) DEFAULT NULL")
                 await safe_schema_execute(cur, "UPDATE nexus_guild_settings SET loop_mode = 'queue' WHERE loop_mode IS NULL OR loop_mode NOT IN ('off', 'song', 'queue')")
                 await cur.execute("CREATE TABLE IF NOT EXISTS nexus_queue (id INT AUTO_INCREMENT PRIMARY KEY, guild_id BIGINT, bot_name VARCHAR(50), video_url TEXT, title TEXT, requester_id BIGINT DEFAULT NULL, track_uid CHAR(32) DEFAULT NULL)")
                 await cur.execute("CREATE TABLE IF NOT EXISTS nexus_queue_backup (id INT AUTO_INCREMENT PRIMARY KEY, guild_id BIGINT, bot_name VARCHAR(50), video_url TEXT, title TEXT, requester_id BIGINT DEFAULT NULL, track_uid CHAR(32) DEFAULT NULL)")
@@ -6293,9 +6294,9 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
     async with DBPoolManager() as pool:
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
-                await cur.execute("SELECT volume, loop_mode, filter_mode, transition_mode, custom_speed, custom_pitch, custom_modifiers_left, stay_in_vc, fade_seconds, fade_curve FROM nexus_guild_settings WHERE guild_id = %s", (guild.id,))
+                await cur.execute("SELECT volume, loop_mode, filter_mode, transition_mode, custom_speed, custom_pitch, custom_modifiers_left, stay_in_vc, fade_seconds, fade_curve, filter_stack FROM nexus_guild_settings WHERE guild_id = %s", (guild.id,))
                 res = await cur.fetchone()
-                vol, loop_mode, filter_mode, trans_mode, c_speed, c_pitch, c_mod_left, stay_in_vc, fade_seconds, fade_curve = res if res else (100, 'queue', 'none', 'off', 1.0, 1.0, 0, False, 3.0, 'smooth')
+                vol, loop_mode, filter_mode, trans_mode, c_speed, c_pitch, c_mod_left, stay_in_vc, fade_seconds, fade_curve, filter_stack = res if res else (100, 'queue', 'none', 'off', 1.0, 1.0, 0, False, 3.0, 'smooth', None)
                 fade_seconds = max(0.25, min(12.0, float(fade_seconds or 3.0)))
                 fade_curve = str(fade_curve or 'linear').lower()
 
@@ -6413,6 +6414,8 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
                         if c_mod_left == 0: await cur.execute("UPDATE nexus_guild_settings SET custom_speed = 1.0, custom_pitch = 1.0 WHERE guild_id = %s", (guild.id,))
 
                     c_speed = apply_filter_preset(wav_filters, filter_mode, c_speed)
+                    if filter_stack and filter_stack != filter_mode:
+                        c_speed = apply_filter_preset(wav_filters, filter_stack, c_speed)
 
                     await replace_audio_filters(voice_client, wav_filters)
 
@@ -8550,22 +8553,33 @@ async def loop_cmd(interaction: discord.Interaction, mode: str):
     await interaction.response.send_message(embed=discord.Embed(description=f"🔁 Looping set to: {mode}", color=discord.Color.green()), ephemeral=True)
 
 @bot.tree.command(name="nexus_main_filter", description="Apply an audio filter such as nightcore, vaporwave, or bass boost to upcoming playback.")
-@app_commands.describe(mode="Choose an audio filter to apply")
-@app_commands.choices(mode=FILTER_PRESET_CHOICES)
-async def filter_cmd(interaction: discord.Interaction, mode: str):
+@app_commands.describe(mode="Choose an audio filter to apply", stack="Optional second filter to layer on top (e.g. bassboost + nightcore)")
+@app_commands.choices(mode=FILTER_PRESET_CHOICES, stack=FILTER_PRESET_CHOICES)
+async def filter_cmd(interaction: discord.Interaction, mode: str, stack: str = None):
     if not await is_dj(interaction): return
     if mode not in FILTER_PRESET_VALUES:
         return await interaction.response.send_message("Invalid filter.", ephemeral=True)
+    if stack is not None and stack not in FILTER_PRESET_VALUES:
+        return await interaction.response.send_message("Invalid stacked filter.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
     await ensure_guild_settings(interaction.guild.id)
+    # None means the param was omitted -- leave any existing stack untouched so plain
+    # /filter mode:X keeps behaving exactly as it did before stacking existed. Explicitly
+    # passing stack:none clears it.
+    stack_value = None if stack in (None, 'none') else stack
     async with DBPoolManager() as pool:
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
-                await cur.execute("UPDATE nexus_guild_settings SET filter_mode = %s, custom_speed = 1.0, custom_pitch = 1.0, custom_modifiers_left = 0 WHERE guild_id = %s", (mode, interaction.guild.id))
+                if stack is None:
+                    await cur.execute("UPDATE nexus_guild_settings SET filter_mode = %s, custom_speed = 1.0, custom_pitch = 1.0, custom_modifiers_left = 0 WHERE guild_id = %s", (mode, interaction.guild.id))
+                else:
+                    await cur.execute("UPDATE nexus_guild_settings SET filter_mode = %s, filter_stack = %s, custom_speed = 1.0, custom_pitch = 1.0, custom_modifiers_left = 0 WHERE guild_id = %s", (mode, stack_value, interaction.guild.id))
     new_speed = 1.0
     if interaction.guild.voice_client:
         wav_filters = wavelink.Filters()
         new_speed = apply_filter_preset(wav_filters, mode)
+        if stack_value and stack_value != mode:
+            new_speed = apply_filter_preset(wav_filters, stack_value, new_speed)
         try:
             await replace_audio_filters(interaction.guild.voice_client, wav_filters)
         except Exception as tx_error:
@@ -8575,7 +8589,11 @@ async def filter_cmd(interaction: discord.Interaction, mode: str):
         playback_tracking[interaction.guild.id]['speed'] = new_speed
         playback_tracking[interaction.guild.id]['current_filter'] = mode
     label = next((c.name for c in FILTER_PRESET_CHOICES if c.value == mode), mode)
-    await interaction.followup.send(embed=discord.Embed(description=f"🎛️ Filter set to: **{label}**.", color=discord.Color.blurple()), ephemeral=True)
+    if stack_value and stack_value != mode:
+        stack_label = next((c.name for c in FILTER_PRESET_CHOICES if c.value == stack_value), stack_value)
+        await interaction.followup.send(embed=discord.Embed(description=f"🎛️ Filter set to: **{label}** + **{stack_label}**.", color=discord.Color.blurple()), ephemeral=True)
+    else:
+        await interaction.followup.send(embed=discord.Embed(description=f"🎛️ Filter set to: **{label}**.", color=discord.Color.blurple()), ephemeral=True)
 
 @bot.tree.command(name="nexus_main_fade", description="Customize track fade transitions, let the bot pick smart fade timing, or enable BPM-matched mixing.")
 @app_commands.describe(mode="Fade mode", seconds="Fade length in seconds, from 0.5 to 20", curve="Volume curve")
