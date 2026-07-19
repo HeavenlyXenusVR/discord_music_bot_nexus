@@ -9876,6 +9876,8 @@ async def clear_active_playlist(guild_id):
 async def playlist_sync_loop():
     if getattr(playlist_sync_loop, "_sync_active", False): return
     playlist_sync_loop._sync_active = True
+    if not hasattr(playlist_sync_loop, "_suspicious_streak"):
+        playlist_sync_loop._suspicious_streak = {}
     try:
         await init_playlist_db()
         async with DBPoolManager() as pool:
@@ -9955,10 +9957,23 @@ async def playlist_sync_loop():
                                             p_key = _track_key(p_url, p_title)
                                         previous_rows.append((p_url, p_title, p_req, p_key, p_uid or _new_track_uid()))
 
-                                    if previous_rows and len(previous_rows) >= 10 and current_count < len(previous_rows) * 0.5:
+                                    suspicious = bool(previous_rows and len(previous_rows) >= 10 and current_count < len(previous_rows) * 0.5)
+                                    if suspicious:
+                                        streak = playlist_sync_loop._suspicious_streak.get(guild_id, 0) + 1
+                                        playlist_sync_loop._suspicious_streak[guild_id] = streak
+                                    else:
+                                        streak = 0
+                                        playlist_sync_loop._suspicious_streak.pop(guild_id, None)
+
+                                    if suspicious and streak < 2:
+                                            # A single low reading is usually a transient/partial fetch (e.g.
+                                            # YouTube Data API pagination hiccup) -- gradual multi-cycle drift
+                                            # can still slip a bad count past a same-cycle-only comparison, so
+                                            # require 2 consecutive suspicious cycles (~60s apart) before
+                                            # trusting it, instead of only ever checking the last cycle.
                                             logger.warning(
-                                                "[%s] Playlist sync got suspiciously few tracks (%s) vs previous snapshot (%s) for guild %s; likely a transient extraction issue, skipping this cycle.",
-                                                BOT_ENV_PREFIX.lower(), current_count, len(previous_rows), guild_id,
+                                                "[%s] Playlist sync got suspiciously few tracks (%s) vs previous snapshot (%s) for guild %s; likely a transient extraction issue, skipping this cycle (streak %s/2).",
+                                                BOT_ENV_PREFIX.lower(), current_count, len(previous_rows), guild_id, streak,
                                             )
                                             added_count = 0
                                             purged_live = 0
@@ -9967,6 +9982,12 @@ async def playlist_sync_loop():
                                             backup_content_trim = 0
                                             refilled_count = 0
                                             break
+                                    elif suspicious:
+                                            logger.warning(
+                                                "[%s] Playlist sync low count (%s vs %s) for guild %s confirmed on %s consecutive cycles; accepting it as a real change instead of blocking indefinitely.",
+                                                BOT_ENV_PREFIX.lower(), current_count, len(previous_rows), guild_id, streak,
+                                            )
+                                            playlist_sync_loop._suspicious_streak.pop(guild_id, None)
 
                                     added_rows = []
                                     removed_counts = {}
