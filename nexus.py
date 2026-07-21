@@ -10511,7 +10511,7 @@ async def resilience_loop():
                         active_guild_ids = {_runtime_key(guild.id) for guild in bot.guilds if guild.voice_client}
                     for raw_guild_id in active_guild_ids:
                         _p_lock = get_process_queue_lock(_runtime_key(raw_guild_id))
-                        if _p_lock.locked(): continue
+                        if await _p_lock.locked(): continue
                         try:
                             guild_id = int(_runtime_key(raw_guild_id))
                         except Exception:
@@ -11224,7 +11224,7 @@ async def queue_integrity_check_loop():
                     parity_rows = await cur.fetchall()
                     for parity_row in parity_rows:
                         guild_id = int(_row_value(parity_row, "guild_id", _row_value(parity_row, 0)))
-                        if get_process_queue_lock(guild_id).locked(): continue
+                        if await get_process_queue_lock(guild_id).locked(): continue
                         guild = bot.get_guild(guild_id)
                         if not guild:
                             continue
