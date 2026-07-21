@@ -10028,8 +10028,12 @@ async def clear_active_playlist(guild_id):
 async def playlist_sync_loop():
     if getattr(playlist_sync_loop, "_sync_active", False): return
     playlist_sync_loop._sync_active = True
-    if not hasattr(playlist_sync_loop, "_suspicious_streak"):
-        playlist_sync_loop._suspicious_streak = {}
+    if not hasattr(playlist_sync_loop, "_missing_streak"):
+        # (guild_id -> {track_key: consecutive sync cycles missing from the freshly
+        # re-extracted playlist}). A track only gets purged from the live queue once it's
+        # been confirmed missing on 2 consecutive cycles (~PLAYLIST_SYNC_INTERVAL apart) --
+        # see the removal-detection block below for why.
+        playlist_sync_loop._missing_streak = {}
     try:
         await init_playlist_db()
         async with DBPoolManager() as pool:
@@ -10109,55 +10113,49 @@ async def playlist_sync_loop():
                                             p_key = _track_key(p_url, p_title)
                                         previous_rows.append((p_url, p_title, p_req, p_key, p_uid or _new_track_uid()))
 
-                                    suspicious = bool(previous_rows and len(previous_rows) >= 10 and current_count < len(previous_rows) * 0.5)
-                                    if suspicious:
-                                        streak = playlist_sync_loop._suspicious_streak.get(guild_id, 0) + 1
-                                        playlist_sync_loop._suspicious_streak[guild_id] = streak
-                                    else:
-                                        streak = 0
-                                        playlist_sync_loop._suspicious_streak.pop(guild_id, None)
-
-                                    if suspicious and streak < 2:
-                                            # A single low reading is usually a transient/partial fetch (e.g.
-                                            # YouTube Data API pagination hiccup) -- gradual multi-cycle drift
-                                            # can still slip a bad count past a same-cycle-only comparison, so
-                                            # require 2 consecutive suspicious cycles (~60s apart) before
-                                            # trusting it, instead of only ever checking the last cycle.
-                                            logger.warning(
-                                                "[%s] Playlist sync got suspiciously few tracks (%s) vs previous snapshot (%s) for guild %s; likely a transient extraction issue, skipping this cycle (streak %s/2).",
-                                                BOT_ENV_PREFIX.lower(), current_count, len(previous_rows), guild_id, streak,
-                                            )
-                                            added_count = 0
-                                            purged_live = 0
-                                            purged_backup = 0
-                                            trim_count = 0
-                                            backup_content_trim = 0
-                                            refilled_count = 0
-                                            break
-                                    elif suspicious:
-                                            logger.warning(
-                                                "[%s] Playlist sync low count (%s vs %s) for guild %s confirmed on %s consecutive cycles; accepting it as a real change instead of blocking indefinitely.",
-                                                BOT_ENV_PREFIX.lower(), current_count, len(previous_rows), guild_id, streak,
-                                            )
-                                            playlist_sync_loop._suspicious_streak.pop(guild_id, None)
-
                                     added_rows = []
                                     removed_counts = {}
+                                    carry_forward_rows = []
                                     if previous_rows:
                                         previous_counts = {}
-                                        for _p_url, _p_title, _p_req, p_key, _p_uid in previous_rows:
+                                        previous_row_by_key = {}
+                                        for p_row in previous_rows:
+                                            p_key = p_row[3]
                                             previous_counts[p_key] = previous_counts.get(p_key, 0) + 1
-                                        current_counts = {}
-                                        for _c_url, _c_title, _c_req, c_key, _c_uid in current_rows:
-                                            current_counts[c_key] = current_counts.get(c_key, 0) + 1
-                                        for p_key, p_count in previous_counts.items():
-                                            missing = p_count - current_counts.get(p_key, 0)
-                                            if missing > 0:
-                                                removed_counts[p_key] = missing
+                                            previous_row_by_key.setdefault(p_key, []).append(p_row)
                                         remaining_previous = previous_counts.copy()
                                         for row in current_rows:
                                             if not _decrement_count(remaining_previous, row[3]):
                                                 added_rows.append(row)
+                                        # remaining_previous now holds, per track_key, how many instances are
+                                        # missing from THIS cycle's fresh extraction. yt-dlp's ignoreerrors=True
+                                        # silently drops any single entry it fails to resolve (age-restricted/
+                                        # region-locked/rate-limited/transient), so a track missing from one
+                                        # extraction is not reliable evidence it was actually removed from the
+                                        # playlist -- only purge (and drop from the tracked-playlist baseline) a
+                                        # track once it's been missing on 2 CONSECUTIVE cycles (~PLAYLIST_SYNC_
+                                        # INTERVAL apart). Applied per-track rather than as a whole-cycle
+                                        # aggregate so small playlists and small/incremental extraction misses
+                                        # are covered too, not just catastrophic >=50% drops.
+                                        guild_streaks = playlist_sync_loop._missing_streak.setdefault(guild_id, {})
+                                        for p_key, missing_n in remaining_previous.items():
+                                            if missing_n <= 0:
+                                                continue
+                                            streak = guild_streaks.get(p_key, 0) + 1
+                                            guild_streaks[p_key] = streak
+                                            if streak >= 2:
+                                                removed_counts[p_key] = missing_n
+                                            else:
+                                                logger.info(
+                                                    "[%s] Playlist sync: %sx track missing from this cycle's extraction for guild %s "
+                                                    "(streak %s/2); deferring removal in case it's a transient extraction failure.",
+                                                    BOT_ENV_PREFIX.lower(), missing_n, guild_id, streak,
+                                                )
+                                                carry_forward_rows.extend(previous_row_by_key.get(p_key, [])[:missing_n])
+                                        for row in current_rows:
+                                            guild_streaks.pop(row[3], None)
+                                        if not guild_streaks:
+                                            playlist_sync_loop._missing_streak.pop(guild_id, None)
                                     else:
                                         # First run after this patch: seed the identity snapshot.
                                         # If the old count says the playlist grew, queue only the tail delta.
@@ -10298,12 +10296,17 @@ async def playlist_sync_loop():
                                     if added_rows or purged_live or purged_backup or trim_count or backup_content_trim or refilled_count:
                                         await snapshot_queue_backup(cur, guild_id)
 
+                                    # Baseline for the next cycle's comparison: this cycle's confirmed
+                                    # tracks plus anything still within its missing-streak grace period
+                                    # (carry_forward_rows) -- so a transiently-missed track isn't forgotten
+                                    # before it's had a fair second chance to reconfirm.
+                                    effective_rows = current_rows + carry_forward_rows
                                     await cur.execute("DELETE FROM nexus_active_playlist_tracks WHERE guild_id = %s AND bot_name = 'nexus'", (guild_id,))
                                     await cur.executemany(
                                         "INSERT INTO nexus_active_playlist_tracks (guild_id, bot_name, playlist_url, position_idx, track_key, track_uid, video_url, title, requester_id) VALUES (%s, 'nexus', %s, %s, %s, %s, %s, %s, %s)",
-                                        [(guild_id, url, idx, key, track_uid, t_url, t_title, t_req) for idx, (t_url, t_title, t_req, key, track_uid) in enumerate(current_rows)],
+                                        [(guild_id, url, idx, key, track_uid, t_url, t_title, t_req) for idx, (t_url, t_title, t_req, key, track_uid) in enumerate(effective_rows)],
                                     )
-                                    await cur.execute("UPDATE nexus_active_playlists SET known_track_count = %s WHERE guild_id = %s AND bot_name = 'nexus'", (current_count, guild_id))
+                                    await cur.execute("UPDATE nexus_active_playlists SET known_track_count = %s WHERE guild_id = %s AND bot_name = 'nexus'", (len(effective_rows), guild_id))
                         break
                     except Exception as _psync_exc:
                         if _is_retryable_mysql_error(_psync_exc) and _psync_attempt < 2:
