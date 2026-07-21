@@ -1,0 +1,9 @@
+target-version = "py313"
+line-length = 200
+
+[lint]
+# E701/E702/E703: multiple statements per line (colon/semicolon) -- this codebase's pervasive
+# idiomatic style (`if x: return y`, `try: ... except: ...`), used deliberately throughout,
+# not a defect. E402: the logging-setup import intentionally sits after the DAVE-protocol
+# monkeypatch section near the top of the file, not a real ordering bug.
+ignore = ["E701", "E702", "E703", "E402"]

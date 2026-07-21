@@ -60,7 +60,7 @@ def _resolve_channel_id_for_guild(guild_id: int):
     try:
         global bot
         guild = bot.get_guild(guild_id) if bot else None
-    except Exception as tx_error:
+    except Exception:
         guild = None
 
     if guild:
@@ -68,13 +68,13 @@ def _resolve_channel_id_for_guild(guild_id: int):
             voice_client = guild.voice_client
             if voice_client and getattr(voice_client, "channel", None):
                 return str(voice_client.channel.id)
-        except Exception as tx_error:
+        except Exception:
             logger.debug("Suppressed exception", exc_info=True)
             pass
         try:
             if guild.me and guild.me.voice and guild.me.voice.channel:
                 return str(guild.me.voice.channel.id)
-        except Exception as tx_error:
+        except Exception:
             logger.debug("Suppressed exception", exc_info=True)
             pass
 
@@ -108,7 +108,7 @@ def _inject_lavalink_channel_id(method, url, kwargs):
             new_payload["voice"]["channelId"] = resolved_channel_id
             new_kwargs["json"] = new_payload
             return new_kwargs
-    except Exception as tx_error:
+    except Exception:
         logger.debug("Suppressed exception", exc_info=True)
         pass
 
@@ -230,7 +230,7 @@ class DBPoolManager:
         try:
             pool.close()
             await pool.wait_closed()
-        except Exception as tx_error:
+        except Exception:
             logger.debug("Suppressed exception", exc_info=True)
             pass
 
@@ -249,7 +249,7 @@ class DBPoolManager:
             elif time.time() - DBPoolManager._last_ping >= DB_POOL_PING_INTERVAL_SECONDS:
                 try:
                     await DBPoolManager._ping_pool(pool)
-                except Exception as tx_error:
+                except Exception:
                     logger.warning("[%s] DB pool keepalive failed; reopening pool.", BOT_ENV_PREFIX.lower(), exc_info=True)
                     await DBPoolManager._close_pool(pool)
                     pool = await DBPoolManager._open_pool()
@@ -351,7 +351,7 @@ def _player_is_playing(player):
                 value = value()
         except TypeError:
             pass
-        except Exception as tx_error:
+        except Exception:
             value = None
         if isinstance(value, bool):
             paused = value
@@ -366,7 +366,7 @@ def _player_is_playing(player):
                 value = value()
         except TypeError:
             pass
-        except Exception as tx_error:
+        except Exception:
             value = None
         if isinstance(value, bool):
             if value:
@@ -388,7 +388,7 @@ def _player_is_paused(player):
                 value = value()
         except TypeError:
             pass
-        except Exception as tx_error:
+        except Exception:
             value = None
         if isinstance(value, bool):
             return value
@@ -404,7 +404,7 @@ def _player_current_track(player):
                 value = value()
             if value:
                 return value
-        except Exception as tx_error:
+        except Exception:
             continue
     return None
 
@@ -420,13 +420,13 @@ def _track_title_from_obj(track):
                 value = value()
             if value:
                 return str(value).strip()
-        except Exception as tx_error:
+        except Exception:
             continue
     try:
         value = str(track).strip()
         if value and value.lower() not in {"none", "unknown"}:
             return value
-    except Exception as tx_error:
+    except Exception:
         logger.debug("Suppressed exception", exc_info=True)
         pass
     return None
@@ -440,7 +440,7 @@ def _voice_client_connected(vc):
             return bool(value())  # Return definitive result; False means disconnected
         if isinstance(value, bool):
             return value
-    except Exception as tx_error:
+    except Exception:
         logger.debug("Suppressed exception", exc_info=True)
         pass
     return bool(getattr(vc, "channel", None))
@@ -642,7 +642,7 @@ class SwarmErrorWebhookHandler(logging.Handler):
         if any(tk in _rec_name for tk in ("aiomysql", "mysql", "dbpool", "webhook")): return
         try:
             message = record.getMessage()
-        except Exception as tx_error:
+        except Exception:
             message = str(record.msg)
         if not message:
             return
@@ -824,7 +824,7 @@ async def load_private_owner_user_ids():
             user_id = getattr(user, "id", None)
             if user_id:
                 ids.add(int(user_id))
-    except Exception as tx_error:
+    except Exception:
         logger.exception("[%s] Failed to load Discord application owner ids for private mode.", BOT_ENV_PREFIX.lower())
 
     _application_owner_ids_cache = ids
@@ -1039,7 +1039,7 @@ LAVALINK_TRACK_CACHE_CAPACITY = max(100, int(os.getenv(f"{BOT_ENV_PREFIX}_LAVALI
 YTDLP_CACHE_DIR = os.getenv(f"{BOT_ENV_PREFIX}_YTDLP_CACHE_DIR", os.getenv("YTDLP_CACHE_DIR", "/app/.cache/yt-dlp")).strip() or "/app/.cache/yt-dlp"
 try:
     os.makedirs(YTDLP_CACHE_DIR, exist_ok=True)
-except Exception as tx_error:
+except Exception:
     logger.debug("Suppressed exception", exc_info=True)
     pass
 SMART_RECENT_HISTORY_LIMIT = max(12, int(os.getenv(f"{BOT_ENV_PREFIX}_SMART_RECENT_HISTORY_LIMIT", os.getenv("SMART_RECENT_HISTORY_LIMIT", "36"))))
@@ -1066,7 +1066,7 @@ def _cache_get(cache, key, ttl_seconds):
     try:
         cache.pop(key, None)
         cache[key] = (value, timestamp)
-    except Exception as tx_error:
+    except Exception:
         logger.debug("Suppressed exception", exc_info=True)
         pass
     return value
@@ -1100,7 +1100,7 @@ def _embed_fingerprint(embed):
     try:
         fields = tuple((str(field.name), str(field.value), bool(field.inline)) for field in getattr(embed, "fields", []) or [])
         return (str(getattr(embed, "title", "") or ""), str(getattr(embed, "description", "") or ""), fields)
-    except Exception as tx_error:
+    except Exception:
         return (repr(embed),)
 
 def _runtime_key(value):
@@ -1139,7 +1139,7 @@ def _queue_parity_signature(rows):
             digest.update(b"\0")
             digest.update(str(_row_track_uid(row, 4, default="")).encode("utf-8", "ignore"))
             digest.update(b"\0")
-        except Exception as tx_error:
+        except Exception:
             digest.update(repr(row).encode("utf-8", "ignore"))
             digest.update(b"\0")
     return digest.hexdigest()
@@ -1165,7 +1165,7 @@ def queue_parity_repair_allowed(guild_id, backup_rows, live_rows, *, reason="que
 def prune_runtime_state_cache():
     try:
         active_guild_ids = {_runtime_key(g.id) for g in bot.guilds}
-    except Exception as tx_error:
+    except Exception:
         active_guild_ids = set()
     protected = {_runtime_key(key) for key in playback_tracking.keys()} | {_runtime_key(key) for key in guild_states.keys()} | {_runtime_key(key) for key in recovering_guilds} | {_runtime_key(key) for key in recovery_retry_tasks.keys()}
 
@@ -1212,11 +1212,11 @@ def clear_feature_runtime_caches():
         try:
             counts[name] = len(cache)
             cache.clear()
-        except Exception as tx_error:
+        except Exception:
             logger.debug("[%s] Failed to clear feature cache %s.", BOT_ENV_PREFIX.lower(), name, exc_info=True)
     try:
         prune_runtime_state_cache()
-    except Exception as tx_error:
+    except Exception:
         logger.debug("[%s] Runtime prune skipped during cache cleanup.", BOT_ENV_PREFIX.lower(), exc_info=True)
     return counts
 
@@ -1225,7 +1225,7 @@ def _cache_cleanup_lock_path():
     parent = os.path.dirname(os.path.abspath(YTDLP_CACHE_DIR)) or "/tmp"
     try:
         os.makedirs(parent, exist_ok=True)
-    except Exception as tx_error:
+    except Exception:
         parent = "/tmp"
     return os.path.join(parent, ".music_fleet_cache_cleanup.lock")
 
@@ -1247,9 +1247,9 @@ def _try_acquire_cache_cleanup_lock():
                 return _try_acquire_cache_cleanup_lock()
         except FileNotFoundError:
             return _try_acquire_cache_cleanup_lock()
-        except Exception as tx_error:
+        except Exception:
             logger.debug("[%s] Cache cleanup lock inspection failed.", BOT_ENV_PREFIX.lower(), exc_info=True)
-    except Exception as tx_error:
+    except Exception:
         logger.debug("[%s] Cache cleanup lock acquisition failed.", BOT_ENV_PREFIX.lower(), exc_info=True)
     return None
 
@@ -1261,7 +1261,7 @@ def _release_cache_cleanup_lock(path):
         os.unlink(path)
     except FileNotFoundError:
         pass
-    except Exception as tx_error:
+    except Exception:
         logger.debug("[%s] Cache cleanup lock release failed.", BOT_ENV_PREFIX.lower(), exc_info=True)
 
 
@@ -1281,7 +1281,7 @@ def _clear_directory_contents(path):
             removed += 1
         except FileNotFoundError:
             continue
-        except Exception as tx_error:
+        except Exception:
             logger.debug("[%s] Failed removing cache entry %s.", BOT_ENV_PREFIX.lower(), entry.path, exc_info=True)
     return removed
 
@@ -1295,7 +1295,7 @@ def _clear_wavelink_memory_caches():
             targets.extend(nodes.values())
         elif nodes:
             targets.extend(list(nodes))
-    except Exception as tx_error:
+    except Exception:
         logger.debug("Suppressed exception", exc_info=True)
         pass
     targets.append(wavelink.Pool)
@@ -1308,7 +1308,7 @@ def _clear_wavelink_memory_caches():
                     before = len(cache) if hasattr(cache, "__len__") else 0
                     cache.clear()
                     cleared += before
-            except Exception as tx_error:
+            except Exception:
                 logger.debug("[%s] Failed clearing Wavelink cache %s on %r.", BOT_ENV_PREFIX.lower(), attr, target, exc_info=True)
     return cleared
 
@@ -1348,7 +1348,7 @@ def schedule_named_task(name, coro, overwrite=False):
         else:
             try:
                 coro.close()
-            except Exception as tx_error:
+            except Exception:
                 logger.debug("Suppressed exception", exc_info=True)
                 pass
             return existing
@@ -1362,7 +1362,7 @@ def schedule_named_task(name, coro, overwrite=False):
             done_task.result()
         except asyncio.CancelledError:
             pass
-        except Exception as tx_error:
+        except Exception:
             logger.exception("Background task %s failed", name)
 
     task.add_done_callback(_cleanup)
@@ -1390,9 +1390,9 @@ async def flush_runtime_state_before_restart(reason: str = "restart"):
                                 connected=True,
                             )
                             await save_state(guild_id)
-                        except Exception as tx_error:
+                        except Exception:
                             logger.debug("[%s] Failed to flush playback position for guild %s before %s.", BOT_ENV_PREFIX.lower(), guild_id, reason, exc_info=True)
-    except Exception as tx_error:
+    except Exception:
         logger.debug("[%s] Runtime flush skipped before %s.", BOT_ENV_PREFIX.lower(), reason, exc_info=True)
 
 async def close_shared_runtime_resources():
@@ -1400,7 +1400,7 @@ async def close_shared_runtime_resources():
         session = HTTPSessionManager._session
         if session and not session.closed:
             await session.close()
-    except Exception as tx_error:
+    except Exception:
         logger.debug("[%s] Failed closing HTTP session.", BOT_ENV_PREFIX.lower(), exc_info=True)
     try:
         pool = DBPoolManager._pool
@@ -1408,7 +1408,7 @@ async def close_shared_runtime_resources():
             pool.close()
             await pool.wait_closed()
         DBPoolManager._pool = None
-    except Exception as tx_error:
+    except Exception:
         logger.debug("[%s] Failed closing DB pool.", BOT_ENV_PREFIX.lower(), exc_info=True)
 
 MAINTENANCE_ANNOUNCE_TIMEOUT_SECONDS = 5.0
@@ -1470,7 +1470,7 @@ async def request_supervisor_restart(reason: str, *, announce: bool = True):
                 f"This node is restarting for **{reason.replace('_', ' ')}**. Docker will bring it back online automatically.",
                 discord.Color.orange(),
             )
-        except Exception as tx_error:
+        except Exception:
             logger.debug("[%s] Failed to publish restart webhook.", BOT_ENV_PREFIX.lower(), exc_info=True)
         try:
             await announce_maintenance_to_active_guilds(reason)
@@ -1501,7 +1501,7 @@ async def flush_and_close_for_shutdown(reason: str = "signal"):
     logger.warning("[%s] Shutdown signal received; flushing playback checkpoints before container exits.", BOT_ENV_PREFIX.lower())
     try:
         await asyncio.wait_for(flush_runtime_state_before_restart(reason), timeout=SHUTDOWN_POSITION_FLUSH_TIMEOUT_SECONDS)
-    except Exception as tx_error:
+    except Exception:
         logger.exception("[%s] Timed out or failed while flushing playback checkpoints for %s.", BOT_ENV_PREFIX.lower(), reason)
     try:
         await announce_maintenance_to_active_guilds(reason)
@@ -1509,12 +1509,12 @@ async def flush_and_close_for_shutdown(reason: str = "signal"):
         logger.debug("[%s] Failed to announce maintenance shutdown to active guilds.", BOT_ENV_PREFIX.lower(), exc_info=True)
     try:
         await bot.close()
-    except Exception as tx_error:
+    except Exception:
         logger.debug("Suppressed exception", exc_info=True)
         pass
     try:
         await close_shared_runtime_resources()
-    except Exception as tx_error:
+    except Exception:
         logger.debug("Suppressed exception", exc_info=True)
         pass
     # Always exit, even if resource cleanup raised — otherwise the process can hang
@@ -1725,7 +1725,7 @@ BOT_STAGGER_SLOTS = {
 def _runtime_path(name: str) -> str:
     try:
         os.makedirs(MUSIC_BOT_RUNTIME_DIR, exist_ok=True)
-    except Exception as tx_error:
+    except Exception:
         logger.debug("Suppressed exception", exc_info=True)
         pass
     return os.path.join(MUSIC_BOT_RUNTIME_DIR, name)
@@ -1736,7 +1736,7 @@ def _runtime_file_float(path: str, default: float = 0.0) -> float:
     try:
         with open(path, "r", encoding="utf-8") as handle:
             return float((handle.read() or "0").strip() or "0")
-    except Exception as tx_error:
+    except Exception:
         return default
 
 
@@ -1744,7 +1744,7 @@ def _runtime_write_float(path: str, value: float) -> None:
     try:
         with open(path, "w", encoding="utf-8") as handle:
             handle.write(str(float(value)))
-    except Exception as tx_error:
+    except Exception:
         logger.debug("[%s] Could not write runtime float file %s", BOT_ENV_PREFIX.lower(), path, exc_info=True)
 
 
@@ -1834,7 +1834,7 @@ def _wait_for_global_discord_login_gate() -> None:
                 if age > GLOBAL_DISCORD_LOGIN_LOCK_STALE_SECONDS:
                     os.rmdir(lock_dir)
                     continue
-            except Exception as tx_error:
+            except Exception:
                 logger.debug("Suppressed exception", exc_info=True)
                 pass
             if not warned_shared:
@@ -1842,7 +1842,7 @@ def _wait_for_global_discord_login_gate() -> None:
                 warned_shared = True
             time.sleep(min(GLOBAL_DISCORD_LOGIN_LOCK_POLL_SECONDS, max(1.0, GLOBAL_DISCORD_LOGIN_GATE_MAX_WAIT_SECONDS - elapsed)))
             continue
-        except Exception as tx_error:
+        except Exception:
             logger.warning("[%s] Could not create shared login gate in %s; continuing with local-only stagger.", BOT_ENV_PREFIX.lower(), MUSIC_BOT_RUNTIME_DIR, exc_info=True)
             return
 
@@ -1870,7 +1870,7 @@ def _wait_for_global_discord_login_gate() -> None:
         finally:
             try:
                 os.rmdir(lock_dir)
-            except Exception as tx_error:
+            except Exception:
                 logger.debug("Suppressed exception", exc_info=True)
                 pass
 
@@ -1881,14 +1881,14 @@ def _read_login_failure_count() -> int:
     try:
         with open(_login_failure_counter_path(), "r", encoding="utf-8") as handle:
             return max(0, int((handle.read() or "0").strip() or "0"))
-    except Exception as tx_error:
+    except Exception:
         return 0
 
 def _write_login_failure_count(count: int) -> None:
     try:
         with open(_login_failure_counter_path(), "w", encoding="utf-8") as handle:
             handle.write(str(max(0, int(count))))
-    except Exception as tx_error:
+    except Exception:
         logger.debug("[%s] Could not persist login failure count.", BOT_ENV_PREFIX.lower(), exc_info=True)
 
 def reset_login_failure_backoff() -> None:
@@ -1925,11 +1925,11 @@ async def _wait_for_lavalink_tcp(timeout: float = 1.5) -> bool:
         writer.close()
         try:
             await writer.wait_closed()
-        except Exception as tx_error:
+        except Exception:
             logger.debug("Suppressed exception", exc_info=True)
             pass
         return True
-    except Exception as tx_error:
+    except Exception:
         return False
 
 def _has_connecting_lavalink_node() -> bool:
@@ -1939,7 +1939,7 @@ def _has_connecting_lavalink_node() -> bool:
             status_text = str(status).upper()
             if status_text == "CONNECTING" or status_text.endswith(".CONNECTING"):
                 return True
-        except Exception as tx_error:
+        except Exception:
             continue
     return False
 
@@ -1954,14 +1954,14 @@ def _get_pool_nodes():
             return list(nodes.values())
         if isinstance(nodes, (list, tuple, set)):
             return list(nodes)
-    except Exception as tx_error:
+    except Exception:
         logger.debug("[%s] Unable to inspect Wavelink node pool.", BOT_ENV_PREFIX.lower(), exc_info=True)
     return []
 
 def _has_connected_lavalink_node() -> bool:
     try:
         connected_status = getattr(getattr(wavelink, "NodeStatus", None), "CONNECTED", None)
-    except Exception as tx_error:
+    except Exception:
         connected_status = None
 
     for node in _get_pool_nodes():
@@ -1974,7 +1974,7 @@ def _has_connected_lavalink_node() -> bool:
                 return True
             if getattr(node, "connected", False):
                 return True
-        except Exception as tx_error:
+        except Exception:
             continue
     return False
 
@@ -2068,7 +2068,7 @@ async def lavalink_health_monitor():
                                 schedule_recovery_retry(guild.id, channel_id, start_position=position, reason="lavalink_health")
                         else:
                             logger.info("[%s] Lavalink degraded; preserving state and letting Aria decide recovery.", guild.id)
-    except Exception as tx_error:
+    except Exception:
         logger.exception("[nexus] Lavalink health monitor failed.")
 
 @lavalink_health_monitor.before_loop
@@ -2100,7 +2100,7 @@ async def resolve_requester_name(guild, requester_id):
         return cached
     try:
         member = guild.get_member(requester_id) if guild else None
-    except Exception as tx_error:
+    except Exception:
         member = None
     if member:
         return _cache_set(REQUESTER_NAME_CACHE, cache_key, _safe_display_name(member))
@@ -2110,7 +2110,7 @@ async def resolve_requester_name(guild, requester_id):
     try:
         user = await bot.fetch_user(requester_id)
         return _cache_set(REQUESTER_NAME_CACHE, cache_key, _safe_display_name(user))
-    except Exception as tx_error:
+    except Exception:
         fallback = f"User {requester_id}"
         return _cache_set(REQUESTER_NAME_CACHE, cache_key, fallback)
 
@@ -2162,7 +2162,7 @@ async def get_autodj_enabled(guild_id):
                     value = bool(row and row.get('auto_dj'))
                     _cache_set(AUTO_DJ_ENABLED_CACHE, int(guild_id), value)
                     return value
-    except Exception as tx_error:
+    except Exception:
         return False
 
 async def set_autodj_enabled(guild_id, enabled):
@@ -2547,16 +2547,16 @@ async def save_state(guild_id):
                 f.flush()
                 try:
                     os.fsync(f.fileno())
-                except Exception as tx_error:
+                except Exception:
                     logger.debug("Suppressed exception", exc_info=True)
                     pass
             os.replace(tmp_path, path)
             return True
-        except Exception as tx_error:
+        except Exception:
             try:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
-            except Exception as tx_error:
+            except Exception:
                 logger.debug("Suppressed exception", exc_info=True)
                 pass
             return False
@@ -2574,7 +2574,7 @@ async def delete_state(guild_id):
         await asyncio.to_thread(os.remove, f"state_{guild_id}.json")
     except FileNotFoundError:
         pass
-    except Exception as tx_error:
+    except Exception:
         logger.debug("Suppressed exception", exc_info=True)
         pass
 
@@ -2608,7 +2608,7 @@ def _coerce_text(value, default="", *, limit=512):
         return default
     try:
         text = value if isinstance(value, str) else str(value)
-    except Exception as tx_error:
+    except Exception:
         return default
     if not isinstance(text, str):
         return default
@@ -2712,7 +2712,7 @@ def _track_key(video_url, title=None):
                 raw = f"youtube:{query['v'][0]}"
             else:
                 raw = urllib.parse.urlunparse((parsed.scheme.lower(), host, parsed.path.rstrip("/"), "", parsed.query, ""))
-    except Exception as tx_error:
+    except Exception:
         logger.debug("Suppressed exception", exc_info=True)
         pass
     normalized = re.sub(r"\s+", " ", raw.lower()).strip()
@@ -2799,7 +2799,7 @@ def _member_ids_from_voice_channel(guild, channel_id):
         return []
     try:
         return [member.id for member in channel.members if not getattr(member, "bot", False)]
-    except Exception as tx_error:
+    except Exception:
         return []
 
 
@@ -2813,7 +2813,7 @@ def _weighted_smart_pick(rows):
         reason = _row_value(row, "reason", _row_value(row, 3, "history"))
         try:
             weight = max(0.25, float(raw_weight or 0.0))
-        except Exception as tx_error:
+        except Exception:
             weight = 1.0
         if not title and not url:
             continue
@@ -2858,7 +2858,7 @@ async def fetch_track_embedding_vector(title):
                 values = (data.get("embedding") or {}).get("values")
                 if isinstance(values, list) and values:
                     return [float(v) for v in values]
-    except Exception as tx_error:
+    except Exception:
         return None
     return None
 
@@ -2872,7 +2872,7 @@ async def get_or_fetch_track_embedding(cur, url_key, title, video_url=None):
         if raw:
             try:
                 return json.loads(raw)
-            except Exception as tx_error:
+            except Exception:
                 logger.debug("Suppressed exception", exc_info=True)
                 pass
     vector = await fetch_track_embedding_vector(title)
@@ -2883,7 +2883,7 @@ async def get_or_fetch_track_embedding(cur, url_key, title, video_url=None):
                 "ON DUPLICATE KEY UPDATE title = VALUES(title), video_url = VALUES(video_url), embedding = VALUES(embedding)",
                 (url_key, title, video_url, json.dumps(vector)),
             )
-        except Exception as tx_error:
+        except Exception:
             logger.debug("Suppressed exception", exc_info=True)
             pass
     return vector
@@ -2905,7 +2905,7 @@ async def find_similar_tracks_global(cur, seed_vector, avoid_keys, limit=5):
             continue
         try:
             vector = json.loads(raw)
-        except Exception as tx_error:
+        except Exception:
             continue
         similarity = _cosine_similarity(seed_vector, vector)
         if similarity >= SMART_EMBEDDING_SIMILARITY_THRESHOLD:
@@ -3194,7 +3194,7 @@ async def pick_smart_recommendation_track(cur, guild_id, listener_ids=None):
                 chosen = SimpleNamespace(uri=sim_url, title=sim_title)
                 recommendation["reason"] = "similar track"
                 return chosen, recommendation
-        except Exception as tx_error:
+        except Exception:
             logger.debug("Suppressed exception", exc_info=True)
             pass
 
@@ -3478,7 +3478,7 @@ def current_track_position(guild_id, now=None):
                     return last_checkpoint
 
                 return max(reported_position, last_checkpoint)
-    except Exception as tx_error:
+    except Exception:
         logger.debug("Suppressed exception", exc_info=True)
         pass
 
@@ -3598,13 +3598,13 @@ async def cleanup_failed_voice_session(guild, *, reason="voice_connect_error"):
         except TypeError:
             try:
                 await asyncio.wait_for(voice_client.disconnect(), timeout=10.0)
-            except Exception as tx_error:
+            except Exception:
                 logger.debug(f"[{guild.id}] Failed to disconnect stale voice client after {reason}.", exc_info=True)
-        except Exception as tx_error:
+        except Exception:
             logger.debug(f"[{guild.id}] Failed to disconnect stale voice client after {reason}.", exc_info=True)
     try:
         await asyncio.wait_for(guild.change_voice_state(channel=None), timeout=10.0)
-    except Exception as tx_error:
+    except Exception:
         logger.debug(f"[{guild.id}] Failed to clear Discord voice state after {reason}.", exc_info=True)
 
 def clear_recovery_backoff(guild_id):
@@ -3708,7 +3708,7 @@ async def _run_soft_voice_recovery_after_grace(guild_id, channel_id, position, r
         await restore_guild_state(guild_id, {"voice_channel_id": channel_id, "position": max(0, int(position))})
     except asyncio.CancelledError:
         raise
-    except Exception as tx_error:
+    except Exception:
         logger.exception(f"[{guild_id}] Soft voice recovery grace task failed.")
         schedule_recovery_retry(guild_id, channel_id, start_position=position, reason=f"{reason}_grace_failure")
     finally:
@@ -3768,7 +3768,7 @@ async def _run_targeted_interrupt_resume(guild_id, channel_id, position, reason,
         await restore_guild_state(guild_id, state, override_backoff=True)
     except asyncio.CancelledError:
         raise
-    except Exception as tx_error:
+    except Exception:
         logger.exception("[%s] Targeted interrupt resume failed after %s.", guild_id, reason)
     finally:
         current = asyncio.current_task()
@@ -3872,7 +3872,7 @@ async def persist_voice_state(guild_id, channel_id=None, *, text_channel_id=None
                             str(last_error)[:2000] if last_error else None,
                         ),
                     )
-    except Exception as tx_error:
+    except Exception:
         logger.exception("[nexus] Failed to persist voice state for guild %s", guild_id)
 
 
@@ -3881,7 +3881,7 @@ async def mark_voice_disconnected(guild_id, channel_id=None, *, desired_connecte
     try:
         if position is None and (guild_id in playback_tracking or str(guild_id) in playback_tracking):
             position = current_track_position(guild_id)
-    except Exception as tx_error:
+    except Exception:
         position = None
     try:
         async with DBPoolManager() as pool:
@@ -3897,7 +3897,7 @@ async def mark_voice_disconnected(guild_id, channel_id=None, *, desired_connecte
                             "UPDATE nexus_playback_state SET is_playing = FALSE, is_paused = FALSE, position_seconds = %s WHERE guild_id = %s AND bot_name = 'nexus'",
                             (normalize_position_seconds(position), guild_id),
                         )
-    except Exception as tx_error:
+    except Exception:
         logger.exception("[nexus] Failed to mark playback disconnected for guild %s", guild_id)
 
 
@@ -3927,7 +3927,7 @@ async def reconcile_runtime_playback_state(guild):
                             "UPDATE nexus_playback_state SET channel_id = COALESCE(%s, channel_id), is_playing = %s, is_paused = %s, position_seconds = %s WHERE guild_id = %s AND bot_name = 'nexus'",
                             (actual_channel_id, actual_playing, actual_paused, live_position, guild.id),
                         )
-    except Exception as tx_error:
+    except Exception:
         logger.exception("[nexus] Failed to reconcile playback state for guild %s", guild.id)
 
 
@@ -3935,7 +3935,7 @@ async def collect_and_persist_metrics(guild=None):
     guilds = [guild] if guild else list(bot.guilds)
     try:
         lavalink_ready = await ensure_lavalink_ready(timeout=1.0)
-    except Exception as tx_error:
+    except Exception:
         lavalink_ready = False
 
     # Snapshot in-memory state (no DB, no await) for all guilds upfront.
@@ -4077,7 +4077,7 @@ async def restore_persistent_voice_states():
                                 await _cur.execute("SELECT stay_in_vc FROM nexus_guild_settings WHERE guild_id = %s", (guild.id,))
                                 stay_row = await _cur.fetchone()
                                 stay_in_vc = bool(stay_row[0]) if stay_row else False
-                except Exception as tx_error:
+                except Exception:
                     logger.debug("[nexus] Failed checking 24/7 state for persistent voice restore.", exc_info=True)
                 if not state and not stay_in_vc:
                     await persist_voice_state(guild.id, channel_id, desired_connected=False, connected=False, last_error="no_recoverable_playback")
@@ -4094,7 +4094,7 @@ async def restore_persistent_voice_states():
                             async with _pool.acquire() as _conn:
                                 async with _conn.cursor() as _cur:
                                     await _cur.execute("UPDATE nexus_voice_state SET reconnect_attempts = reconnect_attempts + 1, last_error = %s WHERE guild_id = %s AND bot_name = 'nexus'", ("rejoin_failed", guild.id))
-                    except Exception as tx_error:
+                    except Exception:
                         logger.debug("[nexus] Failed to increment reconnect_attempts for guild %s.", guild.id, exc_info=True)
             except Exception as row_exc:
                 logger.warning("[nexus] Persistent voice row recovery failed: %s", row_exc)
@@ -4124,7 +4124,7 @@ async def sync_pause_state(guild_id, paused: bool):
         )
         await save_state(guild_id)
         last_state_file_persist[guild_id] = time.time()
-    except Exception as tx_error:
+    except Exception:
         logger.exception("[nexus] Failed to sync pause state for guild %s.", guild_id)
 
 async def insert_queue_front(cur, table_name, guild_id, bot_name, video_url, title, requester_id, track_uid=None, max_attempts=5, dedupe_identity=False):
@@ -4234,10 +4234,10 @@ async def snapshot_queue_backup(cur, guild_id):
                 insert_data,
             )
         await cur.execute("COMMIT")
-    except Exception as tx_error:
+    except Exception:
         try:
             await cur.execute("ROLLBACK")
-        except Exception as tx_error:
+        except Exception:
             logger.debug("Suppressed exception", exc_info=True)
             pass
         raise
@@ -4301,7 +4301,7 @@ async def enqueue_track(cur, guild_id, video_url, title, requester_id, *, backup
     if backup:
         try:
             await bulk_record_tracks_queued(cur, guild_id, [(video_url, title, requester_id)])
-        except Exception as tx_error:
+        except Exception:
             logger.debug("[nexus] Track intelligence queue write skipped.", exc_info=True)
         await backup_track(cur, guild_id, video_url, title, requester_id, track_uid)
     return track_uid
@@ -4672,10 +4672,10 @@ async def shuffle_queue_rows(cur, guild_id, *, preserve_first=True):
                 insert_data,
             )
         await cur.execute("COMMIT")
-    except Exception as tx_error:
+    except Exception:
         try:
             await cur.execute("ROLLBACK")
-        except Exception as tx_error:
+        except Exception:
             logger.debug("Suppressed exception", exc_info=True)
             pass
         logger.exception("[nexus] Queue reshuffle transaction failed; live queue was rolled back instead of leaking tracks.")
@@ -5171,7 +5171,7 @@ async def requeue_failed_track(cur, guild_id, channel_id, url, title, requester_
                     track_uid = _row_track_uid(backup_row, 3, default=track_uid) or _ensure_track_uid(track_uid)
                     if requester_id is None and backup_requester is not None:
                         requester_id = backup_requester
-            except Exception as tx_error:
+            except Exception:
                 logger.debug("[nexus] Backup row lookup skipped while requeueing failed track.", exc_info=True)
 
         track_uid = _ensure_track_uid(track_uid)
@@ -5287,7 +5287,7 @@ def _player_reported_position_seconds(player):
         if position_ms is None:
             return None
         return max(0, int(float(position_ms) / 1000))
-    except Exception as tx_error:
+    except Exception:
         return None
 
 
@@ -5311,7 +5311,7 @@ def _track_uid_from_obj(track):
             normalized = _normalize_track_uid(dict(extras).get("track_uid"))
             if normalized:
                 return normalized
-    except Exception as tx_error:
+    except Exception:
         logger.debug("Suppressed exception", exc_info=True)
         pass
     for attr in ("track_uid", "play_session_key"):
@@ -5319,7 +5319,7 @@ def _track_uid_from_obj(track):
             normalized = _normalize_track_uid(getattr(track, attr, None))
             if normalized:
                 return normalized
-        except Exception as tx_error:
+        except Exception:
             continue
     return ""
 
@@ -5343,7 +5343,7 @@ def _apply_track_runtime_extras(track, *, track_uid=None, requester_id=None, que
         current_extras = getattr(track, "extras", None)
         if current_extras:
             extras.update(dict(current_extras))
-    except Exception as tx_error:
+    except Exception:
         logger.debug("Suppressed exception", exc_info=True)
         pass
     normalized_uid = _ensure_track_uid(track_uid) if track_uid else ""
@@ -5353,7 +5353,7 @@ def _apply_track_runtime_extras(track, *, track_uid=None, requester_id=None, que
     if requester_id is not None:
         try:
             extras["requester_id"] = int(requester_id)
-        except Exception as tx_error:
+        except Exception:
             extras["requester_id"] = requester_id
     if queue_url:
         extras["queue_url"] = queue_url
@@ -5362,7 +5362,7 @@ def _apply_track_runtime_extras(track, *, track_uid=None, requester_id=None, que
     extras["resume_position_seconds"] = max(0, int(resume_position or 0))
     try:
         track.extras = extras
-    except Exception as tx_error:
+    except Exception:
         logger.debug("[%s] Failed to attach runtime extras to playable.", BOT_ENV_PREFIX.lower(), exc_info=True)
 
 
@@ -5391,7 +5391,7 @@ async def apply_resume_seek(voice_client, guild_id, start_position, *, track_uid
         if expected_identity and guild_id in playback_tracking and float(playback_tracking[guild_id].get("last_user_seek_at", 0.0)) > (time.monotonic() - 5.0): return start_position
         try:
             await asyncio.sleep(max(0.75, retry_delay if attempt == 1 else retry_delay))
-        except Exception as tx_error:
+        except Exception:
             logger.debug("Suppressed exception", exc_info=True)
             pass
         current_identity = _current_player_track_identity(voice_client)
@@ -5446,7 +5446,7 @@ async def apply_resume_seek(voice_client, guild_id, start_position, *, track_uid
         # while the runtime clock races ahead and falsely triggers track_stuck.
         try:
             await voice_client.seek(0)
-        except Exception as tx_error:
+        except Exception:
             logger.debug("[%s] seek(0) reset after failed deep seek could not complete.", guild_id, exc_info=True)
         return last_reported
 
@@ -5600,7 +5600,7 @@ async def verify_track_stuck_before_requeue(guild_id, channel_id, url, title, re
         )
     except asyncio.CancelledError:
         raise
-    except Exception as tx_error:
+    except Exception:
         logger.exception("[%s] Failed delayed %s verification for '%s'.", guild_id, reason, title)
         return False
 
@@ -5743,7 +5743,7 @@ async def handle_track_playback_failure(payload, *, reason="track_exception"):
 async def on_wavelink_track_exception(payload):
     try:
         await handle_track_playback_failure(payload, reason="track_exception")
-    except Exception as tx_error:
+    except Exception:
         logger.exception("[nexus] Failed to handle Wavelink track exception without leaking queue state.")
 
 
@@ -5751,7 +5751,7 @@ async def on_wavelink_track_exception(payload):
 async def on_wavelink_track_stuck(payload):
     try:
         await handle_track_playback_failure(payload, reason="track_stuck")
-    except Exception as tx_error:
+    except Exception:
         logger.exception("[nexus] Failed to handle Wavelink stuck track without leaking queue state.")
 
 
@@ -5794,14 +5794,14 @@ async def _fade_volume(voice_client, start_volume, end_volume, duration=3.0, ste
             if volume != last_volume:
                 await voice_client.set_volume(volume)
                 last_volume = volume
-        except Exception as tx_error:
+        except Exception:
             return
         if step < steps:
             await asyncio.sleep(step_delay)
     if last_volume != max(0, min(200, int(end_volume))):
         try:
             await voice_client.set_volume(max(0, min(200, int(end_volume))))
-        except Exception as tx_error:
+        except Exception:
             return
 
 def choose_fade_duration(mode, configured_seconds, track_duration, filter_mode, title):
@@ -5882,10 +5882,10 @@ async def clear_voice_channel_status(guild):
             await channel.edit(status=None)
         except TypeError:
             pass
-        except Exception as tx_error:
+        except Exception:
             logger.debug("Suppressed exception", exc_info=True)
             pass
-    except Exception as tx_error:
+    except Exception:
         logger.debug("Suppressed exception", exc_info=True)
         pass
 
@@ -5938,7 +5938,7 @@ async def send_or_update_status_message(guild, embed):
                         message = channel.get_partial_message(message_id)
                         await message.edit(embed=embed)
                         new_message_id = message_id
-                    except Exception as tx_error:
+                    except Exception:
                         message = None
                 if not message:
                     try:
@@ -5985,7 +5985,7 @@ async def send_feedback_notice(guild, title, description, color, *, dedupe_key=N
                 if old_expiry <= now:
                     feedback_notice_cache.pop(old_key, None)
         return True
-    except Exception as tx_error:
+    except Exception:
         logger.debug("[%s] Feedback notice dispatch skipped.", BOT_ENV_PREFIX.lower(), exc_info=True)
         return False
 
@@ -6029,7 +6029,7 @@ async def ensure_voice_connection(guild, channel_id, *, respect_recovery_backoff
                     return None
                 try:
                     await asyncio.wait_for(voice_client.disconnect(), timeout=10.0)
-                except Exception as tx_error:
+                except Exception:
                     logger.debug("Suppressed exception", exc_info=True)
                     pass
                 voice_client = None
@@ -6076,7 +6076,7 @@ async def ensure_voice_connection(guild, channel_id, *, respect_recovery_backoff
                 arm_recovery_backoff(guild.id, seconds=timeout_backoff, reason="voice_connect_timeout")
             try:
                 await mark_voice_disconnected(guild.id, channel_id, desired_connected=True, reason=reason)
-            except Exception as tx_error:
+            except Exception:
                 logger.debug(f"[{guild.id}] Failed to persist voice failure state.", exc_info=True)
             return None
 
@@ -6389,7 +6389,7 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
                     await delete_state(guild.id)
                     try:
                         await bot.change_presence(status=discord.Status.online)
-                    except Exception as tx_error:
+                    except Exception:
                         logger.debug("Suppressed exception", exc_info=True)
                         pass
                     if loop_mode != 'queue' and not allow_recovery_restore:
@@ -6502,7 +6502,7 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
                         if VOICE_FORCE_STALE_CLIENT_REJOIN:
                             try:
                                 await guild.voice_client.disconnect()
-                            except Exception as tx_error:
+                            except Exception:
                                 logger.debug(f"[{guild.id}] Failed to recycle stale Lavalink player cleanly.", exc_info=True)
                         else:
                             logger.warning(f"[{guild.id}] Stale Lavalink player detected, but this playback path is not allowed to recycle/rejoin automatically; waiting for a direct/manual recovery command.")
@@ -6579,7 +6579,7 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
                     asyncio.ensure_future(_record_track_play_resumed_bg(guild.id, url, title, requester_id))
                 try:
                     await bot.change_presence(status=discord.Status.online, activity=discord.Activity(type=discord.ActivityType.listening, name=str(title).replace("\\n", " ").strip()[:120]))
-                except Exception as tx_error:
+                except Exception:
                     logger.debug("Suppressed exception", exc_info=True)
                     pass
                 playback_tracking[guild.id] = {'start_time': time.monotonic(), 'offset': start_position, 'url': url, 'channel_id': channel_id, 'title': title, 'track_uid': track_uid, 'original_queue_url': original_queue_url, 'original_queue_title': original_queue_title, 'duration': duration, 'speed': c_speed, 'current_filter': filter_mode, 'requester_id': requester_id, 'transition_mode': trans_mode, 'volume': vol, 'paused': False, 'last_position_checkpoint': start_position, 'last_listen_position': start_position, 'listen_seconds_committed': 0}
@@ -6678,11 +6678,11 @@ async def stop_playback(guild):
     if guild.voice_client:
         try:
             await guild.voice_client.disconnect()
-        except Exception as tx_error:
+        except Exception:
             logger.debug("[%s] Voice disconnect failed during stop_playback.", guild.id, exc_info=True)
     try:
         await bot.change_presence(status=discord.Status.online, activity=discord.Activity(type=discord.ActivityType.watching, name="the Swarm | Idle"))
-    except Exception as tx_error:
+    except Exception:
         logger.debug("Suppressed exception", exc_info=True)
         pass
 
@@ -6737,7 +6737,7 @@ async def restore_guild_state(guild_id, state, *, override_backoff=False):
                             if home_row and home_row[0]:
                                 channel = guild.get_channel(home_row[0])
                                 vc_id = home_row[0]
-            except Exception as tx_error:
+            except Exception:
                 logger.debug("Suppressed exception", exc_info=True)
                 pass
         if not channel:
@@ -6918,7 +6918,7 @@ async def auto_heal_loop():
             for gid, state in db_states.items():
                 schedule_named_task(f"restore_guild_state:{gid}", restore_guild_state(gid, state))
             auto_heal_initialized = True
-        except Exception as tx_error:
+        except Exception:
             logger.exception("[%s] Auto-heal bootstrap failed; will retry on next tick.", BOT_ENV_PREFIX.lower())
 
     for gid, state in list(guild_states.items()):
@@ -6946,7 +6946,7 @@ async def auto_heal_loop():
                             scheduled = True
                     if scheduled:
                         logger.info(f"[HEAL] Rejoining/restarting playback for {gid}")
-        except Exception as tx_error:
+        except Exception:
             logger.debug("Suppressed exception", exc_info=True)
             pass
 
@@ -7244,11 +7244,11 @@ async def metrics_heartbeat_loop():
         for guild, result in zip(guild_snapshot, reconcile_results):
             if isinstance(result, Exception):
                 logger.exception("[nexus] Metrics reconcile failed for guild %s", getattr(guild, 'id', None))
-    except Exception as tx_error:
+    except Exception:
         logger.exception("[nexus] Metrics heartbeat pre-pass failed.")
     try:
         await collect_and_persist_metrics()
-    except Exception as tx_error:
+    except Exception:
         logger.exception("[nexus] Metrics heartbeat failed.")
 
 @tasks.loop(seconds=POSITION_UPDATER_INTERVAL)
@@ -7389,7 +7389,7 @@ async def position_updater():
                                 """,
                                 intelligence_rows,
                             )
-        except Exception as tx_error:
+        except Exception:
             logger.exception("[%s] Failed to batch-persist realtime playback checkpoints.", BOT_ENV_PREFIX.lower())
             return
 
@@ -7399,10 +7399,10 @@ async def position_updater():
             if now - last_state_file_persist.get(guild_id, 0) >= POSITION_STATE_FILE_INTERVAL:
                 try:
                     await save_state(guild_id)
-                except Exception as tx_error:
+                except Exception:
                     logger.exception("[%s] Failed to save state file for guild %s.", BOT_ENV_PREFIX.lower(), guild_id)
                 last_state_file_persist[guild_id] = now
-    except Exception as tx_error:
+    except Exception:
         logger.exception("[%s] Position updater failed.", BOT_ENV_PREFIX.lower())
 
 # --- SETTINGS COMMANDS ---
@@ -7528,15 +7528,15 @@ async def play(interaction: discord.Interaction, search: str, source: str = "ytm
         await interaction.response.defer()
     except discord.NotFound: interaction_token_valid = False
     except discord.InteractionResponded: interaction_token_valid = True
-    except Exception as tx_error: interaction_token_valid = False
+    except Exception: interaction_token_valid = False
 
     async def send_play_feedback(embed: discord.Embed):
         if interaction_token_valid:
             try: return await interaction.followup.send(embed=embed)
-            except Exception as tx_error: pass
+            except Exception: pass
         if interaction.channel:
             try: return await interaction.channel.send(embed=embed)
-            except Exception as tx_error: pass
+            except Exception: pass
         return None
 
     channel = None
@@ -7585,7 +7585,7 @@ async def play(interaction: discord.Interaction, search: str, source: str = "ytm
                         )
                         try:
                             await bulk_record_tracks_queued(cur, interaction.guild.id, [(url, title, requester_id) for url, title, requester_id, _track_uid in queue_rows])
-                        except Exception as tx_error:
+                        except Exception:
                             logger.debug("[nexus] Bulk track intelligence queue write skipped.", exc_info=True)
                     if added_count > 1:
                         await shuffle_queue_rows(cur, interaction.guild.id, preserve_first=True)
@@ -7637,14 +7637,14 @@ async def playnext(interaction: discord.Interaction, search: str):
                     )
                     try:
                         await bulk_record_tracks_queued(cur, interaction.guild.id, [(track.uri, track.title, interaction.user.id)])
-                    except Exception as tx_error:
+                    except Exception:
                         logger.debug("[nexus] Track intelligence queue write skipped.", exc_info=True)
                     await snapshot_queue_backup(cur, interaction.guild.id)
                     await cur.execute("COMMIT")
-                except Exception as tx_error:
+                except Exception:
                     try:
                         await cur.execute("ROLLBACK")
-                    except Exception as tx_error:
+                    except Exception:
                         logger.debug("Suppressed exception", exc_info=True)
                         pass
                     logger.exception("[nexus] playnext transaction failed; queue was rolled back instead of leaking tracks.")
@@ -7710,7 +7710,7 @@ async def sleep_timer_cmd(interaction: discord.Interaction, minutes: app_command
         if channel:
             try:
                 await channel.send(embed=discord.Embed(title="😴 Sleep Timer", description="Playback stopped — sleep timer elapsed.", color=discord.Color.dark_purple()))
-            except Exception as tx_error:
+            except Exception:
                 logger.debug("Suppressed exception", exc_info=True)
                 pass
         await send_webhook_log(bot.user.name if bot.user else "Unknown Node", "😴 Sleep Timer", f"Guild {guild.name}: sleep timer elapsed, playback stopped.", discord.Color.dark_purple())
@@ -7747,7 +7747,7 @@ async def clear(interaction: discord.Interaction):
     vc = interaction.guild.voice_client
     if vc and _player_is_active(vc):
         try: await vc.stop()
-        except Exception as tx_error: pass
+        except Exception: pass
     playback_tracking.pop(interaction.guild.id, None)
     guild_states.pop(interaction.guild.id, None)
     recovering_guilds.discard(interaction.guild.id)
@@ -7770,7 +7770,7 @@ async def clear(interaction: discord.Interaction):
                 await cur.execute("UPDATE nexus_voice_state SET desired_connected = FALSE, connected_channel_id = NULL, disconnected_at = CURRENT_TIMESTAMP WHERE guild_id = %s AND bot_name = 'nexus'", (interaction.guild.id,))
     try:
         await bot.change_presence(status=discord.Status.online)
-    except Exception as tx_error:
+    except Exception:
         logger.debug("Suppressed exception", exc_info=True)
         pass
     await interaction.response.send_message(embed=discord.Embed(description="🗑️ Playback stopped and queue cleared.", color=discord.Color.red()), ephemeral=True)
@@ -7941,10 +7941,10 @@ async def skipto(interaction: discord.Interaction, index: int):
                                 title=_row_value(r, "title", _row_value(r, 1)),
                             )
                         await cur.execute("COMMIT")
-                    except Exception as tx_error:
+                    except Exception:
                         try:
                             await cur.execute("ROLLBACK")
-                        except Exception as tx_error:
+                        except Exception:
                             logger.debug("Suppressed exception", exc_info=True)
                             pass
                         logger.exception("[nexus] skipto transaction failed; live/backup queues rolled back instead of drifting.")
@@ -7988,10 +7988,10 @@ async def move(interaction: discord.Interaction, frm: int, to: int):
                             )
                         await snapshot_queue_backup(cur, interaction.guild.id)
                         await cur.execute("COMMIT")
-                    except Exception as tx_error:
+                    except Exception:
                         try:
                             await cur.execute("ROLLBACK")
-                        except Exception as tx_error:
+                        except Exception:
                             logger.debug("Suppressed exception", exc_info=True)
                             pass
                         logger.exception("[nexus] move transaction failed; queue was rolled back instead of leaking tracks.")
@@ -8248,7 +8248,7 @@ async def loadqueue(interaction: discord.Interaction, name: str):
                     )
                     try:
                         await bulk_record_tracks_queued(cur, interaction.guild.id, [(_row_value(row, "video_url", _row_value(row, 0)), _row_value(row, "title", _row_value(row, 1)), interaction.user.id) for row in rows])
-                    except Exception as tx_error:
+                    except Exception:
                         logger.debug("[nexus] Bulk track intelligence queue write skipped.", exc_info=True)
                     await snapshot_queue_backup(cur, interaction.guild.id)
     await interaction.followup.send(embed=discord.Embed(description=f"📂 Loaded **{len(rows)}** tracks from **{name}** into the queue!", color=discord.Color.green()), ephemeral=True)
@@ -8422,7 +8422,7 @@ async def taste(interaction: discord.Interaction, member: discord.Member = None)
         score = _row_value(row, "score", _row_value(row, 7, 0))
         try:
             score_text = f"{float(score):.1f}"
-        except Exception as tx_error:
+        except Exception:
             score_text = str(score)
         lines.append(f"**{idx}.** {title} *(score {score_text})*")
     played, finished, liked, disliked, skipped = totals if totals else (0, 0, 0, 0, 0)
@@ -8600,7 +8600,7 @@ async def volume(interaction: discord.Interaction, vol: int):
                 await cur.execute("INSERT INTO nexus_guild_settings (guild_id, volume) VALUES (%s, %s) ON DUPLICATE KEY UPDATE volume = %s", (interaction.guild.id, vol, vol))
     if interaction.guild.voice_client:
         try: await interaction.guild.voice_client.set_volume(vol)
-        except Exception as tx_error: pass
+        except Exception: pass
     await interaction.response.send_message(embed=discord.Embed(description=f"🔊 Volume set to {vol}%", color=discord.Color.green()), ephemeral=True)
 
 @bot.tree.command(name="nexus_main_loop", description="Choose whether playback loops nothing, the current song, or the full queue.")
@@ -8643,7 +8643,7 @@ async def filter_cmd(interaction: discord.Interaction, mode: str, stack: str = N
             new_speed = apply_filter_preset(wav_filters, stack_value, new_speed)
         try:
             await replace_audio_filters(interaction.guild.voice_client, wav_filters)
-        except Exception as tx_error:
+        except Exception:
             logger.debug("Suppressed exception", exc_info=True)
             pass
     # Update in-memory speed so the progress tracker stays accurate during playback
@@ -8718,7 +8718,7 @@ async def modify_audio(interaction: discord.Interaction, speed: float = 1.0, pit
         wav_filters = wavelink.Filters()
         wav_filters.timescale.set(speed=speed, pitch=pitch)
         try: await replace_audio_filters(interaction.guild.voice_client, wav_filters)
-        except Exception as tx_error: pass
+        except Exception: pass
     await interaction.followup.send(embed=discord.Embed(title="🎛️ Audio Modifiers Set", description=f"**Speed:** {speed}x\n**Pitch:** {pitch}x\n*Active for the next {duration} track(s).* ", color=discord.Color.gold()), ephemeral=True)
 
 # --- SCRUBBING ---
@@ -9265,7 +9265,7 @@ async def _expand_media_url(url):
         async with HTTPSessionManager() as session:
             async with session.get(candidate, allow_redirects=True, timeout=timeout) as response:
                 return str(response.url)
-    except Exception as tx_error:
+    except Exception:
         return candidate
 
 # --- Local audio cache: download best-quality audio once, play from disk on repeat ---
@@ -10192,7 +10192,7 @@ async def playlist_sync_loop():
                                         )
                                         try:
                                             await bulk_record_tracks_queued(cur, guild_id, [(u, t, r) for u, t, r, _k, _uid in added_rows])
-                                        except Exception as tx_error:
+                                        except Exception:
                                             logger.debug("[nexus] Bulk playlist-sync intelligence write skipped.", exc_info=True)
                                         # Mirror to backup immediately, not just once at the end of this
                                         # block -- otherwise a concurrent parity repair can see these
@@ -10270,7 +10270,7 @@ async def playlist_sync_loop():
                                             )
                                             try:
                                                 await bulk_record_tracks_queued(cur, guild_id, [(u, t, r) for u, t, r, _k, _uid in refill_rows])
-                                            except Exception as tx_error:
+                                            except Exception:
                                                 logger.debug("[nexus] Bulk playlist-sync intelligence write skipped (refill).", exc_info=True)
                                             refilled_count = len(refill_rows)
                                             # Mirror to backup immediately -- see the added_rows snapshot
@@ -10330,7 +10330,7 @@ async def playlist_sync_loop():
             await audio_cache_refs_reconcile()
         except Exception:
             logger.debug("[%s] Post-sync audio cache reconcile failed.", BOT_ENV_PREFIX.lower(), exc_info=True)
-    except Exception as tx_error:
+    except Exception:
         logger.exception("[%s] Playlist sync task failed before guild processing.", BOT_ENV_PREFIX.lower())
     finally:
         playlist_sync_loop._sync_active = False
@@ -10398,12 +10398,12 @@ async def aria_command_listener():
                                         wav_filters = wavelink.Filters()
                                         apply_filter_preset(wav_filters, f_mode)
                                         try: await replace_audio_filters(vc, wav_filters)
-                                        except Exception as tx_error: pass
+                                        except Exception: pass
                     executed = True
 
                 if executed:
                     try: await send_webhook_log(bot.user.name if bot.user else "Unknown Node", "🤖 Aria Override", f"Aria forcefully executed a **{cmd}** command in `{guild.name}`.", discord.Color.purple())
-                    except Exception as tx_error:
+                    except Exception:
                         logger.exception("[nexus] Failed sending Aria override webhook for guild %s.", guild_id)
                 else:
                     logger.info("[nexus] Ignored Aria override %s for guild %s because the player state did not match.", cmd, guild_id)
@@ -10416,7 +10416,7 @@ async def aria_command_listener():
                             await _cleanup_cur.execute("DELETE FROM nexus_swarm_overrides WHERE guild_id = %s AND bot_name = %s", (guild_id, 'nexus'))
                         else:
                             await _cleanup_cur.execute("UPDATE nexus_swarm_overrides SET attempts = COALESCE(attempts, 0) + 1, last_error = %s WHERE guild_id = %s AND bot_name = %s", (f"state_mismatch:{cmd}", guild_id, 'nexus'))
-    except Exception as tx_error:
+    except Exception:
         logger.exception("Aria override listener failed for nexus.")
 
 @bot.event
@@ -10468,7 +10468,7 @@ async def ensure_swarm_command_tables():
                         ]:
                             try:
                                 await cur.execute(stmt)
-                            except Exception as tx_error:
+                            except Exception:
                                 logger.debug("Suppressed exception", exc_info=True)
                                 pass
             swarm_command_tables_ready = True
@@ -10498,7 +10498,7 @@ async def resilience_loop():
                         if _p_lock.locked(): continue
                         try:
                             guild_id = int(_runtime_key(raw_guild_id))
-                        except Exception as tx_error:
+                        except Exception:
                             continue
                         guild = bot.get_guild(guild_id)
                         if guild is None:
@@ -10607,7 +10607,7 @@ async def zombie_reaper_loop():
         try:
             vc = guild.voice_client
             should_inspect = bool(vc and not _player_is_active(vc))
-        except Exception as tx_error:
+        except Exception:
             logger.exception("[nexus] Zombie reaper failed to inspect voice state for guild %s.", getattr(guild, "id", "?"))
             continue
         if should_inspect:
@@ -10657,7 +10657,7 @@ async def zombie_reaper_loop():
                                 else:
                                     playback_tracking.pop(guild.id, None)
                                     await cur.execute("UPDATE nexus_playback_state SET channel_id = NULL, video_url = NULL, title = NULL, position_seconds = 0, is_playing = FALSE, is_paused = FALSE, play_session_key = NULL, track_uid = NULL WHERE guild_id = %s AND bot_name = 'nexus'", (guild.id,))
-            except Exception as tx_error:
+            except Exception:
                 logger.exception("[nexus] Zombie reaper failed for guild %s.", guild.id)
 
 @tasks.loop(hours=24.0)
@@ -10735,7 +10735,7 @@ async def cache_cleanup_loop():
     # queue_shuffle_maintenance_loop, playlist_sync_loop, etc).
     try:
         await clear_local_cache_systems("scheduled_10h")
-    except Exception as tx_error:
+    except Exception:
         logger.exception("[%s] Cache cleanup loop failed.", BOT_ENV_PREFIX.lower())
 
 
@@ -10881,7 +10881,7 @@ async def direct_order_listener():
                                     try:
                                         await send_feedback(guild, discord.Embed(title="🎶 Direct Order Received", description=f"Aria successfully deposited **{added_count}** tracks into my matrix. Booting audio engine...", color=discord.Color.green()))
                                         await send_webhook_log(bot.user.name if bot.user else "Unknown Node", "📥 Matrix Loaded", f"Aria routed a payload of **{added_count}** tracks directly into `{guild.name}`.", discord.Color.blue())
-                                    except Exception as tx_error:
+                                    except Exception:
                                         logger.debug("Suppressed exception", exc_info=True)
                                         pass
                         except Exception as e:
@@ -10974,7 +10974,7 @@ async def direct_order_listener():
                         if cmd == 'RECOVER' and data:
                             details += f" | payload={str(data)[:160]}"
                         await send_webhook_log(bot.user.name if bot.user else "Unknown Node", "🤖 Direct Drone Execution", f"Received and executed direct `{cmd}` order from Aria in `{guild.name}`.{details}", discord.Color.purple())
-                    except Exception as tx_error:
+                    except Exception:
                         logger.exception("[nexus] Failed sending direct order webhook for guild %s.", guild.id)
                 else:
                     logger.info("[nexus] Direct order %s in guild %s completed without state changes.", cmd, guild.id)
@@ -10993,7 +10993,7 @@ async def direct_order_listener():
                                     else:
                                         await _fin_cur.execute("UPDATE nexus_swarm_direct_orders SET attempts = COALESCE(attempts, 0) + 1, last_error = %s, claimed_at = DATE_SUB(NOW(), INTERVAL %s SECOND), claim_token = NULL WHERE id = %s", (f"unexecuted:{cmd}", DIRECT_ORDER_RETRY_BACKDATE_SECONDS, oid))
                                     await _fin_cur.execute("COMMIT")
-                                except Exception as tx_error:
+                                except Exception:
                                     try:
                                         await _fin_cur.execute("ROLLBACK")
                                     except Exception:
@@ -11015,7 +11015,7 @@ async def direct_order_listener():
                         continue
                     raise
 
-    except Exception as tx_error:
+    except Exception:
         logger.exception("Direct order listener failed for nexus.")
 
 @bot.event
@@ -11067,7 +11067,7 @@ class SwarmIntelligence(commands.Cog):
             elif tracked.get("title"):
                 try:
                     started = float(tracked.get("start_time") or 0)
-                except Exception as tx_error:
+                except Exception:
                     started = 0
                 if time.time() - started < 120:
                     reconnect_candidate = (str(tracked["title"]).replace("\n", " ").strip(), guild.name)
@@ -11090,7 +11090,7 @@ class SwarmIntelligence(commands.Cog):
             self._last_presence_state = presence_state
         except (aiohttp.ClientConnectionResetError, ConnectionResetError):
             logger.debug("[%s] Presence update skipped while the gateway transport was closing.", self.bot_name)
-        except Exception as tx_error:
+        except Exception:
             logger.exception("[%s] Status updater failed.", self.bot_name)
 
     @tasks.loop(seconds=30)
@@ -11100,7 +11100,7 @@ class SwarmIntelligence(commands.Cog):
                 async with pool.acquire() as conn:
                     async with conn.cursor() as cur:
                         await cur.execute("INSERT INTO swarm_health (bot_name, status, last_pulse) VALUES (%s, 'HEALTHY', NOW()) ON DUPLICATE KEY UPDATE status=VALUES(status), last_pulse=NOW()", (self.bot_name,))
-        except Exception as tx_error:
+        except Exception:
             logger.exception("[%s] Heartbeat update failed.", self.bot_name)
 
     @tasks.loop(seconds=15)
@@ -11162,7 +11162,7 @@ class SwarmIntelligence(commands.Cog):
                                         track_info['offset'] = current_pos
                                         await send_webhook_log(self.bot.user.name if self.bot.user else "Unknown Node", "⚙️ Watchdog Revival", f"Detected playback stall in `{guild.name}`. Recovering track safely at {current_pos}s.", discord.Color.orange())
                                         schedule_named_task(f"watchdog_recovery_process_queue:{guild.id}", process_queue(guild, track_info.get('channel_id'), start_position=current_pos))
-        except Exception as tx_error:
+        except Exception:
             logger.exception("[nexus] Watchdog tick failed.")
 
     @status_updater.before_loop
@@ -11369,7 +11369,7 @@ async def queue_integrity_check_loop():
                                     allow_recovery_restore=True,
                                 ),
                             )
-    except Exception as tx_error:
+    except Exception:
         logger.exception("[nexus] Queue integrity check loop failed.")
 
 
@@ -11450,7 +11450,7 @@ async def on_ready_error_reporting():
     install_error_reporting()
     try:
         asyncio.get_running_loop().set_exception_handler(_asyncio_exception_handler)
-    except Exception as tx_error:
+    except Exception:
         logger.debug("Suppressed exception", exc_info=True)
         pass
 bot.add_listener(on_ready_error_reporting, 'on_ready')
@@ -11510,7 +11510,7 @@ def main():
     finally:
         try:
             asyncio.run(close_shared_runtime_resources())
-        except Exception as tx_error:
+        except Exception:
             logger.debug("Suppressed exception", exc_info=True)
             pass
 
