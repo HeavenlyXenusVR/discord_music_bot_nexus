@@ -10070,12 +10070,15 @@ async def playlist_sync_loop():
                         logger.warning("[%s] YouTube Data API playlist sync failed for guild %s, falling back to yt-dlp", BOT_ENV_PREFIX.lower(), guild_id, exc_info=True)
                         api_entries = []
                     if api_entries:
-                        return {'entries': api_entries}
+                        return {'entries': api_entries, 'source': 'api'}
             async with semaphore:
-                return await asyncio.wait_for(
+                _ytdlp_data = await asyncio.wait_for(
                     loop.run_in_executor(None, lambda playlist_url=url: _extract_playlist(playlist_url)),
                     timeout=PLAYLIST_SYNC_EXTRACT_TIMEOUT_SECONDS,
                 )
+                if isinstance(_ytdlp_data, dict):
+                    _ytdlp_data['source'] = 'ytdlp'
+                return _ytdlp_data
 
         results = await asyncio.gather(*(_extract_one(row) for row in playlists), return_exceptions=True)
 
@@ -10092,6 +10095,11 @@ async def playlist_sync_loop():
                 known_count = int(known_count or 0)
                 if not current_rows:
                     continue
+                # yt-dlp's flat-playlist fallback deterministically caps out around ~100-205
+                # entries for large playlists regardless of cookies/session (see
+                # _resolve_youtube_playlist_via_api's docstring) -- only an extraction sourced
+                # from the properly-paginating API may be trusted to confirm a real removal.
+                trusted_for_removal = (data.get('source') == 'api')
 
                 _psync_delays = [0.05, 0.1]
                 for _psync_attempt in range(3):
@@ -10137,25 +10145,35 @@ async def playlist_sync_loop():
                                         # INTERVAL apart). Applied per-track rather than as a whole-cycle
                                         # aggregate so small playlists and small/incremental extraction misses
                                         # are covered too, not just catastrophic >=50% drops.
-                                        guild_streaks = playlist_sync_loop._missing_streak.setdefault(guild_id, {})
-                                        for p_key, missing_n in remaining_previous.items():
-                                            if missing_n <= 0:
-                                                continue
-                                            streak = guild_streaks.get(p_key, 0) + 1
-                                            guild_streaks[p_key] = streak
-                                            if streak >= 2:
-                                                removed_counts[p_key] = missing_n
-                                            else:
-                                                logger.info(
-                                                    "[%s] Playlist sync: %sx track missing from this cycle's extraction for guild %s "
-                                                    "(streak %s/2); deferring removal in case it's a transient extraction failure.",
-                                                    BOT_ENV_PREFIX.lower(), missing_n, guild_id, streak,
-                                                )
-                                                carry_forward_rows.extend(previous_row_by_key.get(p_key, [])[:missing_n])
-                                        for row in current_rows:
-                                            guild_streaks.pop(row[3], None)
-                                        if not guild_streaks:
-                                            playlist_sync_loop._missing_streak.pop(guild_id, None)
+                                        if not trusted_for_removal:
+                                            # This cycle came from the yt-dlp fallback, which deterministically
+                                            # truncates large playlists -- every "missing" track here is
+                                            # untrustworthy noise, not evidence of anything. Carry all of them
+                                            # forward without advancing any streak; only an API-sourced cycle
+                                            # gets to judge a track as actually removed.
+                                            for p_key, missing_n in remaining_previous.items():
+                                                if missing_n > 0:
+                                                    carry_forward_rows.extend(previous_row_by_key.get(p_key, [])[:missing_n])
+                                        else:
+                                            guild_streaks = playlist_sync_loop._missing_streak.setdefault(guild_id, {})
+                                            for p_key, missing_n in remaining_previous.items():
+                                                if missing_n <= 0:
+                                                    continue
+                                                streak = guild_streaks.get(p_key, 0) + 1
+                                                guild_streaks[p_key] = streak
+                                                if streak >= 2:
+                                                    removed_counts[p_key] = missing_n
+                                                else:
+                                                    logger.info(
+                                                        "[%s] Playlist sync: %sx track missing from this cycle's extraction for guild %s "
+                                                        "(streak %s/2); deferring removal in case it's a transient extraction failure.",
+                                                        BOT_ENV_PREFIX.lower(), missing_n, guild_id, streak,
+                                                    )
+                                                    carry_forward_rows.extend(previous_row_by_key.get(p_key, [])[:missing_n])
+                                            for row in current_rows:
+                                                guild_streaks.pop(row[3], None)
+                                            if not guild_streaks:
+                                                playlist_sync_loop._missing_streak.pop(guild_id, None)
                                     else:
                                         # First run after this patch: seed the identity snapshot.
                                         # If the old count says the playlist grew, queue only the tail delta.
