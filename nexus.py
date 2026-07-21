@@ -6063,6 +6063,17 @@ async def ensure_voice_connection(guild, channel_id, *, respect_recovery_backoff
             if getattr(voice_client, "channel", None):
                 pending_voice_channels[guild.id] = voice_client.channel.id
 
+            try:
+                target_bitrate = int(guild.bitrate_limit)
+                if channel.bitrate < target_bitrate:
+                    await channel.edit(bitrate=target_bitrate, reason="Raise voice channel bitrate to this server's maximum for best audio quality.")
+                    logger.info(f"[{guild.id}] Raised {channel.name} bitrate to {target_bitrate // 1000}kbps (server max).")
+            except discord.Forbidden:
+                logger.debug(f"[{guild.id}] Lacking Manage Channels permission; cannot raise {channel.name}'s bitrate.")
+            except Exception:
+                logger.debug("Suppressed exception", exc_info=True)
+                pass
+
             if isinstance(channel, discord.StageChannel):
                 if guild.me.voice and guild.me.voice.suppress:
                     try:
@@ -9660,7 +9671,11 @@ def _audio_cache_fetch_and_normalize(cache_id, url, final):
                  # Pace requests so bulk caching doesn't trip YouTube's rate limit.
                  "sleep_interval": AUDIO_CACHE_SLEEP_INTERVAL, "max_sleep_interval": AUDIO_CACHE_SLEEP_INTERVAL_MAX,
                  "sleep_interval_requests": 1,
-                 "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "opus"}]})
+                 # preferredquality only matters when a transcode actually happens (source
+                 # wasn't already Opus) -- ffmpeg's libopus encoder has no sane bitrate default
+                 # without it, so pin it well above any real YouTube source bitrate; when the
+                 # source IS already Opus, yt-dlp does a lossless copy regardless of this value.
+                 "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "opus", "preferredquality": "192"}]})
     produced = None
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
