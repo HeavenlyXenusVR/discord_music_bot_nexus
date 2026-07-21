@@ -16,6 +16,7 @@ import signal
 import yt_dlp
 import aiomysql
 import wavelink
+import redis.asyncio as aioredis
 from discord.ext import commands, tasks
 from discord import app_commands
 import re
@@ -488,6 +489,30 @@ LAVALINK_URI = (
 LAVALINK_PASSWORD = os.getenv(f"{BOT_ENV_PREFIX}_LAVALINK_PASSWORD", DEFAULT_LAVALINK_PASSWORD).strip()
 if not LAVALINK_PASSWORD:
     raise RuntimeError(f"Set {BOT_ENV_PREFIX}_LAVALINK_PASSWORD or LAVALINK_PASSWORD before starting {BOT_ENV_PREFIX.lower()}.")
+# Cross-process locking only (the 13-bot restart-overlap window) -- no data worth persisting.
+REDIS_URL = (
+    os.getenv(f"{BOT_ENV_PREFIX}_REDIS_URL")
+    or os.getenv("REDIS_URL")
+    or "redis://127.0.0.1:6379/0"
+).strip()
+REDIS_LOCK_TIMEOUT_SECONDS = max(5.0, float(os.getenv(f"{BOT_ENV_PREFIX}_REDIS_LOCK_TIMEOUT_SECONDS", os.getenv("REDIS_LOCK_TIMEOUT_SECONDS", "60"))))
+_redis_client = aioredis.Redis.from_url(REDIS_URL, socket_connect_timeout=5)
+
+
+def validate_redis_reachable():
+    """Hard dependency: fail fast at startup (before Discord login) if Redis is unreachable,
+    same posture as the LAVALINK_PASSWORD check above. No silent fallback to in-process
+    locks -- that would defeat the purpose of closing the restart-overlap race."""
+    async def _ping():
+        client = aioredis.Redis.from_url(REDIS_URL, socket_connect_timeout=5)
+        try:
+            await client.ping()
+        finally:
+            await client.aclose()
+    try:
+        asyncio.run(_ping())
+    except Exception as exc:
+        raise RuntimeError(f"Cannot reach Redis at {REDIS_URL} (required for cross-process locking): {exc}") from exc
 
 ERROR_WEBHOOK_URL = (
     os.getenv(f"{BOT_ENV_PREFIX}_ERROR_WEBHOOK_URL", "").strip()
@@ -3258,25 +3283,13 @@ async def build_user_taste_summary(guild_id, user_id):
 
 
 def get_process_queue_lock(guild_id):
-    lock = process_queue_locks.get(guild_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        process_queue_locks[guild_id] = lock
-    return lock
+    return _redis_client.lock(f"nexus:process_queue_lock:{guild_id}", timeout=REDIS_LOCK_TIMEOUT_SECONDS)
 
 def get_track_requeue_lock(guild_id):
-    lock = track_requeue_locks.get(guild_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        track_requeue_locks[guild_id] = lock
-    return lock
+    return _redis_client.lock(f"nexus:track_requeue_lock:{guild_id}", timeout=REDIS_LOCK_TIMEOUT_SECONDS)
 
 def get_voice_connect_lock(guild_id):
-    lock = voice_connect_locks.get(guild_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        voice_connect_locks[guild_id] = lock
-    return lock
+    return _redis_client.lock(f"nexus:voice_connect_lock:{guild_id}", timeout=REDIS_LOCK_TIMEOUT_SECONDS)
 
 def invalidate_position_persist(guild_id):
     last_position_persist.pop(guild_id, None)
@@ -11492,6 +11505,7 @@ bot.add_listener(on_ready_task_registry_log, 'on_ready')
 
 def main():
     validate_runtime_config()
+    validate_redis_reachable()
     install_error_reporting()
     startup_delay = compute_login_startup_delay()
     if startup_delay > 0:
