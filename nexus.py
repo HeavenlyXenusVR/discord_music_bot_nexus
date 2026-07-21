@@ -138,32 +138,44 @@ def _redact_secret_text(value):
     redacted = re.sub(r"(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY|WEBHOOK)[A-Z0-9_]*=)([^\s]+)", r"\1[REDACTED]", redacted)
     return redacted
 
-async def send_webhook_log(bot_name, title, description, color, retries=3, image_url=None, fields=None):
-    if not WEBHOOK_URL or WEBHOOK_URL == 'PASTE_YOUR_NEW_WEBHOOK_URL_HERE':
+async def _dispatch_webhook_embed(url, *, build_embed, username, retries, not_found_log, final_failure_log):
+    if not url or url == 'PASTE_YOUR_NEW_WEBHOOK_URL_HERE':
         return
-
     for attempt in range(retries):
         try:
             async with HTTPSessionManager() as session:
-                webhook = discord.Webhook.from_url(WEBHOOK_URL, session=session)
-                embed = discord.Embed(title=title, description=description, color=color, timestamp=discord.utils.utcnow())
-                embed.set_footer(text="Swarm Network Matrix")
-                if image_url: embed.set_thumbnail(url=image_url)
-                if fields:
-                    for name, value, inline in fields:
-                        embed.add_field(name=name, value=value, inline=inline)
-
-                await webhook.send(embed=embed, username=f"Node: {bot_name.capitalize()}")
+                webhook = discord.Webhook.from_url(url, session=session)
+                embed = build_embed()
+                await webhook.send(embed=embed, username=username)
                 return
         except ValueError:
             logger.error("❌ WEBHOOK ERROR: Malformed Webhook URL.")
             return
         except discord.errors.NotFound:
-            logger.error("❌ WEBHOOK KILLED: Discord deleted your webhook. Create a new one.")
+            not_found_log()
             return
         except Exception as e:
             if attempt < retries - 1: await asyncio.sleep(2 ** attempt)
-            else: logger.error(f"❌ Webhook Dispatch Failed: {_redact_secret_text(e)}")
+            else: final_failure_log(e)
+
+
+async def send_webhook_log(bot_name, title, description, color, retries=3, image_url=None, fields=None):
+    def build_embed():
+        embed = discord.Embed(title=title, description=description, color=color, timestamp=discord.utils.utcnow())
+        embed.set_footer(text="Swarm Network Matrix")
+        if image_url: embed.set_thumbnail(url=image_url)
+        if fields:
+            for name, value, inline in fields:
+                embed.add_field(name=name, value=value, inline=inline)
+        return embed
+    await _dispatch_webhook_embed(
+        WEBHOOK_URL,
+        build_embed=build_embed,
+        username=f"Node: {bot_name.capitalize()}",
+        retries=retries,
+        not_found_log=lambda: logger.error("❌ WEBHOOK KILLED: Discord deleted your webhook. Create a new one."),
+        final_failure_log=lambda e: logger.error(f"❌ Webhook Dispatch Failed: {_redact_secret_text(e)}"),
+    )
 
 async def ensure_database_exists():
     """Create this bot's MariaDB schema before opening the normal pooled connection."""
@@ -558,38 +570,28 @@ async def _persist_error_event(title, description, traceback_text=None, guild_id
 
 
 async def send_error_webhook_log(bot_name, title, description, color=discord.Color.red(), retries=3, fields=None, traceback_text=None):
-    if not ERROR_WEBHOOK_URL or ERROR_WEBHOOK_URL == 'PASTE_YOUR_NEW_WEBHOOK_URL_HERE':
-        return
-
-    for attempt in range(retries):
-        try:
-            async with HTTPSessionManager() as session:
-                webhook = discord.Webhook.from_url(ERROR_WEBHOOK_URL, session=session)
-                embed = discord.Embed(
-                    title=_shorten_error_text(title, 256),
-                    description=_shorten_error_text(description, 3500),
-                    color=color,
-                    timestamp=discord.utils.utcnow(),
-                )
-                embed.set_footer(text="Swarm Error Matrix")
-                if fields:
-                    for name, value, inline in fields:
-                        embed.add_field(name=name, value=_shorten_error_text(value, 1024), inline=inline)
-                if traceback_text:
-                    embed.add_field(name="Traceback", value="```py\n{}\n```".format(_shorten_error_text(traceback_text, 900)), inline=False)
-                await webhook.send(embed=embed, username=f"Error Node: {bot_name.capitalize()}")
-                return
-        except ValueError:
-            logger.error("❌ WEBHOOK ERROR: Malformed Webhook URL.")
-            return
-        except discord.errors.NotFound:
-            logger.warning("[%s] Error webhook no longer exists.", BOT_ENV_PREFIX)
-            return
-        except Exception as exc:
-            if attempt < retries - 1:
-                await asyncio.sleep(2 ** attempt)
-            else:
-                logger.warning("[%s] Error webhook dispatch failed: %s", BOT_ENV_PREFIX, _redact_secret_text(exc))
+    def build_embed():
+        embed = discord.Embed(
+            title=_shorten_error_text(title, 256),
+            description=_shorten_error_text(description, 3500),
+            color=color,
+            timestamp=discord.utils.utcnow(),
+        )
+        embed.set_footer(text="Swarm Error Matrix")
+        if fields:
+            for name, value, inline in fields:
+                embed.add_field(name=name, value=_shorten_error_text(value, 1024), inline=inline)
+        if traceback_text:
+            embed.add_field(name="Traceback", value="```py\n{}\n```".format(_shorten_error_text(traceback_text, 900)), inline=False)
+        return embed
+    await _dispatch_webhook_embed(
+        ERROR_WEBHOOK_URL,
+        build_embed=build_embed,
+        username=f"Error Node: {bot_name.capitalize()}",
+        retries=retries,
+        not_found_log=lambda: logger.warning("[%s] Error webhook no longer exists.", BOT_ENV_PREFIX),
+        final_failure_log=lambda exc: logger.warning("[%s] Error webhook dispatch failed: %s", BOT_ENV_PREFIX, _redact_secret_text(exc)),
+    )
 
 
 async def report_runtime_error(title, error=None, *, description=None, traceback_text=None, guild_id=None, error_type="runtime", level="error"):
@@ -6784,51 +6786,47 @@ async def restore_guild_state(guild_id, state, *, override_backoff=False):
         if not handoff:
             recovering_guilds.discard(target_guild_id)
 
-async def _drsd_fetch_playback(pool, guild_id):
+async def _drsd_fetch_one(pool, sql, guild_id):
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
-            await cur.execute(
-                "SELECT channel_id, position_seconds, is_playing, video_url, title, track_uid "
-                "FROM nexus_playback_state WHERE guild_id = %s AND bot_name = 'nexus' LIMIT 1",
-                (guild_id,),
-            )
+            await cur.execute(sql, (guild_id,))
             return await cur.fetchone()
+
+async def _drsd_fetch_playback(pool, guild_id):
+    return await _drsd_fetch_one(
+        pool,
+        "SELECT channel_id, position_seconds, is_playing, video_url, title, track_uid "
+        "FROM nexus_playback_state WHERE guild_id = %s AND bot_name = 'nexus' LIMIT 1",
+        guild_id,
+    )
 
 async def _drsd_fetch_home(pool, guild_id):
-    async with pool.acquire() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                "SELECT home_vc_id FROM nexus_bot_home_channels WHERE guild_id = %s AND bot_name = 'nexus' LIMIT 1",
-                (guild_id,),
-            )
-            return await cur.fetchone()
+    return await _drsd_fetch_one(
+        pool,
+        "SELECT home_vc_id FROM nexus_bot_home_channels WHERE guild_id = %s AND bot_name = 'nexus' LIMIT 1",
+        guild_id,
+    )
 
 async def _drsd_fetch_voice(pool, guild_id):
-    async with pool.acquire() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                "SELECT COALESCE(connected_channel_id, last_channel_id) FROM nexus_voice_state WHERE guild_id = %s AND bot_name = 'nexus' AND desired_connected = TRUE LIMIT 1",
-                (guild_id,),
-            )
-            return await cur.fetchone()
+    return await _drsd_fetch_one(
+        pool,
+        "SELECT COALESCE(connected_channel_id, last_channel_id) FROM nexus_voice_state WHERE guild_id = %s AND bot_name = 'nexus' AND desired_connected = TRUE LIMIT 1",
+        guild_id,
+    )
 
 async def _drsd_fetch_queue_count(pool, guild_id):
-    async with pool.acquire() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                "SELECT COUNT(*) FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus'",
-                (guild_id,),
-            )
-            return await cur.fetchone()
+    return await _drsd_fetch_one(
+        pool,
+        "SELECT COUNT(*) FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus'",
+        guild_id,
+    )
 
 async def _drsd_fetch_backup_count(pool, guild_id):
-    async with pool.acquire() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                "SELECT COUNT(*) FROM nexus_queue_backup WHERE guild_id = %s AND bot_name = 'nexus'",
-                (guild_id,),
-            )
-            return await cur.fetchone()
+    return await _drsd_fetch_one(
+        pool,
+        "SELECT COUNT(*) FROM nexus_queue_backup WHERE guild_id = %s AND bot_name = 'nexus'",
+        guild_id,
+    )
 
 async def derive_recovery_state_from_db(guild_id):
     async with DBPoolManager() as pool:
@@ -7426,71 +7424,51 @@ async def sethome(interaction: discord.Interaction, channel: discord.VoiceChanne
     invalidate_feature_caches(interaction.guild.id)
     await interaction.followup.send(embed=discord.Embed(title="🏠 Home Set", description=f"Home channel set to {channel.mention}.", color=discord.Color.green()), ephemeral=True)
 
-@bot.tree.command(name="nexus_main_setfeedback", description="Choose the text channel (or thread) for updates, queue actions, and recovery notices.")
-@commands.has_permissions(administrator=True)
-async def setfeedback(interaction: discord.Interaction, channel: discord.TextChannel | discord.Thread):
+async def _do_guild_setting_update(interaction, *, column, value=None, toggle=False):
+    # `column` is always a hardcoded literal at each call site below, never user input --
+    # safe to interpolate into SQL. Do not widen this to accept user-controlled column names.
     await interaction.response.defer(ephemeral=True)
     await ensure_guild_settings(interaction.guild.id)
     async with DBPoolManager() as pool:
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
-                await cur.execute("UPDATE nexus_guild_settings SET feedback_channel_id = %s WHERE guild_id = %s", (channel.id, interaction.guild.id))
+                if toggle:
+                    await cur.execute(f"SELECT {column} FROM nexus_guild_settings WHERE guild_id = %s", (interaction.guild.id,))
+                    res = await cur.fetchone()
+                    value = not res[0] if res else True
+                await cur.execute(f"UPDATE nexus_guild_settings SET {column} = %s WHERE guild_id = %s", (value, interaction.guild.id))
     invalidate_feature_caches(interaction.guild.id)
+    return value
+
+@bot.tree.command(name="nexus_main_setfeedback", description="Choose the text channel (or thread) for updates, queue actions, and recovery notices.")
+@commands.has_permissions(administrator=True)
+async def setfeedback(interaction: discord.Interaction, channel: discord.TextChannel | discord.Thread):
+    await _do_guild_setting_update(interaction, column="feedback_channel_id", value=channel.id)
     await interaction.followup.send(embed=discord.Embed(title="✅ Feedback Channel Set", description=f"Updates will be sent to {channel.mention}.", color=discord.Color.green()), ephemeral=True)
 
 @bot.tree.command(name="nexus_main_djrole", description="Set the server DJ role that can manage restricted playback, queue, and settings commands.")
 @commands.has_permissions(administrator=True)
 async def djrole(interaction: discord.Interaction, role: discord.Role):
-    await interaction.response.defer(ephemeral=True)
-    await ensure_guild_settings(interaction.guild.id)
-    async with DBPoolManager() as pool:
-        async with pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("UPDATE nexus_guild_settings SET dj_role_id = %s WHERE guild_id = %s", (role.id, interaction.guild.id))
-    invalidate_feature_caches(interaction.guild.id)
+    await _do_guild_setting_update(interaction, column="dj_role_id", value=role.id)
     await interaction.followup.send(embed=discord.Embed(description=f"🎧 DJ role set to {role.mention}", color=discord.Color.green()), ephemeral=True)
 
 @bot.tree.command(name="nexus_main_removedj", description="Clear the configured DJ role so only admins or open-access mode can control restricted commands.")
 @commands.has_permissions(administrator=True)
 async def removedj(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    await ensure_guild_settings(interaction.guild.id)
-    async with DBPoolManager() as pool:
-        async with pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("UPDATE nexus_guild_settings SET dj_role_id = NULL WHERE guild_id = %s", (interaction.guild.id,))
-    invalidate_feature_caches(interaction.guild.id)
+    await _do_guild_setting_update(interaction, column="dj_role_id", value=None)
     await interaction.followup.send(embed=discord.Embed(description="DJ role requirements removed.", color=discord.Color.green()), ephemeral=True)
 
 @bot.tree.command(name="nexus_main_djmode", description="Enable or disable Strict DJ Mode so only admins and the DJ role can use control commands.")
 @commands.has_permissions(administrator=True)
 async def toggle_djmode(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    await ensure_guild_settings(interaction.guild.id)
-    async with DBPoolManager() as pool:
-        async with pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("SELECT dj_only_mode FROM nexus_guild_settings WHERE guild_id = %s", (interaction.guild.id,))
-                res = await cur.fetchone()
-                new_val = not res[0] if res else True
-                await cur.execute("UPDATE nexus_guild_settings SET dj_only_mode = %s WHERE guild_id = %s", (new_val, interaction.guild.id))
-    invalidate_feature_caches(interaction.guild.id)
+    new_val = await _do_guild_setting_update(interaction, column="dj_only_mode", toggle=True)
     state = "ENABLED" if new_val else "DISABLED"
     await interaction.followup.send(embed=discord.Embed(description=f"🎧 Strict DJ Mode is now **{state}**.", color=discord.Color.green()), ephemeral=True)
 
 @bot.tree.command(name="nexus_main_247", description="Keep the bot connected and ready in voice channels even after playback ends until you disable it.")
 @commands.has_permissions(administrator=True)
 async def toggle_247(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    await ensure_guild_settings(interaction.guild.id)
-    async with DBPoolManager() as pool:
-        async with pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("SELECT stay_in_vc FROM nexus_guild_settings WHERE guild_id = %s", (interaction.guild.id,))
-                res = await cur.fetchone()
-                new_val = not res[0] if res else True
-                await cur.execute("UPDATE nexus_guild_settings SET stay_in_vc = %s WHERE guild_id = %s", (new_val, interaction.guild.id))
-    invalidate_feature_caches(interaction.guild.id)
+    new_val = await _do_guild_setting_update(interaction, column="stay_in_vc", toggle=True)
     state = "ENABLED" if new_val else "DISABLED"
     await interaction.followup.send(embed=discord.Embed(description=f"🕰️ 24/7 Mode is now **{state}**.", color=discord.Color.green()), ephemeral=True)
 
