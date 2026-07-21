@@ -26,6 +26,31 @@ import subprocess
 import fcntl
 from types import SimpleNamespace
 
+# --- Background task registry (discoverability): every @tasks.loop coroutine in this file,
+# its approximate cadence, and the on_ready listener that starts it. discord.py supports
+# multiple listeners per event via bot.add_listener, so these are started from several
+# differently-named on_ready_* functions scattered across ~9000 lines rather than one place
+# -- grepping for "on_ready" alone won't surface all of them. on_ready_task_registry_log
+# (registered last, near the end of this file) logs each loop's actual .is_running() state
+# once the bot is ready, so a loop that silently failed to start is visible in the logs
+# instead of just absent.
+#   lavalink_health_monitor          30s                                   on_ready_lavalink_health
+#   position_updater                 POSITION_UPDATER_INTERVAL             on_ready (plain)
+#   metrics_heartbeat_loop           METRICS_HEARTBEAT_INTERVAL            on_ready (plain)
+#   audio_cache_eviction_loop        1800s                                 on_ready (plain)
+#   audio_cache_refs_reconcile_loop  AUDIO_CACHE_REFS_RECONCILE_SECONDS    on_ready (plain)
+#   playlist_sync_loop               PLAYLIST_SYNC_INTERVAL                on_ready_sync
+#   aria_command_listener            DIRECT_ORDER_POLL_INTERVAL_SECONDS    on_ready_aria_listener
+#   resilience_loop                  15s                                   on_ready_maintenance
+#   zombie_reaper_loop               5m                                    on_ready_maintenance
+#   database_janitor_loop            24h                                   on_ready_maintenance
+#   queue_shuffle_maintenance_loop   30m                                   on_ready_maintenance
+#   cache_cleanup_loop               CACHE_CLEANUP_INTERVAL_HOURS          on_ready_maintenance
+#   periodic_restart_loop            PERIODIC_RESTART_HOURS                on_ready_maintenance
+#   direct_order_listener            DIRECT_ORDER_POLL_INTERVAL_SECONDS    on_ready_direct_order
+#   queue_integrity_check_loop       30s                                   on_ready_auto_heal
+#   auto_heal_loop                   AUTO_HEAL_INTERVAL                    on_ready_auto_heal
+
 # --- DAVE PROTOCOL MONKEYPATCH (FIXES LAVALINK 4.2.2 E2EE ENCRYPTION) ---
 original_request = aiohttp.ClientSession.request
 original__request = aiohttp.ClientSession._request
@@ -44,11 +69,13 @@ def _resolve_channel_id_for_guild(guild_id: int):
             if voice_client and getattr(voice_client, "channel", None):
                 return str(voice_client.channel.id)
         except Exception as tx_error:
+            logger.debug("Suppressed exception", exc_info=True)
             pass
         try:
             if guild.me and guild.me.voice and guild.me.voice.channel:
                 return str(guild.me.voice.channel.id)
         except Exception as tx_error:
+            logger.debug("Suppressed exception", exc_info=True)
             pass
 
     fallback = pending_voice_channels.get(guild_id)
@@ -82,6 +109,7 @@ def _inject_lavalink_channel_id(method, url, kwargs):
             new_kwargs["json"] = new_payload
             return new_kwargs
     except Exception as tx_error:
+        logger.debug("Suppressed exception", exc_info=True)
         pass
 
     return kwargs
@@ -191,6 +219,7 @@ class DBPoolManager:
             pool.close()
             await pool.wait_closed()
         except Exception as tx_error:
+            logger.debug("Suppressed exception", exc_info=True)
             pass
 
     async def __aenter__(self):
@@ -386,6 +415,7 @@ def _track_title_from_obj(track):
         if value and value.lower() not in {"none", "unknown"}:
             return value
     except Exception as tx_error:
+        logger.debug("Suppressed exception", exc_info=True)
         pass
     return None
 
@@ -399,6 +429,7 @@ def _voice_client_connected(vc):
         if isinstance(value, bool):
             return value
     except Exception as tx_error:
+        logger.debug("Suppressed exception", exc_info=True)
         pass
     return bool(getattr(vc, "channel", None))
 
@@ -1007,6 +1038,7 @@ YTDLP_CACHE_DIR = os.getenv(f"{BOT_ENV_PREFIX}_YTDLP_CACHE_DIR", os.getenv("YTDL
 try:
     os.makedirs(YTDLP_CACHE_DIR, exist_ok=True)
 except Exception as tx_error:
+    logger.debug("Suppressed exception", exc_info=True)
     pass
 SMART_RECENT_HISTORY_LIMIT = max(12, int(os.getenv(f"{BOT_ENV_PREFIX}_SMART_RECENT_HISTORY_LIMIT", os.getenv("SMART_RECENT_HISTORY_LIMIT", "36"))))
 SMART_SEED_POOL_LIMIT = max(10, int(os.getenv(f"{BOT_ENV_PREFIX}_SMART_SEED_POOL_LIMIT", os.getenv("SMART_SEED_POOL_LIMIT", "40"))))
@@ -1033,6 +1065,7 @@ def _cache_get(cache, key, ttl_seconds):
         cache.pop(key, None)
         cache[key] = (value, timestamp)
     except Exception as tx_error:
+        logger.debug("Suppressed exception", exc_info=True)
         pass
     return value
 
@@ -1261,6 +1294,7 @@ def _clear_wavelink_memory_caches():
         elif nodes:
             targets.extend(list(nodes))
     except Exception as tx_error:
+        logger.debug("Suppressed exception", exc_info=True)
         pass
     targets.append(wavelink.Pool)
 
@@ -1313,6 +1347,7 @@ def schedule_named_task(name, coro, overwrite=False):
             try:
                 coro.close()
             except Exception as tx_error:
+                logger.debug("Suppressed exception", exc_info=True)
                 pass
             return existing
     task = asyncio.create_task(coro)
@@ -1442,10 +1477,12 @@ async def request_supervisor_restart(reason: str, *, announce: bool = True):
     try:
         await bot.close()
     except Exception:
+        logger.debug("Suppressed exception", exc_info=True)
         pass
     try:
         await close_shared_runtime_resources()
     except Exception:
+        logger.debug("Suppressed exception", exc_info=True)
         pass
     os._exit(0)
 
@@ -1471,10 +1508,12 @@ async def flush_and_close_for_shutdown(reason: str = "signal"):
     try:
         await bot.close()
     except Exception as tx_error:
+        logger.debug("Suppressed exception", exc_info=True)
         pass
     try:
         await close_shared_runtime_resources()
     except Exception as tx_error:
+        logger.debug("Suppressed exception", exc_info=True)
         pass
     # Always exit, even if resource cleanup raised — otherwise the process can hang
     # after a shutdown signal until the supervisor force-kills it (losing the flush
@@ -1685,6 +1724,7 @@ def _runtime_path(name: str) -> str:
     try:
         os.makedirs(MUSIC_BOT_RUNTIME_DIR, exist_ok=True)
     except Exception as tx_error:
+        logger.debug("Suppressed exception", exc_info=True)
         pass
     return os.path.join(MUSIC_BOT_RUNTIME_DIR, name)
 
@@ -1793,6 +1833,7 @@ def _wait_for_global_discord_login_gate() -> None:
                     os.rmdir(lock_dir)
                     continue
             except Exception as tx_error:
+                logger.debug("Suppressed exception", exc_info=True)
                 pass
             if not warned_shared:
                 logger.info("[%s] Another music bot is reserving the Discord login gate; waiting.", BOT_ENV_PREFIX.lower())
@@ -1828,6 +1869,7 @@ def _wait_for_global_discord_login_gate() -> None:
             try:
                 os.rmdir(lock_dir)
             except Exception as tx_error:
+                logger.debug("Suppressed exception", exc_info=True)
                 pass
 
 def _login_failure_counter_path() -> str:
@@ -1882,6 +1924,7 @@ async def _wait_for_lavalink_tcp(timeout: float = 1.5) -> bool:
         try:
             await writer.wait_closed()
         except Exception as tx_error:
+            logger.debug("Suppressed exception", exc_info=True)
             pass
         return True
     except Exception as tx_error:
@@ -1944,6 +1987,7 @@ def _read_saved_lavalink_session_id():
             sid = open(_LAVALINK_SESSION_FILE).read().strip()
             return sid if len(sid) > 4 else None
     except Exception:
+        logger.debug("Suppressed exception", exc_info=True)
         pass
     return None
 
@@ -2099,6 +2143,7 @@ async def dm_requester_track_dropped(guild, requester_id, title, reason=None):
     try:
         await user.send(embed=embed)
     except Exception:
+        logger.debug("Suppressed exception", exc_info=True)
         pass
 
 
@@ -2501,6 +2546,7 @@ async def save_state(guild_id):
                 try:
                     os.fsync(f.fileno())
                 except Exception as tx_error:
+                    logger.debug("Suppressed exception", exc_info=True)
                     pass
             os.replace(tmp_path, path)
             return True
@@ -2509,6 +2555,7 @@ async def save_state(guild_id):
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
             except Exception as tx_error:
+                logger.debug("Suppressed exception", exc_info=True)
                 pass
             return False
 
@@ -2526,6 +2573,7 @@ async def delete_state(guild_id):
     except FileNotFoundError:
         pass
     except Exception as tx_error:
+        logger.debug("Suppressed exception", exc_info=True)
         pass
 
 async def ensure_guild_settings(guild_id):
@@ -2663,6 +2711,7 @@ def _track_key(video_url, title=None):
             else:
                 raw = urllib.parse.urlunparse((parsed.scheme.lower(), host, parsed.path.rstrip("/"), "", parsed.query, ""))
     except Exception as tx_error:
+        logger.debug("Suppressed exception", exc_info=True)
         pass
     normalized = re.sub(r"\s+", " ", raw.lower()).strip()
     if not normalized:
@@ -2822,6 +2871,7 @@ async def get_or_fetch_track_embedding(cur, url_key, title, video_url=None):
             try:
                 return json.loads(raw)
             except Exception as tx_error:
+                logger.debug("Suppressed exception", exc_info=True)
                 pass
     vector = await fetch_track_embedding_vector(title)
     if vector:
@@ -2832,6 +2882,7 @@ async def get_or_fetch_track_embedding(cur, url_key, title, video_url=None):
                 (url_key, title, video_url, json.dumps(vector)),
             )
         except Exception as tx_error:
+            logger.debug("Suppressed exception", exc_info=True)
             pass
     return vector
 
@@ -3142,6 +3193,7 @@ async def pick_smart_recommendation_track(cur, guild_id, listener_ids=None):
                 recommendation["reason"] = "similar track"
                 return chosen, recommendation
         except Exception as tx_error:
+            logger.debug("Suppressed exception", exc_info=True)
             pass
 
     entries, _playlist_result = await search_playables(recommendation["query"])
@@ -3425,6 +3477,7 @@ def current_track_position(guild_id, now=None):
 
                 return max(reported_position, last_checkpoint)
     except Exception as tx_error:
+        logger.debug("Suppressed exception", exc_info=True)
         pass
 
     if data.get("paused"):
@@ -4183,6 +4236,7 @@ async def snapshot_queue_backup(cur, guild_id):
         try:
             await cur.execute("ROLLBACK")
         except Exception as tx_error:
+            logger.debug("Suppressed exception", exc_info=True)
             pass
         raise
     if skipped_duplicates > 0:
@@ -4322,11 +4376,18 @@ def current_live_queue_claim_key(guild_id):
     return track_key
 
 
-async def dedupe_queue_table_by_track_uid(cur, table_name, *, guild_id=None, bot_name=None):
+async def _dedupe_or_trim_queue_rows(cur, table_name, *, guild_id=None, bot_name=None,
+                                      extra_where=(), select_cols, order_extra,
+                                      key_func, mode, cap=1):
+    """Shared engine behind dedupe_queue_table_by_track_uid, dedupe_queue_table_by_track_key,
+    and trim_queue_duplicate_runs: SELECT candidate rows, compute a per-row (row_id, key) via
+    key_func (returning None to skip a row), and either drop every row after the first with a
+    given key ("dedupe" mode, keeps the lowest id) or drop every row past `cap` occurrences of
+    a given key ("trim" mode, keeps the first `cap` lowest ids). Returns rows deleted."""
     if not re.fullmatch(r"[A-Za-z0-9_]+", table_name):
         raise ValueError(f"Unsafe table name: {table_name}")
 
-    where = ["track_uid IS NOT NULL", "track_uid <> ''"]
+    where = list(extra_where)
     params = []
     if guild_id is not None:
         where.append("guild_id = %s")
@@ -4334,82 +4395,82 @@ async def dedupe_queue_table_by_track_uid(cur, table_name, *, guild_id=None, bot
     if bot_name is not None:
         where.append("bot_name = %s")
         params.append(str(bot_name))
+    where_clause = f"WHERE {' AND '.join(where)}" if where else ""
 
     await cur.execute(
-        f"SELECT id, guild_id, bot_name, track_uid FROM {table_name} WHERE {' AND '.join(where)} ORDER BY guild_id ASC, bot_name ASC, track_uid ASC, id ASC",
+        f"SELECT {select_cols} FROM {table_name} {where_clause} ORDER BY guild_id ASC, bot_name ASC, {order_extra}id ASC",
         tuple(params),
     )
     rows = list(await cur.fetchall() or [])
     if not rows:
         return 0
 
-    seen = set()
-    duplicate_ids = []
-    for row in rows:
-        normalized_uid = _normalize_track_uid(_row_track_uid(row, 3))
-        row_id = _row_value(row, "id", _row_value(row, 0))
-        row_guild_id = int(_row_value(row, "guild_id", _row_value(row, 1, 0)) or 0)
-        row_bot_name = str(_row_value(row, "bot_name", _row_value(row, 2, "")) or "")
-        if not normalized_uid or row_id is None:
-            continue
-        dedupe_key = (row_guild_id, row_bot_name, normalized_uid)
-        if dedupe_key in seen:
-            duplicate_ids.append(int(row_id))
-            continue
-        seen.add(dedupe_key)
+    to_delete_ids = []
+    if mode == "dedupe":
+        seen = set()
+        for row in rows:
+            result = key_func(row)
+            if result is None:
+                continue
+            row_id, key = result
+            if key in seen:
+                to_delete_ids.append(int(row_id))
+                continue
+            seen.add(key)
+    else:
+        counts = {}
+        for row in rows:
+            result = key_func(row)
+            if result is None:
+                continue
+            row_id, key = result
+            counts[key] = counts.get(key, 0) + 1
+            if counts[key] > cap:
+                to_delete_ids.append(int(row_id))
 
     deleted = 0
-    for row_id in duplicate_ids:
+    for row_id in to_delete_ids:
         await cur.execute(f"DELETE FROM {table_name} WHERE id = %s", (row_id,))
         deleted += max(0, int(getattr(cur, "rowcount", 0) or 0))
     return deleted
 
 
+async def dedupe_queue_table_by_track_uid(cur, table_name, *, guild_id=None, bot_name=None):
+    def key_func(row):
+        normalized_uid = _normalize_track_uid(_row_track_uid(row, 3))
+        row_id = _row_value(row, "id", _row_value(row, 0))
+        row_guild_id = int(_row_value(row, "guild_id", _row_value(row, 1, 0)) or 0)
+        row_bot_name = str(_row_value(row, "bot_name", _row_value(row, 2, "")) or "")
+        if not normalized_uid or row_id is None:
+            return None
+        return int(row_id), (row_guild_id, row_bot_name, normalized_uid)
+    return await _dedupe_or_trim_queue_rows(
+        cur, table_name, guild_id=guild_id, bot_name=bot_name,
+        extra_where=["track_uid IS NOT NULL", "track_uid <> ''"],
+        select_cols="id, guild_id, bot_name, track_uid",
+        order_extra="track_uid ASC, ",
+        key_func=key_func, mode="dedupe",
+    )
+
+
 
 async def dedupe_queue_table_by_track_key(cur, table_name, *, guild_id=None, bot_name=None):
     """Remove duplicate rows sharing the same URL/title hash, keeping the lowest id (oldest entry)."""
-    if not re.fullmatch(r"[A-Za-z0-9_]+", table_name):
-        raise ValueError(f"Unsafe table name: {table_name}")
-
-    where = []
-    params = []
-    if guild_id is not None:
-        where.append("guild_id = %s")
-        params.append(int(guild_id))
-    if bot_name is not None:
-        where.append("bot_name = %s")
-        params.append(str(bot_name))
-
-    where_clause = f"WHERE {' AND '.join(where)}" if where else ""
-    await cur.execute(
-        f"SELECT id, guild_id, bot_name, video_url, title FROM {table_name} {where_clause} ORDER BY guild_id ASC, bot_name ASC, id ASC",
-        tuple(params),
-    )
-    rows = list(await cur.fetchall() or [])
-    if not rows:
-        return 0
-
-    seen = set()
-    duplicate_ids = []
-    for row in rows:
+    def key_func(row):
         row_id = _row_value(row, "id", _row_value(row, 0))
         row_guild_id = int(_row_value(row, "guild_id", _row_value(row, 1, 0)) or 0)
         row_bot_name = str(_row_value(row, "bot_name", _row_value(row, 2, "")) or "")
         url = str(_row_value(row, "video_url", _row_value(row, 3, "")) or "")
         title = str(_row_value(row, "title", _row_value(row, 4, "")) or "")
         if row_id is None:
-            continue
-        dedup_key = (row_guild_id, row_bot_name, _track_key(url, title))
-        if dedup_key in seen:
-            duplicate_ids.append(int(row_id))
-            continue
-        seen.add(dedup_key)
-
-    deleted = 0
-    for row_id in duplicate_ids:
-        await cur.execute(f"DELETE FROM {table_name} WHERE id = %s", (row_id,))
-        deleted += max(0, int(getattr(cur, "rowcount", 0) or 0))
-    return deleted
+            return None
+        return int(row_id), (row_guild_id, row_bot_name, _track_key(url, title))
+    return await _dedupe_or_trim_queue_rows(
+        cur, table_name, guild_id=guild_id, bot_name=bot_name,
+        select_cols="id, guild_id, bot_name, video_url, title",
+        order_extra="",
+        key_func=key_func, mode="dedupe",
+    )
 
 
 QUEUE_DUPLICATE_CAP = int(os.getenv("QUEUE_DUPLICATE_CAP", "8"))
@@ -4418,44 +4479,23 @@ QUEUE_DUPLICATE_CAP = int(os.getenv("QUEUE_DUPLICATE_CAP", "8"))
 async def trim_queue_duplicate_runs(cur, table_name, *, guild_id=None, bot_name=None, max_copies=QUEUE_DUPLICATE_CAP):
     """Keep at most max_copies rows per (guild, URL/title), lowest ids first. Collapses
     loop/re-add bloat while leaving small deliberate repeats intact. Returns rows deleted."""
-    if not re.fullmatch(r"[A-Za-z0-9_]+", table_name):
-        raise ValueError(f"Unsafe table name: {table_name}")
     cap = max(1, int(max_copies))
-    where = []
-    params = []
-    if guild_id is not None:
-        where.append("guild_id = %s")
-        params.append(int(guild_id))
-    if bot_name is not None:
-        where.append("bot_name = %s")
-        params.append(str(bot_name))
-    where_clause = f"WHERE {' AND '.join(where)}" if where else ""
-    await cur.execute(
-        f"SELECT id, guild_id, bot_name, video_url, title FROM {table_name} {where_clause} ORDER BY guild_id ASC, bot_name ASC, id ASC",
-        tuple(params),
-    )
-    rows = list(await cur.fetchall() or [])
-    if not rows:
-        return 0
-    counts = {}
-    excess_ids = []
-    for row in rows:
+
+    def key_func(row):
         row_id = _row_value(row, "id", _row_value(row, 0))
         row_guild_id = int(_row_value(row, "guild_id", _row_value(row, 1, 0)) or 0)
         row_bot_name = str(_row_value(row, "bot_name", _row_value(row, 2, "")) or "")
         url = str(_row_value(row, "video_url", _row_value(row, 3, "")) or "")
         title = str(_row_value(row, "title", _row_value(row, 4, "")) or "")
         if row_id is None or not url:
-            continue
-        key = (row_guild_id, row_bot_name, _track_key(url, title))
-        counts[key] = counts.get(key, 0) + 1
-        if counts[key] > cap:
-            excess_ids.append(int(row_id))
-    deleted = 0
-    for row_id in excess_ids:
-        await cur.execute(f"DELETE FROM {table_name} WHERE id = %s", (row_id,))
-        deleted += max(0, int(getattr(cur, "rowcount", 0) or 0))
-    return deleted
+            return None
+        return int(row_id), (row_guild_id, row_bot_name, _track_key(url, title))
+    return await _dedupe_or_trim_queue_rows(
+        cur, table_name, guild_id=guild_id, bot_name=bot_name,
+        select_cols="id, guild_id, bot_name, video_url, title",
+        order_extra="",
+        key_func=key_func, mode="trim", cap=cap,
+    )
 
 
 async def find_existing_queue_row(cur, table_name, guild_id, bot_name, *, track_uid=None, video_url=None, title=None, match_identity=False):
@@ -4502,6 +4542,9 @@ async def delete_live_queue_copies(cur, guild_id, video_url, title, track_uid=No
     different uploads can share a title, and YouTube URL variants can share a
     video id. Select candidate rows first, compare with _track_key(), then
     delete only true identity matches by primary key.
+
+    Fast path: when track_uid is known, use the unique index directly instead
+    of fetching the full guild queue and iterating in Python.
     """
     target_identity = _track_instance_identity(track_uid, video_url, title)
     if not target_identity:
@@ -4631,6 +4674,7 @@ async def shuffle_queue_rows(cur, guild_id, *, preserve_first=True):
         try:
             await cur.execute("ROLLBACK")
         except Exception as tx_error:
+            logger.debug("Suppressed exception", exc_info=True)
             pass
         logger.exception("[nexus] Queue reshuffle transaction failed; live queue was rolled back instead of leaking tracks.")
         raise
@@ -4667,6 +4711,7 @@ async def requeue_finished_track(cur, guild_id, video_url, title, requester_id, 
                     (guild_id, original_uid),
                 )
             except Exception:
+                logger.debug("Suppressed exception", exc_info=True)
                 pass
     return True
 
@@ -4855,6 +4900,7 @@ async def repair_queue_backup_parity(cur, guild_id, *, reason="queue_integrity",
                             (guild_id, old_uid),
                         )
                     except Exception:
+                        logger.debug("Suppressed exception", exc_info=True)
                         pass
         missing_live_rows = genuine_missing
 
@@ -5264,6 +5310,7 @@ def _track_uid_from_obj(track):
             if normalized:
                 return normalized
     except Exception as tx_error:
+        logger.debug("Suppressed exception", exc_info=True)
         pass
     for attr in ("track_uid", "play_session_key"):
         try:
@@ -5295,6 +5342,7 @@ def _apply_track_runtime_extras(track, *, track_uid=None, requester_id=None, que
         if current_extras:
             extras.update(dict(current_extras))
     except Exception as tx_error:
+        logger.debug("Suppressed exception", exc_info=True)
         pass
     normalized_uid = _ensure_track_uid(track_uid) if track_uid else ""
     if normalized_uid:
@@ -5334,6 +5382,7 @@ async def apply_resume_seek(voice_client, guild_id, start_position, *, track_uid
         await asyncio.sleep(0.5)  # brief pause for Lavalink to accept the new player
         await voice_client.seek(target_ms)
     except Exception:
+        logger.debug("Suppressed exception", exc_info=True)
         pass
 
     for attempt in range(1, max_attempts + 1):
@@ -5341,6 +5390,7 @@ async def apply_resume_seek(voice_client, guild_id, start_position, *, track_uid
         try:
             await asyncio.sleep(max(0.75, retry_delay if attempt == 1 else retry_delay))
         except Exception as tx_error:
+            logger.debug("Suppressed exception", exc_info=True)
             pass
         current_identity = _current_player_track_identity(voice_client)
         if expected_identity and current_identity and current_identity != expected_identity and _track_key(video_url, title) != _current_player_track_key(voice_client):
@@ -5831,8 +5881,10 @@ async def clear_voice_channel_status(guild):
         except TypeError:
             pass
         except Exception as tx_error:
+            logger.debug("Suppressed exception", exc_info=True)
             pass
     except Exception as tx_error:
+        logger.debug("Suppressed exception", exc_info=True)
         pass
 
 
@@ -5976,6 +6028,7 @@ async def ensure_voice_connection(guild, channel_id, *, respect_recovery_backoff
                 try:
                     await asyncio.wait_for(voice_client.disconnect(), timeout=10.0)
                 except Exception as tx_error:
+                    logger.debug("Suppressed exception", exc_info=True)
                     pass
                 voice_client = None
 
@@ -6119,6 +6172,7 @@ async def on_wavelink_track_start(payload):
                        getattr(node, "session_id", None), getattr(track, "identifier", None),
                        getattr(track, "length", None), getattr(track, "title", None), getattr(track, "uri", None))
     except Exception:
+        logger.debug("Suppressed exception", exc_info=True)
         pass
 
 
@@ -6334,6 +6388,7 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
                     try:
                         await bot.change_presence(status=discord.Status.online)
                     except Exception as tx_error:
+                        logger.debug("Suppressed exception", exc_info=True)
                         pass
                     if loop_mode != 'queue' and not allow_recovery_restore:
                         await cur.execute("DELETE FROM nexus_queue_backup WHERE guild_id = %s AND bot_name = 'nexus'", (guild.id,))
@@ -6368,6 +6423,22 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
                         logger.info(f"[{guild.id}] Recovered '{title}' using alternate source {resolved_source}.")
                         url = track.uri
                         title = track.title
+                    else:
+                        # Integrity check: resolve_queue_track's direct-URL path returns
+                        # resolved_source == url unconditionally (it echoes the input candidate,
+                        # not track.uri), so this branch never actually confirmed Lavalink handed
+                        # back the SAME video that was requested. Under concurrent load across the
+                        # 13-bot shared Lavalink node, a response can get mismatched to the wrong
+                        # request, silently playing (and recording in playback_state/the panel as
+                        # playing) a different, unrelated video. Verify the returned track's real
+                        # identifier before trusting it.
+                        _expected_id = _audio_cache_id(url)
+                        _actual_id = _audio_cache_id(getattr(track, "uri", "") or "") or getattr(track, "identifier", None)
+                        if _expected_id and _actual_id and _expected_id != _actual_id:
+                            raise ValueError(
+                                f"Track identity mismatch: requested {_expected_id} ('{title}') "
+                                f"but Lavalink returned {_actual_id} ('{getattr(track, 'title', '?')}')"
+                            )
                 except Exception as e:
                     logger.error(f"[{guild.id}] Lavalink search failed for '{title}': {e}")
                     if _is_direct_media_url(url):
@@ -6379,6 +6450,8 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
                         await remember_recovery_state(guild.id, channel_id, 0)
                         clear_live_queue_claim(guild.id, original_queue_url, original_queue_title, track_uid)
                         clear_recovery_retry(guild.id)
+                        if "Track identity mismatch" in str(e):
+                            await asyncio.sleep(TRACK_IDENTITY_MISMATCH_RETRY_DELAY_SECONDS)
                         schedule_named_task(f"skip_unavailable:{guild.id}", process_queue(guild, channel_id))
                         return
                     await requeue_failed_track(cur, guild.id, channel_id, url, title, requester_id, position=start_position, reason="search_failure", track_uid=track_uid)
@@ -6490,6 +6563,7 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
                     if _next_row and _next_row[0]:
                         asyncio.create_task(_prefetch_next_track_bg(guild.id, _next_row[0], _next_row[1] or ""))
                 except Exception:
+                    logger.debug("Suppressed exception", exc_info=True)
                     pass
 
                 if start_position <= 0:
@@ -6504,6 +6578,7 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
                 try:
                     await bot.change_presence(status=discord.Status.online, activity=discord.Activity(type=discord.ActivityType.listening, name=str(title).replace("\\n", " ").strip()[:120]))
                 except Exception as tx_error:
+                    logger.debug("Suppressed exception", exc_info=True)
                     pass
                 playback_tracking[guild.id] = {'start_time': time.monotonic(), 'offset': start_position, 'url': url, 'channel_id': channel_id, 'title': title, 'track_uid': track_uid, 'original_queue_url': original_queue_url, 'original_queue_title': original_queue_title, 'duration': duration, 'speed': c_speed, 'current_filter': filter_mode, 'requester_id': requester_id, 'transition_mode': trans_mode, 'volume': vol, 'paused': False, 'last_position_checkpoint': start_position, 'last_listen_position': start_position, 'listen_seconds_committed': 0}
                 clear_live_queue_claim(guild.id, original_queue_url, original_queue_title, track_uid)
@@ -6606,6 +6681,7 @@ async def stop_playback(guild):
     try:
         await bot.change_presence(status=discord.Status.online, activity=discord.Activity(type=discord.ActivityType.watching, name="the Swarm | Idle"))
     except Exception as tx_error:
+        logger.debug("Suppressed exception", exc_info=True)
         pass
 
 async def restore_guild_state(guild_id, state, *, override_backoff=False):
@@ -6660,6 +6736,7 @@ async def restore_guild_state(guild_id, state, *, override_backoff=False):
                                 channel = guild.get_channel(home_row[0])
                                 vc_id = home_row[0]
             except Exception as tx_error:
+                logger.debug("Suppressed exception", exc_info=True)
                 pass
         if not channel:
             logger.warning(f"[{target_guild_id}] Could not resolve any voice channel (saved or home) for recovery.")
@@ -6872,6 +6949,7 @@ async def auto_heal_loop():
                     if scheduled:
                         logger.info(f"[HEAL] Rejoining/restarting playback for {gid}")
         except Exception as tx_error:
+            logger.debug("Suppressed exception", exc_info=True)
             pass
 
 # --- BOT EVENTS & LAVALINK CONNECTION ---
@@ -7589,6 +7667,7 @@ async def playnext(interaction: discord.Interaction, search: str):
                     try:
                         await cur.execute("ROLLBACK")
                     except Exception as tx_error:
+                        logger.debug("Suppressed exception", exc_info=True)
                         pass
                     logger.exception("[nexus] playnext transaction failed; queue was rolled back instead of leaking tracks.")
                     raise
@@ -7654,6 +7733,7 @@ async def sleep_timer_cmd(interaction: discord.Interaction, minutes: app_command
             try:
                 await channel.send(embed=discord.Embed(title="😴 Sleep Timer", description="Playback stopped — sleep timer elapsed.", color=discord.Color.dark_purple()))
             except Exception as tx_error:
+                logger.debug("Suppressed exception", exc_info=True)
                 pass
         await send_webhook_log(bot.user.name if bot.user else "Unknown Node", "😴 Sleep Timer", f"Guild {guild.name}: sleep timer elapsed, playback stopped.", discord.Color.dark_purple())
 
@@ -7713,6 +7793,7 @@ async def clear(interaction: discord.Interaction):
     try:
         await bot.change_presence(status=discord.Status.online)
     except Exception as tx_error:
+        logger.debug("Suppressed exception", exc_info=True)
         pass
     await interaction.response.send_message(embed=discord.Embed(description="🗑️ Playback stopped and queue cleared.", color=discord.Color.red()), ephemeral=True)
 
@@ -7886,6 +7967,7 @@ async def skipto(interaction: discord.Interaction, index: int):
                         try:
                             await cur.execute("ROLLBACK")
                         except Exception as tx_error:
+                            logger.debug("Suppressed exception", exc_info=True)
                             pass
                         logger.exception("[nexus] skipto transaction failed; live/backup queues rolled back instead of drifting.")
                         raise
@@ -7932,6 +8014,7 @@ async def move(interaction: discord.Interaction, frm: int, to: int):
                         try:
                             await cur.execute("ROLLBACK")
                         except Exception as tx_error:
+                            logger.debug("Suppressed exception", exc_info=True)
                             pass
                         logger.exception("[nexus] move transaction failed; queue was rolled back instead of leaking tracks.")
                         raise
@@ -8583,6 +8666,7 @@ async def filter_cmd(interaction: discord.Interaction, mode: str, stack: str = N
         try:
             await replace_audio_filters(interaction.guild.voice_client, wav_filters)
         except Exception as tx_error:
+            logger.debug("Suppressed exception", exc_info=True)
             pass
     # Update in-memory speed so the progress tracker stays accurate during playback
     if interaction.guild.id in playback_tracking:
@@ -8660,45 +8744,30 @@ async def modify_audio(interaction: discord.Interaction, speed: float = 1.0, pit
     await interaction.followup.send(embed=discord.Embed(title="🎛️ Audio Modifiers Set", description=f"**Speed:** {speed}x\n**Pitch:** {pitch}x\n*Active for the next {duration} track(s).* ", color=discord.Color.gold()), ephemeral=True)
 
 # --- SCRUBBING ---
-@bot.tree.command(name="nexus_main_seek", description="Jump to an exact time in the current track using seconds from the start.")
-async def seek(interaction: discord.Interaction, seconds: int):
+async def _do_seek(interaction, compute_target, response_text):
     if not await is_dj(interaction): return
     if interaction.guild.id not in playback_tracking: return await interaction.response.send_message("Nothing playing.", ephemeral=True)
+    target_seconds = compute_target()
     if interaction.guild.voice_client:
-        await interaction.guild.voice_client.seek(seconds * 1000)
-        await reset_runtime_position_after_seek(interaction.guild.id, seconds, getattr(getattr(interaction.guild.voice_client, "channel", None), "id", None))
-    await interaction.response.send_message(embed=discord.Embed(description=f"Seeked to {seconds}s", color=discord.Color.green()), ephemeral=True)
+        await interaction.guild.voice_client.seek(target_seconds * 1000)
+        await reset_runtime_position_after_seek(interaction.guild.id, target_seconds, getattr(getattr(interaction.guild.voice_client, "channel", None), "id", None))
+    await interaction.response.send_message(embed=discord.Embed(description=response_text, color=discord.Color.green()), ephemeral=True)
+
+@bot.tree.command(name="nexus_main_seek", description="Jump to an exact time in the current track using seconds from the start.")
+async def seek(interaction: discord.Interaction, seconds: int):
+    await _do_seek(interaction, lambda: seconds, f"Seeked to {seconds}s")
 
 @bot.tree.command(name="nexus_main_forward", description="Jump forward within the current track by the number of seconds you provide.")
 async def forward(interaction: discord.Interaction, seconds: int):
-    if not await is_dj(interaction): return
-    if interaction.guild.id not in playback_tracking: return await interaction.response.send_message("Nothing playing.", ephemeral=True)
-    current = current_track_position(interaction.guild.id)
-    new_pos = current + seconds
-    if interaction.guild.voice_client:
-        await interaction.guild.voice_client.seek(new_pos * 1000)
-        await reset_runtime_position_after_seek(interaction.guild.id, new_pos, getattr(getattr(interaction.guild.voice_client, "channel", None), "id", None))
-    await interaction.response.send_message(embed=discord.Embed(description=f"Skipped forward {seconds}s", color=discord.Color.green()), ephemeral=True)
+    await _do_seek(interaction, lambda: current_track_position(interaction.guild.id) + seconds, f"Skipped forward {seconds}s")
 
 @bot.tree.command(name="nexus_main_rewind", description="Jump backward within the current track by the number of seconds you provide.")
 async def rewind(interaction: discord.Interaction, seconds: int):
-    if not await is_dj(interaction): return
-    if interaction.guild.id not in playback_tracking: return await interaction.response.send_message("Nothing playing.", ephemeral=True)
-    current = current_track_position(interaction.guild.id)
-    new_pos = max(0, current - seconds)
-    if interaction.guild.voice_client:
-        await interaction.guild.voice_client.seek(new_pos * 1000)
-        await reset_runtime_position_after_seek(interaction.guild.id, new_pos, getattr(getattr(interaction.guild.voice_client, "channel", None), "id", None))
-    await interaction.response.send_message(embed=discord.Embed(description=f"Rewound {seconds}s", color=discord.Color.green()), ephemeral=True)
+    await _do_seek(interaction, lambda: max(0, current_track_position(interaction.guild.id) - seconds), f"Rewound {seconds}s")
 
 @bot.tree.command(name="nexus_main_replay", description="Restart the current track from the beginning without changing the queue.")
 async def replay(interaction: discord.Interaction):
-    if not await is_dj(interaction): return
-    if interaction.guild.id not in playback_tracking: return await interaction.response.send_message("Nothing playing.", ephemeral=True)
-    if interaction.guild.voice_client:
-        await interaction.guild.voice_client.seek(0)
-        await reset_runtime_position_after_seek(interaction.guild.id, 0, getattr(getattr(interaction.guild.voice_client, "channel", None), "id", None))
-    await interaction.response.send_message(embed=discord.Embed(description="Replaying song.", color=discord.Color.green()), ephemeral=True)
+    await _do_seek(interaction, lambda: 0, "Replaying song.")
 
 # --- UTILITY & INFO ---
 async def build_panel_embed(guild):
@@ -9116,6 +9185,7 @@ async def _db_search_cache_get(cache_key: str):
                     if row:
                         return row["resolved_uri"], row.get("title")
     except Exception:
+        logger.debug("Suppressed exception", exc_info=True)
         pass
     return None
 
@@ -9135,6 +9205,7 @@ async def _db_search_cache_put(cache_key: str, uri: str, title):
                         (cache_key[:128], uri[:2048], (title or "")[:512], ttl_hours),
                     )
     except Exception:
+        logger.debug("Suppressed exception", exc_info=True)
         pass
 
 async def search_playables(query):
@@ -9158,8 +9229,16 @@ async def search_playables(query):
             entries, playlist_result = cached
             import copy
             return [copy.copy(_t) for _t in entries], copy.copy(playlist_result)
-        # DB-backed cache: survives restarts — check before hitting YouTube
+        # DB-backed cache: survives restarts — check before hitting YouTube.
+        # Guard against POISONED entries: during a YouTube rate-limit, a search could return an
+        # unrelated default video ("Opus"/"Livescape Opus 1") which got cached here and then served
+        # to every bot forever, bypassing the live-search title-match guard. Only trust a cached
+        # entry whose stored title still roughly matches the query.
         _db_hit = await _db_search_cache_get(cache_key)
+        if _db_hit is not None and not _titles_roughly_match(cache_key, _db_hit[1]):
+            logger.warning("[%s] Ignoring poisoned search-cache entry %r -> %r.",
+                           BOT_ENV_PREFIX.lower(), cache_key[:40], (_db_hit[1] or "")[:40])
+            _db_hit = None
         if _db_hit is not None:
             _db_uri, _db_title = _db_hit
             try:
@@ -9172,16 +9251,21 @@ async def search_playables(query):
                         _cache_set(SEARCH_RESULT_CACHE, cache_key, (tuple(_db_entries), _db_playlist))
                         return _db_entries, _db_playlist
             except Exception:
+                logger.debug("Suppressed exception", exc_info=True)
                 pass  # DB cache miss/stale — fall through to live search
     if not await ensure_lavalink_ready():
         raise RuntimeError("Lavalink is still starting up. Try again in a few seconds.")
     results = await asyncio.wait_for(wavelink.Playable.search(cleaned), timeout=LAVALINK_SEARCH_TIMEOUT_SECONDS)
     entries, playlist_result = unwrap_search_results(results)
     if cacheable and entries:
-        _cache_set(SEARCH_RESULT_CACHE, cache_key, (tuple(entries), playlist_result))
-        asyncio.get_event_loop().create_task(
-            _db_search_cache_put(cache_key, getattr(entries[0], 'uri', None) or cleaned, getattr(entries[0], 'title', None))
-        )
+        _res_title = getattr(entries[0], 'title', None)
+        # Only cache a result whose title matches the query — never persist a rate-limited
+        # garbage substitution (the source of the recurring "Opus" injection).
+        if _titles_roughly_match(cache_key, _res_title):
+            _cache_set(SEARCH_RESULT_CACHE, cache_key, (tuple(entries), playlist_result))
+            asyncio.get_event_loop().create_task(
+                _db_search_cache_put(cache_key, getattr(entries[0], 'uri', None) or cleaned, _res_title)
+            )
     return entries, playlist_result
 
 def _is_direct_media_url(value):
@@ -9212,6 +9296,11 @@ AUDIO_CACHE_ENABLED = bool(AUDIO_CACHE_DIR) and os.getenv("AUDIO_CACHE_ENABLED",
 AUDIO_CACHE_MAX_BYTES = int(float(os.getenv("AUDIO_CACHE_MAX_GB", "60")) * (1024 ** 3))
 AUDIO_CACHE_CONCURRENCY = max(1, int(os.getenv("AUDIO_CACHE_CONCURRENCY", "2")))
 AUDIO_CACHE_PREDOWNLOAD = os.getenv("AUDIO_CACHE_PREDOWNLOAD", "true").strip().lower() not in {"0", "false", "off", "no"}
+# When a track drops out of a guild's tracked playlist, delete its local cache file as soon as
+# it's confirmed safe (no other bot references it, it's not queued anywhere else on THIS bot,
+# and it isn't the track actively playing right now) instead of waiting for LRU eviction. Kept
+# as a kill-switch: set to false to fall back to the original defer-to-LRU-only behavior.
+AUDIO_CACHE_IMMEDIATE_DELETE = os.getenv("AUDIO_CACHE_IMMEDIATE_DELETE", "true").strip().lower() not in {"0", "false", "off", "no"}
 AUDIO_CACHE_REFS_RECONCILE_SECONDS = max(60, int(os.getenv("AUDIO_CACHE_REFS_RECONCILE_SECONDS", "300")))
 # When YouTube rate-limits downloads, pause scheduling new ones for this long so the throttle
 # can recover instead of being prolonged by a flood of failing requests.
@@ -9705,10 +9794,46 @@ def _audio_cache_evict_blocking():
         return 0
 
 
+def _audio_cache_ids_playing_now():
+    """Cache ids actively playing on this bot right now, across all guilds. Synchronous and
+    DB-free so it can be re-checked immediately before each delete, closing the window between
+    the batched still-needed snapshot below and the actual unlink."""
+    needed = set()
+    for guild in bot.guilds:
+        track = _player_current_track(guild.voice_client)
+        if track is None:
+            continue
+        cid = _cache_id_from_uri(getattr(track, "uri", None) or getattr(track, "identifier", None))
+        if cid:
+            needed.add(cid)
+    return needed
+
+
+async def _audio_cache_ids_still_needed_on_this_bot():
+    """Cache ids this bot must NOT delete right now: anything sitting in its own live or
+    backup queue for ANY guild (a track dropped from one guild's tracked playlist may still be
+    manually /play-queued elsewhere, unrelated to any playlist), plus whatever is actively
+    playing right now. Checked fresh on every reconcile pass so a track blocked here today gets
+    deleted as soon as it's no longer true."""
+    needed = set()
+    async with DBPoolManager() as pool:
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                for queue_table in ("nexus_queue", "nexus_queue_backup"):
+                    await cur.execute(f"SELECT DISTINCT video_url FROM {queue_table} WHERE bot_name = %s", (BOT_ENV_PREFIX.lower(),))
+                    for row in (await cur.fetchall() or []):
+                        cid = _audio_cache_id(_row_value(row, 'video_url', _row_value(row, 0)))
+                        if cid:
+                            needed.add(cid)
+    needed |= _audio_cache_ids_playing_now()
+    return needed
+
+
 async def audio_cache_refs_reconcile():
     """Set THIS bot's cache refs to exactly its current playlists (handles add/remove/clear):
     new playlist videos get a ref + a download; videos no longer in any playlist lose this
-    bot's ref, and are deleted from disk once no bot references them."""
+    bot's ref, and are deleted from disk once no bot references them (see
+    AUDIO_CACHE_IMMEDIATE_DELETE) and nothing on this bot still needs the file."""
     if not AUDIO_CACHE_ENABLED or not AUDIO_CACHE_REFS_DIR:
         return
     tbl = f"{BOT_ENV_PREFIX.lower()}_active_playlist_tracks"
@@ -9725,24 +9850,36 @@ async def audio_cache_refs_reconcile():
     to_add = desired - current
     to_remove = current - desired
 
-    def _apply():
+    still_needed = await _audio_cache_ids_still_needed_on_this_bot() if (AUDIO_CACHE_IMMEDIATE_DELETE and to_remove) else set()
+
+    def _apply_refs():
         for cid in to_add:
             _audio_cache_ref_add(cid)
         for cid in to_remove:
             _audio_cache_ref_remove(cid)
-        # IMPORTANT: never delete audio from here. Immediate ref-based deletion raced with
-        # playback — a file could be removed while a bot was streaming it from disk (the live
-        # queue is broader than this bot's playlist snapshot, and 13 bots share the dir),
-        # producing wrong/"unknown" tracks + a download/delete/re-download storm. Unreferenced
-        # files are reclaimed lazily by the capacity-based LRU eviction, which spares both
-        # referenced files and anything recently played (atime grace).
 
-    await asyncio.to_thread(_apply)
+    await asyncio.to_thread(_apply_refs)
+
+    deleted = []
+    if AUDIO_CACHE_IMMEDIATE_DELETE:
+        for cid in to_remove:
+            if cid in still_needed:
+                continue  # still queued/playing on this bot as of the snapshot above; retry next pass
+            if _audio_cache_has_refs(cid):
+                continue  # another bot's tracked playlist still references this id
+            if cid in _audio_cache_ids_playing_now():
+                continue  # re-checked right before dropping: closes the gap since the snapshot above
+            await asyncio.to_thread(_audio_cache_drop, cid)
+            deleted.append(cid)
+    # Anything not deleted above (immediate delete disabled, still needed, or still
+    # cross-bot referenced) is reclaimed lazily by the capacity-based LRU eviction, which
+    # spares both referenced files and anything recently played (atime grace).
+
     for cid in to_add:
         schedule_audio_cache_download(f"https://www.youtube.com/watch?v={cid}")
     if to_add or to_remove:
-        logger.info("[%s] Audio cache refs reconciled: +%s ref, -%s ref (deletion deferred to LRU eviction).",
-                    BOT_ENV_PREFIX.lower(), len(to_add), len(to_remove))
+        logger.info("[%s] Audio cache refs reconciled: +%s ref, -%s ref, %s file(s) deleted immediately (rest deferred to LRU eviction).",
+                    BOT_ENV_PREFIX.lower(), len(to_add), len(to_remove), len(deleted))
 
 
 @tasks.loop(seconds=AUDIO_CACHE_REFS_RECONCILE_SECONDS)
@@ -9770,6 +9907,12 @@ async def audio_cache_eviction_loop():
 # Retry the exact requested video this many times before a title-search substitution.
 RESOLVE_DIRECT_RETRIES = max(1, int(os.getenv("RESOLVE_DIRECT_RETRIES", "3")))
 RESOLVE_DIRECT_RETRY_DELAY = float(os.getenv("RESOLVE_DIRECT_RETRY_DELAY", "0.5"))
+# A track-identity mismatch (Lavalink returned a different video than requested) is most likely
+# a transient wavelink/Lavalink response-correlation race under concurrent shared-node load, not
+# a genuinely broken video. Pause briefly before moving to the next queue item instead of
+# hammering the shared Lavalink node immediately, which risks perpetuating the same race across
+# the whole queue.
+TRACK_IDENTITY_MISMATCH_RETRY_DELAY_SECONDS = float(os.getenv("TRACK_IDENTITY_MISMATCH_RETRY_DELAY_SECONDS", "4"))
 _TITLE_TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 
@@ -10200,6 +10343,15 @@ async def playlist_sync_loop():
                         await send_webhook_log(bot.user.name if bot.user else "Unknown Node", "📡 Playlist Sync", f"Guild {guild.name}: +{added_count} playlist track(s), -{purged_live} live row(s), -{purged_backup} backup row(s), -{trim_count} loop duplicates, +{refilled_count} refilled.", discord.Color.green())
             except Exception as e:
                 logger.error("[%s] Playlist sync loop failed for guild %s: %s", BOT_ENV_PREFIX.lower(), guild_id, e, exc_info=True)
+
+        # Clean up cache refs/files for anything just dropped from a playlist right away
+        # instead of waiting for audio_cache_refs_reconcile_loop's own timer (up to
+        # AUDIO_CACHE_REFS_RECONCILE_SECONDS later) — this is what makes "removed from the
+        # tracked playlist" promptly mean "removed from this bot's local cache" too.
+        try:
+            await audio_cache_refs_reconcile()
+        except Exception:
+            logger.debug("[%s] Post-sync audio cache reconcile failed.", BOT_ENV_PREFIX.lower(), exc_info=True)
     except Exception as tx_error:
         logger.exception("[%s] Playlist sync task failed before guild processing.", BOT_ENV_PREFIX.lower())
     finally:
@@ -10339,6 +10491,7 @@ async def ensure_swarm_command_tables():
                             try:
                                 await cur.execute(stmt)
                             except Exception as tx_error:
+                                logger.debug("Suppressed exception", exc_info=True)
                                 pass
             swarm_command_tables_ready = True
             swarm_command_tables_retry_after = 0.0
@@ -10751,6 +10904,7 @@ async def direct_order_listener():
                                         await send_feedback(guild, discord.Embed(title="🎶 Direct Order Received", description=f"Aria successfully deposited **{added_count}** tracks into my matrix. Booting audio engine...", color=discord.Color.green()))
                                         await send_webhook_log(bot.user.name if bot.user else "Unknown Node", "📥 Matrix Loaded", f"Aria routed a payload of **{added_count}** tracks directly into `{guild.name}`.", discord.Color.blue())
                                     except Exception as tx_error:
+                                        logger.debug("Suppressed exception", exc_info=True)
                                         pass
                         except Exception as e:
                             logger.error(f"Direct Play Extractor Error: {e}")
@@ -10865,6 +11019,7 @@ async def direct_order_listener():
                                     try:
                                         await _fin_cur.execute("ROLLBACK")
                                     except Exception:
+                                        logger.debug("Suppressed exception", exc_info=True)
                                         pass
                                     raise
                     break
@@ -11318,8 +11473,43 @@ async def on_ready_error_reporting():
     try:
         asyncio.get_running_loop().set_exception_handler(_asyncio_exception_handler)
     except Exception as tx_error:
+        logger.debug("Suppressed exception", exc_info=True)
         pass
 bot.add_listener(on_ready_error_reporting, 'on_ready')
+
+
+@bot.event
+async def on_ready_task_registry_log():
+    """Log every registered background loop's actual .is_running() state once the bot is
+    ready, so a loop that silently failed to start is visible in the logs instead of just
+    absent. Registered last in the on_ready listener chain (see the task registry comment
+    near the top of this file) so every other on_ready_* handler has already had a chance
+    to call .start() on its loops."""
+    registry = [
+        ("lavalink_health_monitor", lavalink_health_monitor),
+        ("position_updater", position_updater),
+        ("metrics_heartbeat_loop", metrics_heartbeat_loop),
+        ("audio_cache_eviction_loop", audio_cache_eviction_loop),
+        ("audio_cache_refs_reconcile_loop", audio_cache_refs_reconcile_loop),
+        ("playlist_sync_loop", playlist_sync_loop),
+        ("aria_command_listener", aria_command_listener),
+        ("resilience_loop", resilience_loop),
+        ("zombie_reaper_loop", zombie_reaper_loop),
+        ("database_janitor_loop", database_janitor_loop),
+        ("queue_shuffle_maintenance_loop", queue_shuffle_maintenance_loop),
+        ("cache_cleanup_loop", cache_cleanup_loop),
+        ("periodic_restart_loop", periodic_restart_loop),
+        ("direct_order_listener", direct_order_listener),
+        ("queue_integrity_check_loop", queue_integrity_check_loop),
+        ("auto_heal_loop", auto_heal_loop),
+    ]
+    not_running = [name for name, loop in registry if not loop.is_running()]
+    logger.info(
+        "[%s] Background task registry: %s/%s loops running.%s",
+        BOT_ENV_PREFIX.lower(), len(registry) - len(not_running), len(registry),
+        f" NOT running: {', '.join(not_running)}" if not_running else "",
+    )
+bot.add_listener(on_ready_task_registry_log, 'on_ready')
 
 
 def main():
@@ -11343,6 +11533,7 @@ def main():
         try:
             asyncio.run(close_shared_runtime_resources())
         except Exception as tx_error:
+            logger.debug("Suppressed exception", exc_info=True)
             pass
 
 if __name__ == "__main__":
