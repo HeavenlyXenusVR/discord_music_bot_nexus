@@ -205,6 +205,7 @@ function Lavalink:connect()
       if ok2 then
         if msg.op == "ready" then
           self.session_id = msg.sessionId
+          print("[lavalink] session ready: " .. tostring(self.session_id))
         end
         self:emit(msg.op, msg)
       end
