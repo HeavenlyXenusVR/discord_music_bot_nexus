@@ -183,9 +183,18 @@ function Gateway:connect()
     return self:connect()
   end
 
+  local my_ws = self.ws
   copas.addthread(function()
-    while self.should_run do
-      local message, opcode, was_clean = self.ws:receive()
+    -- Bind this thread to the socket it started with (my_ws), not the live
+    -- self.ws field. handle_message() can trigger self:reconnect() inline
+    -- (OP.RECONNECT) which reassigns self.ws and spawns a NEW reader thread
+    -- while this thread's while-loop is still running -- without this guard
+    -- both threads end up calling receive() on the same socket concurrently,
+    -- corrupting frame reassembly (surfaces as cjson.decode errors like
+    -- "Expected the end but found invalid token").
+    while self.should_run and self.ws == my_ws do
+      local message, opcode, was_clean = my_ws:receive()
+      if self.ws ~= my_ws then return end
       if not message then
         print("[gateway] connection lost, reconnecting")
         self:reconnect(true)
