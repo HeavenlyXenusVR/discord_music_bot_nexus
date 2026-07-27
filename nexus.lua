@@ -408,10 +408,29 @@ local function resolved_display_name(interaction, uid)
 end
 
 local ADMINISTRATOR_BIT = 8
+
+local guild_owner_cache = {} -- guild_id -> owner user_id
+
+local function get_guild_owner_id(guild_id)
+  if not guild_id then return nil end
+  local cached = guild_owner_cache[guild_id]
+  if cached then return cached end
+  local g = bot.rest:get("/guilds/" .. tostring(guild_id))
+  local owner_id = g and g.owner_id
+  if owner_id then guild_owner_cache[guild_id] = owner_id end
+  return owner_id
+end
+
 local function is_admin(interaction)
   local perms = interaction.member and tonumber(interaction.member.permissions)
-  if not perms then return false end
-  return math.floor(perms / ADMINISTRATOR_BIT) % 2 == 1
+  if perms and math.floor(perms / ADMINISTRATOR_BIT) % 2 == 1 then return true end
+  -- The guild owner always effectively has admin, but Discord's resolved
+  -- member.permissions bitfield on the interaction has been observed to not
+  -- reliably reflect that -- fall back to an explicit ownership check
+  -- rather than ever locking the actual owner out of admin-gated commands.
+  local uid = interaction.member and interaction.member.user and interaction.member.user.id
+  local owner_id = uid and get_guild_owner_id(interaction.guild_id)
+  return owner_id ~= nil and tostring(owner_id) == tostring(uid)
 end
 
 local function require_admin(interaction)
