@@ -957,7 +957,57 @@ local function ensure_voice(guild_id, channel_id)
   mark_voice_connected(guild_id, channel_id)
 end
 
+-- Port of alucard.py's update_stage_topic/clear_voice_channel_status: without
+-- this, a stage channel just sits showing "waiting" in Discord's UI and the
+-- member list never shows what's playing, even though audio is flowing fine
+-- -- these are purely cosmetic Discord-side signals, not required for audio,
+-- but users expect them. Channel type is memoized since it never changes.
+local channel_kind_cache = {} -- channel_id -> "stage" | "voice"
+local last_stage_topic = {}   -- guild_id -> last topic string sent (dedup)
+
+local function get_channel_kind(channel_id)
+  if not channel_id then return "voice" end
+  local cached = channel_kind_cache[channel_id]
+  if cached then return cached end
+  local ch = bot.rest:get("/channels/" .. tostring(channel_id))
+  local kind = (ch and ch.type == 13) and "stage" or "voice"
+  channel_kind_cache[channel_id] = kind
+  return kind
+end
+
+local function update_stage_topic(guild_id, channel_id, title)
+  if not channel_id then return end
+  local ok, err = pcall(function()
+    local safe_title = tostring(title or "Unknown Track"):gsub("\n", " "):sub(1, 60)
+    local topic = "\240\159\142\181 " .. safe_title
+    if last_stage_topic[guild_id] == topic then return end
+    if get_channel_kind(channel_id) == "stage" then
+      local patched = bot.rest:patch("/stage-instances/" .. tostring(channel_id), { topic = topic })
+      if not patched then
+        bot.rest:post("/stage-instances", { channel_id = tostring(channel_id), topic = topic, privacy_level = 2 })
+      end
+    else
+      bot.rest:patch("/channels/" .. tostring(channel_id), { status = topic })
+    end
+    last_stage_topic[guild_id] = topic
+  end)
+  if not ok then print(("[nexus] stage/voice topic update failed for %s: %s"):format(tostring(guild_id), tostring(err))) end
+end
+
+local function clear_stage_topic(guild_id, channel_id)
+  last_stage_topic[guild_id] = nil
+  if not channel_id then return end
+  pcall(function()
+    if get_channel_kind(channel_id) == "stage" then
+      bot.rest:delete("/stage-instances/" .. tostring(channel_id))
+    else
+      bot.rest:patch("/channels/" .. tostring(channel_id), { status = cjson.null })
+    end
+  end)
+end
+
 local function leave_voice(guild_id)
+  clear_stage_topic(guild_id, voice_channel[guild_id])
   bot.gateway:leave_voice(guild_id)
   voice_channel[guild_id] = nil
   if bot.lavalink and bot.lavalink.session_id then
@@ -1207,6 +1257,8 @@ local function process_queue_inner(guild_id, channel_id)
 
   bot.lavalink:update_player(guild_id, { volume = start_vol, filters = filters })
   bot.lavalink:play(guild_id, track.encoded)
+
+  update_stage_topic(guild_id, channel_id, title)
 
   fade_token[guild_id] = (fade_token[guild_id] or 0) + 1
   playback[guild_id] = {
