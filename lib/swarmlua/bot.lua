@@ -66,6 +66,9 @@ function Bot:_wire_voice_to_lavalink()
     if d.user_id == self.user_id then
       self.voice_state[d.guild_id] = self.voice_state[d.guild_id] or {}
       self.voice_state[d.guild_id].session_id = d.session_id
+      if d.channel_id and d.channel_id ~= cjson.null then
+        self.voice_state[d.guild_id].channel_id = d.channel_id
+      end
       -- Joining a stage channel (as opposed to a regular voice channel)
       -- drops the bot in as a suppressed audience member by default -- no
       -- audio goes out even though Lavalink is playing fine -- unless it's
@@ -81,11 +84,15 @@ function Bot:_wire_voice_to_lavalink()
   self.gateway:on("VOICE_SERVER_UPDATE", function(d)
     local vs = self.voice_state[d.guild_id]
     if vs and vs.session_id and self.lavalink then
-      self.lavalink:send_voice_update(d.guild_id, {
+      local ok, err = self.lavalink:send_voice_update(d.guild_id, {
         token = d.token,
         endpoint = d.endpoint,
         session_id = vs.session_id,
+        channel_id = vs.channel_id,
       })
+      if not ok then
+        print(("[bot] voice update failed for guild %s: %s"):format(tostring(d.guild_id), tostring(err)))
+      end
     end
   end)
 end

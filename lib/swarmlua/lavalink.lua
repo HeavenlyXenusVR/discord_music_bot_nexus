@@ -145,8 +145,18 @@ end
 -- Called with the {token, endpoint, session_id} assembled from the bot's
 -- VOICE_SERVER_UPDATE + VOICE_STATE_UPDATE gateway events.
 function Lavalink:send_voice_update(guild_id, voice)
+  -- Lavalink 4.2.2's VoiceState schema requires channelId in addition to
+  -- token/endpoint/sessionId (older versions didn't). Without it this PATCH
+  -- 400s server-side (HttpMessageNotReadableException: "Field 'channelId' is
+  -- required") and Lavalink never gets valid voice credentials at all -- no
+  -- real UDP voice connection is ever established, so nothing plays, even
+  -- though the bot's own queue/playback-state bookkeeping has no idea
+  -- anything went wrong.
   return self:update_player(guild_id, {
-    voice = { token = voice.token, endpoint = voice.endpoint, sessionId = voice.session_id },
+    voice = {
+      token = voice.token, endpoint = voice.endpoint,
+      sessionId = voice.session_id, channelId = voice.channel_id,
+    },
   })
 end
 
