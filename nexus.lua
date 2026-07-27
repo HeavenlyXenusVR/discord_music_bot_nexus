@@ -2689,7 +2689,16 @@ end
 ------------------------------------------------------------------------
 bot.gateway:on("READY", function(_)
   copas.addthread(function()
-    copas.sleep(3) -- let the gateway settle / guild cache populate
+    -- Wait for the Lavalink websocket to actually be connected before
+    -- touching the queue -- process_queue deletes each row before resolving
+    -- it, so racing this against Lavalink's own (often slow, cold-start)
+    -- connect meant every "no response from Lavalink" failure permanently
+    -- destroyed that queued track instead of just skipping playback.
+    local waited = 0
+    while not (bot.lavalink and bot.lavalink.session_id) and waited < 60 do
+      copas.sleep(1)
+      waited = waited + 1
+    end
     local homes = dbq("SELECT guild_id::text AS guild_id, home_vc_id::text AS home_vc_id FROM nexus_bot_home_channels WHERE bot_name = 'nexus'") or {}
     for _, h in ipairs(homes) do
       if queue_count(h.guild_id) > 0 and not playback[h.guild_id] then
