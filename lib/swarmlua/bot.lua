@@ -16,6 +16,7 @@ local Gateway = require("swarmlua.gateway")
 local Rest = require("swarmlua.rest")
 local Lavalink = require("swarmlua.lavalink")
 local Pg = require("swarmlua.pg")
+local cjson = require("cjson")
 
 local Bot = {}
 Bot.__index = Bot
@@ -65,6 +66,16 @@ function Bot:_wire_voice_to_lavalink()
     if d.user_id == self.user_id then
       self.voice_state[d.guild_id] = self.voice_state[d.guild_id] or {}
       self.voice_state[d.guild_id].session_id = d.session_id
+      -- Joining a stage channel (as opposed to a regular voice channel)
+      -- drops the bot in as a suppressed audience member by default -- no
+      -- audio goes out even though Lavalink is playing fine -- unless it's
+      -- explicitly unsuppressed. Regular voice channels never set
+      -- suppress=true, so this is a no-op there.
+      if d.suppress and d.channel_id and d.channel_id ~= cjson.null then
+        self.rest:patch(("/guilds/%s/voice-states/@me"):format(d.guild_id), {
+          channel_id = d.channel_id, suppress = false,
+        })
+      end
     end
   end)
   self.gateway:on("VOICE_SERVER_UPDATE", function(d)
