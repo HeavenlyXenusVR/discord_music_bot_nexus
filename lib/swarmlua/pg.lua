@@ -56,12 +56,29 @@ function Pg:query(sql, ...)
 
   local res, err2 = self.conn:query(sql)
   if res == nil then
-    -- connection may have dropped; retry once
-    self.conn = nil
-    local ok2 = self:ensure()
-    if not ok2 then return nil, err2 end
-    res, err2 = self.conn:query(sql)
-    if res == nil then return nil, err2 end
+    -- BUGFIX: this used to treat ANY nil result as "connection dropped" and
+    -- force a reconnect unconditionally -- including plain Postgres ERROR
+    -- responses (bad SQL, a constraint/type violation, etc.) on an
+    -- otherwise-perfectly-live connection. Harmless for a one-off error, but
+    -- a bug that makes the same query fail on every call in a tight loop
+    -- (e.g. a column-length violation hit once per row while inserting
+    -- hundreds of rows) reconnected on every single failure, opening a new
+    -- Postgres backend connection each time -- fast enough to exhaust
+    -- max_connections for the whole swarm (13 bots + the panel all share
+    -- this instance) well before anyone notices the original bug. pgmoon
+    -- tears down its own socket (self.conn.sock becomes falsy) on a genuine
+    -- I/O-level connection loss, so that's the actual signal to reconnect
+    -- on -- a live socket with a nil query result is just a real error to
+    -- hand back to the caller.
+    if not self.conn.sock then
+      self.conn = nil
+      local ok2 = self:ensure()
+      if not ok2 then return nil, err2 end
+      res, err2 = self.conn:query(sql)
+      if res == nil then return nil, err2 end
+    else
+      return nil, err2
+    end
   end
   return res
 end
