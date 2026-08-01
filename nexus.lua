@@ -66,6 +66,58 @@ local function env(name, default)
   return v
 end
 
+-- File-based logging was entirely missing from this bot (stdout-only, so
+-- anything not caught live via `docker logs` was gone on the next log
+-- rotation/restart) -- unlike alucard.py's RotatingFileHandler, which every
+-- Python-era bot had. Rather than hand-migrate every existing print() call
+-- site (large, error-prone for one pass), print itself is wrapped here so
+-- every call -- old and new -- is transparently timestamped, tagged, and
+-- persisted to a rotating file (same 10MB x 5 backups policy as the other
+-- bots' logline()/LOG_FILE and Lavalink's logback config), with zero change
+-- to any call site's behavior or arguments.
+local LOG_DIR = env("NEXUS_LOG_DIR", env("MUSIC_BOT_LOG_DIR", "/app/logs"))
+pcall(function() os.execute("mkdir -p '" .. LOG_DIR .. "'") end)
+local LOG_FILE = LOG_DIR .. "/nexus.log"
+local LOG_MAX_BYTES = tonumber(env("MUSIC_BOT_LOG_MAX_BYTES", "10485760")) or 10485760
+local LOG_BACKUP_COUNT = tonumber(env("MUSIC_BOT_LOG_BACKUP_COUNT", "5")) or 5
+
+local function rotate_log_if_needed()
+  local f = io.open(LOG_FILE, "r")
+  if not f then return end
+  local size = f:seek("end")
+  f:close()
+  if not size or size < LOG_MAX_BYTES then return end
+  for i = LOG_BACKUP_COUNT - 1, 1, -1 do
+    os.rename(LOG_FILE .. "." .. i, LOG_FILE .. "." .. (i + 1))
+  end
+  os.rename(LOG_FILE, LOG_FILE .. ".1")
+end
+
+local raw_print = print
+local function logline(level, fmt, ...)
+  local ok, msg = pcall(string.format, fmt, ...)
+  if not ok then msg = fmt end
+  local line = string.format("%s %-5s nexus %s", os.date("%Y-%m-%d %H:%M:%S"), level, msg)
+  raw_print(line)
+  rotate_log_if_needed()
+  local f = io.open(LOG_FILE, "a")
+  if f then f:write(line .. "\n"); f:close() end
+end
+local function log_info(fmt, ...) logline("INFO", fmt, ...) end
+local function log_warn(fmt, ...) logline("WARN", fmt, ...) end
+local function log_error(fmt, ...) logline("ERROR", fmt, ...) end
+
+-- Existing print("[bot] message") calls throughout this file already embed
+-- their own tag/timestamp-free format; route them through the same
+-- rotating file (tagged INFO, since plain print() carries no level) instead
+-- of rewriting every call site.
+print = function(...)
+  local n = select("#", ...)
+  local parts = {{}}
+  for i = 1, n do parts[i] = tostring((select(i, ...))) end
+  logline("INFO", "%s", table.concat(parts, "\t"))
+end
+
 local BOT_NAME = "nexus"
 local TOKEN = env("NEXUS_DISCORD_TOKEN", "")
 if TOKEN == "" then
@@ -2687,7 +2739,18 @@ end
 -- before a restart. This is a deliberately simple stand-in for nexus.py's
 -- elaborate multi-stage recovery/backoff/checkpoint system.
 ------------------------------------------------------------------------
+-- BUGFIX: the Discord gateway sends a fresh READY (not RESUMED) on every
+-- invalidated session -- routine reconnects, not just process restarts --
+-- and this handler used to redo its full boot-resume/background-loop-spawn
+-- pass every single time, which both force-restarted/discarded queued
+-- tracks on reconnect and piled up duplicate background loops. Gate on
+-- did_initial_ready so it runs exactly once per process (matching what it was
+-- actually written for).
+local did_initial_ready = false
+
 bot.gateway:on("READY", function(_)
+  if did_initial_ready then return end
+  did_initial_ready = true
   copas.addthread(function()
     -- Wait for the Lavalink websocket to actually be connected before
     -- touching the queue -- process_queue deletes each row before resolving
@@ -2730,6 +2793,53 @@ bot.gateway:on("READY", function(_)
       copas.sleep(6 * 3600)
       local ok, err = pcall(dbq, "DELETE FROM nexus_error_events WHERE created_at < NOW() - INTERVAL '30 days'")
       if not ok then print("[nexus] error_events cleanup failed: " .. tostring(err)) end
+    end
+  end)
+
+  -- SwarmPanel/Aria remote-control bridge -- was entirely missing, so the
+  -- panel's PAUSE/RESUME/SKIP/STOP/RESTART buttons silently did nothing for
+  -- this bot. Same poll-and-execute-then-delete pattern as alucard.lua/
+  -- gws.lua/sapphire.lua.
+  copas.addthread(function()
+    while true do
+      copas.sleep(10)
+      local ok, err = pcall(function()
+        local rows = dbq("SELECT guild_id, command FROM nexus_swarm_overrides WHERE bot_name = 'nexus'") or {}
+        for _, row in ipairs(rows) do
+          local guild_id = tostring(row.guild_id)
+          local cmd_name = (row.command or ""):upper()
+          local executed = false
+          if cmd_name == "RESTART" then
+            dbq("DELETE FROM nexus_swarm_overrides WHERE guild_id = %s AND bot_name = 'nexus'", guild_id)
+            send_webhook_log("\240\159\164\150 Aria Override", "Aria requested a restart.", COLOR.purple)
+            os.exit(0)
+          elseif cmd_name == "PAUSE" and playback[guild_id] and not playback[guild_id].paused then
+            playback[guild_id].paused = true
+            playback[guild_id].offset = current_position(guild_id)
+            bot.lavalink:set_paused(guild_id, true)
+            executed = true
+          elseif cmd_name == "RESUME" and playback[guild_id] and playback[guild_id].paused then
+            playback[guild_id].paused = false
+            playback[guild_id].start_time = socket.gettime()
+            bot.lavalink:set_paused(guild_id, false)
+            executed = true
+          elseif cmd_name == "SKIP" and playback[guild_id] then
+            bot.lavalink:stop(guild_id)
+            executed = true
+          elseif cmd_name == "STOP" then
+            do_stop(guild_id)
+            executed = true
+          end
+          if executed then
+            send_webhook_log("\240\159\164\150 Aria Override", ("Aria executed **%s** in guild %s."):format(cmd_name, guild_id), COLOR.purple)
+          end
+          dbq("DELETE FROM nexus_swarm_overrides WHERE guild_id = %s AND bot_name = 'nexus' AND command = %s", guild_id, row.command)
+        end
+      end)
+      if not ok then
+        print("[nexus] swarm override poll error: " .. tostring(err))
+        report_error(nil, "runtime", "swarm override poll error", tostring(err))
+      end
     end
   end)
 
