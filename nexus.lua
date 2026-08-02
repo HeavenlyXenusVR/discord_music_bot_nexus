@@ -1589,6 +1589,11 @@ local function process_queue_inner(guild_id, channel_id)
     resolve_attempts[retry_key] = nil
     print(("[nexus] giving up on '%s' in guild %s after %d failed resolves: %s"):format(tostring(title), guild_id, attempts, tostring(terr)))
     report_error(guild_id, "runtime", "track resolve failed permanently", ("%s: %s"):format(tostring(title), tostring(terr)))
+    -- Yield before recursing -- see gws.lua's identical fix for why: a
+    -- queue full of permanently-broken tracks could otherwise recurse with
+    -- no yield point, spinning the CPU and starving this bot's own
+    -- heartbeat thread.
+    copas.sleep(0.25)
     return process_queue(guild_id, channel_id)
   end
   resolve_attempts[retry_key] = nil
