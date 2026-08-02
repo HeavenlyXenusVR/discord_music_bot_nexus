@@ -1029,12 +1029,24 @@ local function mark_voice_disconnected(guild_id)
 end
 
 local function ensure_voice(guild_id, channel_id)
-  if voice_channel[guild_id] ~= channel_id then
+  -- Used to key off voice_channel[guild_id] (a local "we already called
+  -- join" cache) and skip the join+wait entirely once it matched, with no
+  -- check of the actual live session -- a stale cache entry (e.g. after a
+  -- LEAVE/RECOVER cycle, or a link that silently died) meant this returned
+  -- immediately doing nothing, and callers never checked a return value
+  -- anyway, so a dead voice link looked identical to a working one.
+  if voice_channel[guild_id] ~= channel_id
+      or not (bot.voice_state[guild_id] and bot.voice_state[guild_id].session_id) then
     bot.gateway:join_voice(guild_id, channel_id, false, true) -- self_mute=false, self_deaf=true
     voice_channel[guild_id] = channel_id
-    copas.sleep(1.5) -- give the voice-server handshake time to reach Lavalink
+    local waited = 0
+    while waited < 8 and not (bot.voice_state[guild_id] and bot.voice_state[guild_id].session_id) do
+      copas.sleep(0.25)
+      waited = waited + 0.25
+    end
   end
   mark_voice_connected(guild_id, channel_id)
+  return bot.voice_state[guild_id] and bot.voice_state[guild_id].session_id ~= nil
 end
 
 -- Port of alucard.py's update_stage_topic/clear_voice_channel_status: without
@@ -1581,7 +1593,11 @@ local function process_queue_inner(guild_id, channel_id)
   end
   resolve_attempts[retry_key] = nil
 
-  ensure_voice(guild_id, channel_id)
+  if not ensure_voice(guild_id, channel_id) then
+    print(("[nexus] [%s] Voice connection unavailable; requeueing '%s'"):format(tostring(guild_id), tostring(title)))
+    insert_queue_front(guild_id, url, title, requester_id, track_uid)
+    return
+  end
 
   local filters = {}
   local speed = 1.0
@@ -1605,7 +1621,12 @@ local function process_queue_inner(guild_id, channel_id)
   local start_vol = want_fade and 0 or settings.volume
 
   bot.lavalink:update_player(guild_id, { volume = start_vol, filters = filters })
-  bot.lavalink:play(guild_id, track.encoded)
+  local play_ok, play_err = bot.lavalink:play(guild_id, track.encoded)
+  if not play_ok then
+    print(("[nexus] [%s] Playback start failed for '%s': %s"):format(tostring(guild_id), tostring(title), tostring(play_err)))
+    insert_queue_front(guild_id, url, title, requester_id, track_uid)
+    return
+  end
 
   update_stage_topic(guild_id, channel_id, title)
 
@@ -3209,7 +3230,14 @@ bot.gateway:on("READY", function(_)
           if executed then
             send_webhook_log("\240\159\164\150 Aria Override", ("Aria executed **%s** in guild %s."):format(cmd_name, guild_id), COLOR.purple)
           end
-          dbq("DELETE FROM nexus_swarm_overrides WHERE guild_id = %s AND bot_name = 'nexus' AND command = %s", guild_id, row.command)
+          -- Only clear the override once it actually ran -- it used to be
+          -- deleted unconditionally, so a command whose guard didn't match yet
+          -- (e.g. PAUSE arriving before playback[guild_id] was populated, a real
+          -- race right after a container restart) was silently dropped forever
+          -- instead of being retried on the next poll.
+          if executed then
+            dbq("DELETE FROM nexus_swarm_overrides WHERE guild_id = %s AND bot_name = 'nexus' AND command = %s", guild_id, row.command)
+          end
         end
       end)
       if not ok then
