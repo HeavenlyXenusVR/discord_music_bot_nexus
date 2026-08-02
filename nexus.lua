@@ -1680,6 +1680,28 @@ bot.lavalink:on("event", function(msg)
   end
 end)
 
+-- A Lavalink node restart wipes every player it was holding server-side;
+-- nothing else notices since our own in-memory playback bookkeeping is
+-- untouched -- the bot still thinks it's playing, it just silently isn't
+-- anymore. Fires on every ready (first boot is a no-op since playback is
+-- empty then) and re-attaches whatever this process still thinks is
+-- actively playing.
+bot.lavalink:on("ready", function()
+  for guild_id, data in pairs(playback) do
+    local channel_id = data.channel_id
+    local url, title, requester_id, track_uid = data.url, data.title, data.requester_id, data.track_uid
+    if channel_id then
+      copas.addthread(function()
+        copas.sleep(2)
+        ensure_voice(guild_id, channel_id)
+        if url then insert_queue_front(guild_id, url, title, requester_id, track_uid) end
+        playback[guild_id] = nil
+        process_queue(guild_id, channel_id)
+      end)
+    end
+  end
+end)
+
 bot.lavalink:on("playerUpdate", function(msg)
   local data = playback[msg.guildId]
   if data and msg.state and msg.state.position then
