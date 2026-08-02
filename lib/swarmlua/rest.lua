@@ -1,8 +1,24 @@
 -- Discord REST API client (blocking; see README for the async trade-off note).
 require("copas") -- must load before socket.http/ssl.https anywhere in the process
+local socket_http = require("socket.http")
 local https = require("ssl.https")
 local ltn12 = require("ltn12")
 local cjson = require("cjson")
+
+-- ssl.https is built on socket.http and shares its module-level TIMEOUT
+-- (seconds) for the connect/send/receive phases. Left unset, this client had
+-- NO timeout at all: a stalled DNS resolution, TCP connect, or TLS handshake
+-- during a real network outage could block indefinitely. Since this whole
+-- process is a single-threaded copas event loop, a genuinely-blocking (not
+-- copas-yielding) hang here doesn't just stall one Discord API call -- it
+-- freezes every other coroutine in the bot too, including its own heartbeat
+-- thread, with no way to recover short of a container restart. Confirmed
+-- live: alucard froze for 2+ hours (heartbeat dead, CPU spinning) during a
+-- period of real ISP-level packet loss/latency, right as this exact call
+-- logged "request failed: temporary failure in name resolution" elsewhere in
+-- the swarm. 15s is generous for Discord's API (which normally responds in
+-- well under 1s) while still bounding the worst case.
+socket_http.TIMEOUT = 15
 
 local API_BASE = "https://discord.com/api/v10"
 
