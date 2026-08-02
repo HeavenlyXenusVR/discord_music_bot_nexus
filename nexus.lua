@@ -1523,7 +1523,21 @@ local function maybe_enqueue_autodj(guild_id, channel_id)
   return true
 end
 
+-- guild_id..":"..track_uid -> consecutive resolve-failure count. A Lavalink/
+-- network blip mid-drain used to permanently delete every remaining queued
+-- track (each dequeued row was gone before resolve_track_by_url even ran,
+-- and a failed resolve just moved to the next row with no requeue), so a
+-- short outage could wipe an entire queue in seconds.
+local resolve_attempts = {}
+local MAX_RESOLVE_ATTEMPTS = 3
+
 local function process_queue_inner(guild_id, channel_id)
+  if not (bot.lavalink and bot.lavalink.session_id) then
+    -- Lavalink isn't connected right now -- leave the queue untouched rather
+    -- than dequeuing tracks we can't resolve; the watchdog thread and the
+    -- next natural trigger will retry once it's back.
+    return
+  end
   local settings = get_guild_settings(guild_id)
   local row = db_one([[SELECT id, video_url, title, requester_id::text AS requester_id, track_uid
                         FROM nexus_queue WHERE guild_id = %s AND bot_name = 'nexus' ORDER BY id ASC LIMIT 1]], guild_id)
@@ -1550,11 +1564,22 @@ local function process_queue_inner(guild_id, channel_id)
   local url, title, requester_id, track_uid = row.video_url, row.title, row.requester_id, row.track_uid
   dbq("DELETE FROM nexus_queue WHERE id = %s AND guild_id = %s", row.id, guild_id)
 
+  local retry_key = guild_id .. ":" .. tostring(track_uid or url)
   local track, terr = resolve_track_by_url(url)
   if not track then
-    print(("[nexus] resolve failed for '%s' in guild %s: %s"):format(tostring(title), guild_id, tostring(terr)))
+    local attempts = (resolve_attempts[retry_key] or 0) + 1
+    if attempts < MAX_RESOLVE_ATTEMPTS then
+      resolve_attempts[retry_key] = attempts
+      print(("[nexus] resolve failed for '%s' in guild %s (attempt %d/%d): %s -- requeuing"):format(tostring(title), guild_id, attempts, MAX_RESOLVE_ATTEMPTS, tostring(terr)))
+      insert_queue_front(guild_id, url, title, requester_id, track_uid)
+      return
+    end
+    resolve_attempts[retry_key] = nil
+    print(("[nexus] giving up on '%s' in guild %s after %d failed resolves: %s"):format(tostring(title), guild_id, attempts, tostring(terr)))
+    report_error(guild_id, "runtime", "track resolve failed permanently", ("%s: %s"):format(tostring(title), tostring(terr)))
     return process_queue(guild_id, channel_id)
   end
+  resolve_attempts[retry_key] = nil
 
   ensure_voice(guild_id, channel_id)
 
@@ -3033,6 +3058,17 @@ local function handle_direct_order(order)
   end
 end
 
+local function recovery_watchdog()
+  local stalled = dbq("SELECT DISTINCT guild_id FROM nexus_queue WHERE bot_name = 'nexus'") or {}
+  for _, row in ipairs(stalled) do
+    local guild_id = tostring(row.guild_id)
+    if not playback[guild_id] then
+      local channel_id = voice_channel[guild_id] or get_home_channel(guild_id)
+      if channel_id then process_queue(guild_id, channel_id) end
+    end
+  end
+end
+
 local function poll_direct_orders()
   local rows = dbq("SELECT id, guild_id, vc_id, text_channel_id, command, data FROM nexus_swarm_direct_orders WHERE bot_name = 'nexus' AND claimed_at IS NULL ORDER BY id ASC LIMIT 5") or {}
   for _, order in ipairs(rows) do
@@ -3158,6 +3194,16 @@ bot.gateway:on("READY", function(_)
       if not ok then
         print("[nexus] direct order poll error: " .. tostring(err))
         report_error(nil, "runtime", "direct order poll error", tostring(err))
+      end
+    end
+  end)
+  copas.addthread(function()
+    while true do
+      copas.sleep(30)
+      local ok, err = pcall(recovery_watchdog)
+      if not ok then
+        print("[nexus] recovery_watchdog error: " .. tostring(err))
+        report_error(nil, "runtime", "recovery_watchdog error", tostring(err))
       end
     end
   end)
